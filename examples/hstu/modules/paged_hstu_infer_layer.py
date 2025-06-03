@@ -23,6 +23,7 @@ from ops.triton_ops.triton_paged_hstu_attention import (
     triton_history_hstu_mha,
     triton_candidate_hstu_mha
 )
+import hstu_attn
 
 
 class PagedHSTUInferLayer(JaggedModule):
@@ -138,40 +139,32 @@ class PagedHSTUInferLayer(JaggedModule):
             jd.seqlen_offsets,
             jd.num_candidates)
 
-        jagged_attn_output = torch.zeros_like(value)
-        triton_history_hstu_mha(
-            jd.max_seqlen,
-            self._alpha,
-            query,
-            jagged_attn_output,
-            kv_cache_metadata.max_delta_history_length,
-            gpu_kv_cache_manager.get_buffers(self.layer_idx),
-            kv_cache_metadata.kv_indices,
-            kv_cache_metadata.kv_indptr,
-            kv_cache_metadata.kv_last_page_len,
-            gpu_kv_cache_manager.get_page_size(),
-            jd.seqlen_offsets,
-            jd.num_candidates,
-            kv_cache_metadata.total_history_lengths,
-            False,
-        )
-        triton_candidate_hstu_mha(
-            jd.max_seqlen,
-            self._alpha,
+        cu_seqlen_offsets = jd.seqlen_offsets.to(torch.int32)
+        cu_num_targets = jd.num_candidates.to(torch.int32)
+        cu_seq_offsets_t = jd.num_candidates_offsets.to(torch.int32)
+        
+        jagged_attn_output = hstu_attn.hstu_attn_varlen_func(
             query,
             key,
             value,
-            jagged_attn_output,
-            kv_cache_metadata.max_num_candidate,
-            gpu_kv_cache_manager.get_buffers(self.layer_idx),
-            kv_cache_metadata.kv_indices,
-            kv_cache_metadata.kv_indptr,
-            kv_cache_metadata.kv_last_page_len,
-            gpu_kv_cache_manager.get_page_size(),
-            jd.seqlen_offsets,
-            jd.num_candidates,
-            kv_cache_metadata.total_history_lengths,
-            False,
+            cu_seqlen_offsets,
+            cu_seqlen_offsets,
+            jd.max_seqlen,
+            jd.max_seqlen,
+            num_contexts=None,
+            num_targets=cu_num_targets,
+
+            target_group_size=1,
+            window_size=(-1, 0),
+            alpha=self._alpha,
+            rab=None,
+            has_drab=False,
+            is_delta_q=False,
+            kv_cache=gpu_kv_cache_manager.get_buffers(self.layer_idx), 
+            page_offsets=kv_cache_metadata.kv_indptr,
+            page_ids=kv_cache_metadata.kv_indices,
+            last_page_lens=kv_cache_metadata.kv_last_page_len,
+            seq_offsets_t=cu_seq_offsets_t,
         )
         jagged_attn_output = jagged_attn_output.view(-1, self._num_heads*self._linear_dim_per_head)
 
