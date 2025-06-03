@@ -130,6 +130,7 @@ def test_gr_infer(
             hstu_config=hstu_config, 
             kvcache_config=kv_cache_config, 
             task_config=task_config)
+        model_predict.eval()
         with tensor_parallel.get_cuda_rng_tracker().fork():
             batch = RankingBatch.random(num_tasks=num_tasks, **batch_kwargs)
         user_ids = torch.arange(batchsize_per_rank)

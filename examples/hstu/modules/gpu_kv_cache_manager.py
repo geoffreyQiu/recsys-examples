@@ -139,8 +139,8 @@ class HSTUGpuKVCacheManager:
     
     def lookup(self, user_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size = user_ids.shape[0]
-        num_cached_lengths = torch.zeros((batch_size,), dtype=torch.int64, device=torch.device('cpu'))
-        num_offloaded_lengths = torch.zeros((batch_size,), dtype=torch.int64, device=torch.device('cpu'))
+        num_cached_lengths = torch.zeros((batch_size,), dtype=torch.int32, device=torch.device('cpu'))
+        num_offloaded_lengths = torch.zeros((batch_size,), dtype=torch.int32, device=torch.device('cpu'))
         for idx in range(batch_size):
             user_id = user_ids[idx].item()
             num_cached_lengths[idx] = self.impl.get_num_tokens_cached(user_id)
@@ -153,9 +153,9 @@ class HSTUGpuKVCacheManager:
         
         page_ids = list()
         num_pages = 0
-        kv_cache_page_indptr = torch.zeros((batch_size + 1,), dtype=torch.int64, device=torch.device('cpu'))
-        kv_cache_last_page_lengths = torch.zeros((batch_size,), dtype=torch.int64, device=torch.device('cpu'))
-        cached_history_lengths = torch.zeros((batch_size,), dtype=torch.int64, device=torch.device('cpu'))
+        kv_cache_page_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device=torch.device('cpu'))
+        kv_cache_last_page_lengths = torch.zeros((batch_size,), dtype=torch.int32, device=torch.device('cpu'))
+        cached_history_lengths = torch.zeros((batch_size,), dtype=torch.int32, device=torch.device('cpu'))
 
         for idx in range(batch_size):
             user_id = user_ids[idx]
@@ -167,7 +167,7 @@ class HSTUGpuKVCacheManager:
             last_page_length = self.tokens_per_block if last_page_length == 0 else last_page_length
             kv_cache_last_page_lengths[idx] = last_page_length
 
-        kv_cache_page_ids = torch.tensor(page_ids, dtype=torch.int64, device=jd.values.device)
+        kv_cache_page_ids = torch.tensor(page_ids, dtype=torch.int32, device=jd.values.device)
         kv_cache_page_indptr = kv_cache_page_indptr.to(jd.values.device)
         kv_cache_last_page_lengths = kv_cache_last_page_lengths.to(jd.values.device)
         cached_history_lengths = cached_history_lengths.to(jd.values.device)
