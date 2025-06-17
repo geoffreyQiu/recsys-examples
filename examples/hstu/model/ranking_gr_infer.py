@@ -16,24 +16,69 @@ from typing import Optional, Tuple
 
 import torch
 from commons.utils.nvtx_op import output_nvtx_hook
-from configs import HSTUConfig, RankingConfig, KVCacheConfig, KVCacheMetadata
+from configs import (
+    HSTUConfig, 
+    RankingConfig, 
+    KVCacheConfig, 
+    KVCacheMetadata, 
+    get_kvcache_metadata_buffer,
+    copy_kvcache_metadata
+)
 from dataset.utils import RankingBatch
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.transformer.module import Float16Module
 from model.base_model import BaseModel
 from modules.embedding import ShardedEmbedding
 from modules.gpu_kv_cache_manager import HSTUGpuKVCacheManager
+from modules.host_kv_storage_manager import HSTUHostKVStorageManager
 from modules.hstu_block import HSTUBlock
-from modules.jagged_module import JaggedData
+from modules.jagged_data import JaggedData
 from modules.metrics import get_multi_event_metric_module
 from modules.mlp import MLP
 from modules.multi_task_loss_module import MultiTaskLossModule
-from modules.multi_task_over_arch import MultiTaskOverArch
+from ops.triton_ops.triton_jagged import triton_concat_2D_jagged
+import os
+import numpy as np
 
 
-class RankingGRInfer(torch.nn.Module):
+def get_jagged_metadata_buffer(max_batch_size, max_seq_len):
+    int_dtype = torch.int32
+    device = torch.cuda.current_device()
+
+    default_num_candidates = max_seq_len // 2
+
+    return JaggedData(
+        values=None,
+        # hidden states
+        max_seqlen=max_seq_len,
+        seqlen=torch.full((max_batch_size, ), max_seq_len, dtype=int_dtype, device=device),
+        seqlen_offsets=torch.arange(end=max_batch_size+1, dtype=int_dtype, device=device) * max_seq_len,
+
+        # candidates (included in hidden states)
+        max_num_candidates=default_num_candidates,
+        num_candidates=torch.full((max_batch_size, ), default_num_candidates, dtype=int_dtype, device=device),
+        num_candidates_offsets=torch.arange(end=max_batch_size+1, dtype=int_dtype, device=device) * default_num_candidates,
+
+        # contextual features
+        contextual_max_seqlen=0,
+        contextual_seqlen=None,
+        contextual_seqlen_offsets=None,
+
+        has_interleaved_action=True,
+    )
+
+def copy_jagged_metadata(dst_metadata, src_metata):
+    bs = src_metata.seqlen.shape[0]
+    dst_metadata.max_seqlen = src_metata.max_seqlen
+    dst_metadata.seqlen[:bs].copy_(src_metata.seqlen[:bs], non_blocking=True)
+    dst_metadata.seqlen_offsets[:bs+1].copy_(src_metata.seqlen_offsets[:bs+1], non_blocking=True)
+    dst_metadata.max_num_candidates = src_metata.max_num_candidates
+    dst_metadata.num_candidates[:bs].copy_(src_metata.num_candidates[:bs], non_blocking=True)
+    dst_metadata.num_candidates_offsets[:bs+1].copy_(src_metata.num_candidates_offsets[:bs+1], non_blocking=True)
+
+
+class RankingGRInferenceModel(torch.nn.Module):
     """
     A class representing the ranking model inference.
 
@@ -50,6 +95,7 @@ class RankingGRInfer(torch.nn.Module):
         kvcache_config: KVCacheConfig,
         task_config: RankingConfig,
         ddp_config: Optional[DistributedDataParallelConfig] = None,
+        use_cudagraph = False,
         # gpu_kv_cache_impl = None,
         # host_kv_storage_impl = None,
     ):
@@ -73,37 +119,48 @@ class RankingGRInfer(torch.nn.Module):
             layer_sizes[-1] for layer_sizes in task_config.prediction_head_arch
         ]
         self._embedding_collection = ShardedEmbedding(task_config.embedding_configs)
+        # temporary using a non-sharing GPU embeding
+        self._embedding_collection.to_empty(device=self._device)
 
 
         self._gpu_kv_cache_manager = HSTUGpuKVCacheManager(
             hstu_config, kvcache_config)
-        # self._host_kv_storage_manager = HSTUHostKvStorageManager(host_kv_storage_impl)
+        self._host_kv_storage_manager = HSTUHostKVStorageManager(
+            hstu_config, kvcache_config)
 
-        self._hstu_block = HSTUBlock(hstu_config, inference_mode=True)
-        self._dense_module = torch.nn.Sequential(
-            MultiTaskOverArch(
-                [
-                    MLP(
-                        self._embedding_dim,
-                        layer_sizes,
-                        has_bias,
-                        head_act_type,
-                        device=self._device,
-                    )
-                    for layer_sizes, head_act_type, has_bias in zip(
-                        task_config.prediction_head_arch,
-                        task_config.prediction_head_act_type,
-                        task_config.prediction_head_bias,  # type: ignore[arg-type]
-                    )
-                ]
-            ),
+        self._hstu_block = HSTUBlock(hstu_config, inference_mode=True, kvcache_config=kvcache_config)
+        self._dense_module = MLP(
+            self._embedding_dim,
+            task_config.prediction_head_arch[0],
+            task_config.prediction_head_act_type,
+            task_config.prediction_head_bias,
+            device=self._device,
         )
 
         self._hstu_block = self._hstu_block.cuda()
         self._dense_module = self._dense_module.cuda()
-        # TODO, add ddp optimizer flag
-        if hstu_config.bf16 or hstu_config.fp16:
-            self._dense_module = Float16Module(hstu_config, self._dense_module)
+
+        dtype = torch.bfloat16 if hstu_config.bf16 else torch.float16 if hstu_config.fp16 else torch.float32
+        device = torch.cuda.current_device()
+
+        max_batch_size = kvcache_config.max_batch_size
+        max_seq_len = kvcache_config.max_seq_len
+        hidden_dim = hstu_config.hidden_size
+
+        self._hidden_states = torch.randn((max_batch_size * max_seq_len, hidden_dim), 
+            dtype=dtype, device=device)
+        self._jagged_metadata = get_jagged_metadata_buffer(max_batch_size, max_seq_len)
+        self._kvcache_metadata = get_kvcache_metadata_buffer(hstu_config, kvcache_config)
+        self._kvcache_metadata.kv_cache_table = [ 
+            self._gpu_kv_cache_manager.get_buffers(layer_idx) for layer_idx in range(hstu_config.num_layers) ]
+
+        if use_cudagraph:
+            self._hstu_block.set_cudagraph(
+                max_batch_size, 
+                max_seq_len, 
+                self._hidden_states,
+                self._jagged_metadata,
+                self._kvcache_metadata)
 
     def bfloat16(self):
         """
@@ -112,6 +169,7 @@ class RankingGRInfer(torch.nn.Module):
         Returns:
             RankingGR: The model with bfloat16 precision.
         """
+        self._hstu_block.bfloat16()
         self._dense_module.bfloat16()
         return self
 
@@ -122,6 +180,7 @@ class RankingGRInfer(torch.nn.Module):
         Returns:
             RankingGR: The model with half precision.
         """
+        self._hstu_block.half()
         self._dense_module.half()
         return self
     
@@ -130,23 +189,29 @@ class RankingGRInfer(torch.nn.Module):
         host_lengths = self._host_kv_storage_manger.lookup(user_ids)
         return (gpu_cached_lengths, gpu_offloaded_legnths, host_lengths)
     
-    def prepare_kv_cache(self, jd: JaggedData, user_ids: torch.Tensor) -> Tuple[torch.Tensor, KVCacheMetadata]:
-        self._gpu_kv_cache_manager.allocate(jd, user_ids)
-        kv_cache_metadata = self._gpu_kv_cache_manager.get_cache_page_metadata(jd, user_ids)
-        
-        # host_kv = self._host_kv_storage_manger.lookup(batch.user_ids)
-        # #^ cpu jagged tensor pinned memory
-        # host_kv_page_ids, host_kv_page_indptr, events_list = self._gpu_kv_cache_manager.onboard(host_kv_cpu)
-        # #^ gpu tensor,        ^ gpu tensor,            
-        
-        # kv_cache_page_ids = triton_concat_2D_jagged(host_kv_page_ids, kv_cache_page_ids, host_kv_page_indptr, kv_cache_page_indptr)
-        # kv_cache_page_indptr = host_kv_page_indptr + kv_cache_page_indptr
-        
-        return (self._gpu_kv_cache_manager, kv_cache_metadata)
+    def prepare_kv_cache(self, batch: RankingBatch, user_ids: torch.Tensor) -> Tuple[torch.Tensor, KVCacheMetadata]:
+        self._gpu_kv_cache_manager.allocate(batch, user_ids)
+        kv_cache_metadata = self._gpu_kv_cache_manager.get_cache_page_metadata(batch, user_ids)
+        (onload_kv_page_ids, onload_kv_page_indptr, onload_length) = self._host_kv_storage_manager.lookup(user_ids, torch.zeros_like(user_ids))
+
+        if onload_kv_page_indptr[-1].item() > 0:
+            kv_page_ids = triton_concat_2D_jagged(
+                    max_seq_len=onload_kv_page_indptr[-1] + kv_cache_metadata.kv_indices[-1],
+                    values_a=onload_kv_page_ids.view(-1, 1),
+                    values_b=kv_cache_metadata.kv_indices.view(-1, 1),
+                    offsets_a=onload_kv_page_indptr.to(torch.int64),
+                    offsets_b=kv_cache_metadata.kv_indptr.to(torch.int64),
+                )
+            kv_cache_metadata.kv_indices = kv_page_ids.view(-1)
+            kv_cache_metadata.kv_indptr = onload_kv_page_indptr + kv_cache_metadata.kv_indptr
+
+        copy_kvcache_metadata(self._kvcache_metadata, kv_cache_metadata)
+        self._gpu_kv_cache_manager.onboard(self._host_kv_storage_manager.get_lookup_buffer(), onload_length, self._kvcache_metadata)
     
     def finalize_kv_cache(self, user_ids: torch.Tensor):
+        self._gpu_kv_cache_manager.evict(user_ids)
         return
-
+    
     def forward(
         self,
         batch: RankingBatch,
@@ -157,9 +222,10 @@ class RankingGRInfer(torch.nn.Module):
                 embeddings=self._embedding_collection(batch.features),
                 batch=batch,
             )
-            kv_cache_handler = self.prepare_kv_cache(jagged_data, user_ids)
-            hstu_output = self._hstu_block.predict(jagged_data, kv_cache_handler)
-            self.finalize_kv_cache(batch)
-            jagged_item_logit = self._dense_module(hstu_output).values
-
+            self.prepare_kv_cache(batch, user_ids)
+            copy_jagged_metadata(self._jagged_metadata, jagged_data)
+            hstu_output = self._hstu_block.predict(batch.batch_size, jagged_data.seqlen_offsets[-1].item(), jagged_data.values, self._jagged_metadata, self._kvcache_metadata)
+            self.finalize_kv_cache(user_ids)
+            jagged_item_logit = self._dense_module(hstu_output.values)
+            
         return jagged_item_logit

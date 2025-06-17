@@ -10,6 +10,8 @@ from .kv_cache_config import (
     KVCacheMetadata,
     KVCacheConfig,
     get_kvcache_config,
+    get_kvcache_metadata_buffer,
+    copy_kvcache_metadata,
 )
 from .task_config import (
     OptimizerParam,
@@ -28,6 +30,8 @@ __all__ = [
     "KVCacheMetadata",
     "KVCacheConfig",
     "get_kvcache_config",
+    "get_kvcache_metadata_buffer",
+    "copy_kvcache_metadata",
     "RankingConfig",
     "RetrievalConfig",
     "OptimizerParam",
