@@ -36,7 +36,8 @@ from typing import Optional, Tuple
 import torch
 from configs.hstu_config import HSTUConfig
 from configs.kv_cache_config import KVCacheConfig, KVCacheMetadata
-from modules.jagged_module import JaggedData
+from dataset.utils import RankingBatch
+from modules.jagged_data import JaggedData
 
 import flashinfer
 import tensorrt_llm
@@ -54,14 +55,15 @@ class HSTUGpuKVCacheManager:
         self.num_layers = hstu_config.num_layers
         self.head_dim = hstu_config.kv_channels
         self.tokens_per_block = kv_cache_config.tokens_per_block
-        self.tp_size = 1
+        self.num_cache_blocks = kv_cache_config.blocks_in_primary_pool
+        self.max_batch_size = kv_cache_config.max_batch_size
 
         self.num_kv_heads_per_layer = [ hstu_config.num_attention_heads for _ in range(self.num_layers) ]
 
         if kv_cache_config.max_attention_window is None:
-            max_attention_window = kv_cache_config.max_seq_len
+            self.max_attention_window = kv_cache_config.max_seq_len
         else:
-            max_attention_window = max(kv_cache_config.max_attention_window)
+            self.max_attention_window = max(kv_cache_config.max_attention_window)
 
         self._onload_stream = torch.cuda.Stream()
         self._offload_stream = torch.cuda.Stream()
@@ -74,7 +76,7 @@ class HSTUGpuKVCacheManager:
             'blocks_in_secondary_pool': 0,
             'max_num_sequences': kv_cache_config.max_batch_size,
             'max_beam_width': 1,
-            'max_attention_window': max_attention_window,
+            'max_attention_window': self.max_attention_window,
             'temporary_attention_window': 0,
             'sink_token_length': 0,
             'stream': self._offload_stream.cuda_stream,
@@ -88,15 +90,21 @@ class HSTUGpuKVCacheManager:
 
         kv_cache_dtype = DataType.BF16 if hstu_config.bf16 else DataType.HALF if hstu_config.fp16 else DataType.FLOAT
         self.impl.allocate_pools(kv_cache_dtype, False)
-        self.kv_cache_pool_pointers = self.impl.get_block_pool_pointers()
-        self.kv_cache_pool_mapping = self.impl.get_layer_to_pool_mapping()
-        self.num_pools = self.impl.num_pools
-        self.max_blocks_per_seq = self.impl.max_blocks_per_seq
+        # self.kv_cache_pool_pointers = self.impl.get_block_pool_pointers()
+        # self.kv_cache_pool_mapping = self.impl.get_layer_to_pool_mapping()
+        # self.num_pools = self.impl.num_pools
+        # self.max_blocks_per_seq = self.impl.max_blocks_per_seq
 
-    def allocate(self, jd: JaggedData, user_ids: torch.Tensor):
+        self.host_kvdata_gpu_buffer_ = torch.empty((),
+            dtype=torch.bfloat16, device=torch.cuda.current_device())
+
+    def allocate(self, batch: RankingBatch, user_ids: torch.Tensor):
         batch_size = user_ids.shape[0]
-        seq_lengths = jd.seqlen.to('cpu')
-        num_candidates = jd.num_candidates.to('cpu')
+        seq_lengths = batch.features.lengths()[:batch_size] + torch.zeros_like(batch.features.lengths()[:batch_size])
+        for idx in range(batch_size, batch.features.lengths().shape[0], batch_size):
+            seq_lengths += batch.features.lengths()[idx:idx+batch_size]
+        seq_lengths = seq_lengths.to('cpu')
+        num_candidates = batch.num_candidates.to('cpu') * 2
         # allocate KV Cache
         for idx in range(batch_size):
             user_id = user_ids[idx].item()
@@ -112,30 +120,14 @@ class HSTUGpuKVCacheManager:
         value: torch.Tensor, 
         metadata: KVCacheMetadata,
         seqlen_offsets: torch.Tensor,
-        num_candidates: torch.Tensor
-    ):
-        batch_size = seqlen_offsets.shape[0] - 1
-        kv_cache_data_buffer = self.get_buffers(layer_idx)
-        for idx in range(batch_size):
-            s1, e1 = seqlen_offsets[idx], seqlen_offsets[idx+1] - num_candidates[idx]
-            if s1.item() == e1.item():
-                continue
-            s2, e2 = metadata.delta_history_offsets[idx], metadata.delta_history_offsets[idx+1]
-            flashinfer.append_paged_kv_cache(
-                key[s1:e1, ...],
-                value[s1:e1, ...],
-                metadata.batch_indices[s2:e2, ...] - metadata.batch_indices[s2],
-                metadata.position[s2:e2, ...],
-                kv_cache_data_buffer,
-                metadata.kv_indices[metadata.kv_indptr[idx]:metadata.kv_indptr[idx+1]],
-                metadata.kv_indptr[idx:idx+2] - metadata.kv_indptr[idx],
-                metadata.kv_last_page_len[idx:idx+1],
-            )
+        num_candidates_offsets: torch.Tensor
+    ):  
         
         return
     
     def evict(self, user_ids):
-        pass
+        for idx in range(user_ids.shape[0]):
+            self.impl.remove_sequence(user_ids[idx].item(), None)
     
     def lookup(self, user_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size = user_ids.shape[0]
@@ -148,7 +140,14 @@ class HSTUGpuKVCacheManager:
 
         return (num_cached_lengths, num_offloaded_lengths)
     
-    def get_cache_page_metadata(self, jd: JaggedData, user_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def onboard(self, host_kv_data: torch.Tensor, onload_length: int, kv_cache_metadata):
+        with torch.cuda.stream(self._onload_stream):
+            for layer_idx in range(self.num_layers):
+                kv_cache_metadata.onload_history_kv_buffer[layer_idx][:onload_length, ...].copy_(
+                    host_kv_data[layer_idx, :onload_length, ...], non_blocking=True)
+                kv_cache_metadata.onload_history_kv_events[layer_idx].record(self._onload_stream)
+    
+    def get_cache_page_metadata(self, batch: RankingBatch, user_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = user_ids.shape[0]
         
         page_ids = list()
@@ -157,49 +156,68 @@ class HSTUGpuKVCacheManager:
         kv_cache_last_page_lengths = torch.zeros((batch_size,), dtype=torch.int32, device=torch.device('cpu'))
         cached_history_lengths = torch.zeros((batch_size,), dtype=torch.int32, device=torch.device('cpu'))
 
+        last_fakeout_page_id = 4096
         for idx in range(batch_size):
             user_id = user_ids[idx]
-            page_ids.extend(self.impl.get_cache_block_ids(user_id)[0])
-            kv_cache_page_indptr[idx + 1] = len(page_ids)
             
-            cached_history_lengths[idx] = self.impl.get_num_tokens_cached(user_id)
-            last_page_length = cached_history_lengths[idx].item() % self.tokens_per_block
+            cached_history_length = int(os.getenv("CACHED_LEN")) + self.impl.get_num_tokens_cached(user_id)
+            cached_history_lengths[idx] = cached_history_length
+            last_page_length = cached_history_length % self.tokens_per_block
             last_page_length = self.tokens_per_block if last_page_length == 0 else last_page_length
             kv_cache_last_page_lengths[idx] = last_page_length
 
-        kv_cache_page_ids = torch.tensor(page_ids, dtype=torch.int32, device=jd.values.device)
-        kv_cache_page_indptr = kv_cache_page_indptr.to(jd.values.device)
-        kv_cache_last_page_lengths = kv_cache_last_page_lengths.to(jd.values.device)
-        cached_history_lengths = cached_history_lengths.to(jd.values.device)
+            kv_page_ids = self.impl.get_cache_block_ids(user_id)[0]
+            fakeout_cached_pages_num = (cached_history_length - last_page_length)//self.tokens_per_block + 1 - len(kv_page_ids)
+            page_ids.extend(kv_page_ids)
+            page_ids.extend([ _ for _ in range(last_fakeout_page_id, last_fakeout_page_id+fakeout_cached_pages_num)])
+            kv_cache_page_indptr[idx + 1] = len(page_ids)
+            last_fakeout_page_id = last_fakeout_page_id+fakeout_cached_pages_num
+
+        device = batch.features.values().device
+        kv_cache_page_ids = torch.tensor(page_ids, dtype=torch.int32, device=device)
+        kv_cache_page_indptr = kv_cache_page_indptr.to(device)
+        kv_cache_last_page_lengths = kv_cache_last_page_lengths.to(device)
+        cached_history_lengths = cached_history_lengths.to(device)
         
-        delta_history_offsets = jd.seqlen_offsets - jd.num_candidates_offsets
-        history_token_nnz = delta_history_offsets[-1].item()
+        seq_lengths = batch.features.lengths()[:batch_size] + torch.zeros_like(batch.features.lengths()[:batch_size])
+        for idx in range(batch_size, batch.features.lengths().shape[0], batch_size):
+            seq_lengths += batch.features.lengths()[idx:idx+batch_size]
+        seq_lengths = seq_lengths.to('cpu')
+        num_candidates = batch.num_candidates.to('cpu') * 2
+
+        delta_history_length = seq_lengths - num_candidates
+
+        delta_history_offsets = torch.zeros((batch_size+1,), dtype=torch.int32, device=torch.device("cpu"))
+        torch.cumsum(delta_history_length, 0, out = delta_history_offsets[1:])
+        delta_history_token_nnz = delta_history_offsets[-1].item()
+        delta_history_offsets = delta_history_offsets.to(device=device)
         history_batch_indices, history_positions = flashinfer.page.get_batch_indices_positions(
-            jd.seqlen_offsets - jd.num_candidates_offsets,
+            delta_history_offsets,
             cached_history_lengths,
-            history_token_nnz
+            delta_history_token_nnz
         )
+        new_history_nnz_cuda=torch.full((1,), delta_history_token_nnz, dtype=torch.int32, device=device)
 
-        max_delta_history_length = torch.max(jd.seqlen - jd.num_candidates).item()
-        max_num_candidate = torch.max(jd.num_candidates).item()
-
+        max_delta_history_length = torch.max(delta_history_length).item()
+        max_num_candidate = torch.max(num_candidates).item()
         return KVCacheMetadata(
             kv_indices=kv_cache_page_ids,
             kv_indptr=kv_cache_page_indptr,
             kv_last_page_len=kv_cache_last_page_lengths,
             batch_indices=history_batch_indices,
             position=history_positions,
-            delta_history_offsets=delta_history_offsets,
-            total_history_lengths=cached_history_lengths,
-            max_delta_history_length=max_delta_history_length,
-            max_num_candidate=max_num_candidate,
+            delta_history_token_nnz=delta_history_token_nnz,
+            new_history_nnz_cuda=new_history_nnz_cuda
         )
     
     def get_page_size(self) -> int:
         return self.tokens_per_block
     
     def get_buffers(self, layer_idx: int) -> Optional[torch.Tensor]:
-        result = self.impl.get_primary_pool_data(layer_idx)
+        result = self.impl.get_primary_pool()
+        result = result.view(result.shape[1], result.shape[0], result.shape[2], result.shape[3])
+        result = result[layer_idx, ...]
+        # result = self.impl.get_primary_pool_data(layer_idx)
         return result.reshape(result.shape[0], 2, self.tokens_per_block,
                               self.num_kv_heads_per_layer[layer_idx],
                               self.head_dim).to(torch.bfloat16)

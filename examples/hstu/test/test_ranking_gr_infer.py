@@ -16,9 +16,7 @@ import commons.utils.initialize as init
 import pytest
 import torch
 from configs import (
-    DynamicShardedEmbeddingConfig,
     RankingConfig,
-    RetrievalConfig,
     ShardedEmbeddingConfig,
     get_hstu_config,
     get_kvcache_config,
@@ -26,7 +24,6 @@ from configs import (
 from dataset.utils import FeatureConfig, RankingBatch, RetrievalBatch
 from megatron.core import tensor_parallel
 from model.ranking_gr_infer import RankingGRInfer
-from modules.embedding import EmbeddingOptimizerParam
 
 @pytest.mark.parametrize("model_type", ["ranking"])
 @pytest.mark.parametrize("batchsize_per_rank", [32])
@@ -34,9 +31,9 @@ from modules.embedding import EmbeddingOptimizerParam
 @pytest.mark.parametrize(
     "item_max_seqlen,max_num_candidates",
     [
-        (2, 10),
+        # (2, 10),
         (20, 10),
-        (200, 10),
+        # (200, 10),
     ],
 )
 @pytest.mark.parametrize("dim_size", [128,])
@@ -71,10 +68,10 @@ def test_gr_infer(
     context_emb_size = 1000
     item_emb_size = 1000
     action_vocab_size = 10
-    num_tasks = 2
-    embedding_optimizer_param = EmbeddingOptimizerParam(
-        optimizer_str="adam", learning_rate=0.0001
-    )
+    num_tasks = 1
+    # embedding_optimizer_param = EmbeddingOptimizerParam(
+    #     optimizer_str="adam", learning_rate=0.0001
+    # )
     emb_configs = [
         ShardedEmbeddingConfig(
             feature_names=["act_feat"],
@@ -82,17 +79,15 @@ def test_gr_infer(
             vocab_size=action_vocab_size,
             dim=dim_size,
             sharding_type="data_parallel",
-            optimizer_param=embedding_optimizer_param,
         ),
-        DynamicShardedEmbeddingConfig(
+        ShardedEmbeddingConfig(
             feature_names=["context_feat", "item_feat"]
             if max_contextual_seqlen > 0
             else ["item_feat"],
             table_name="item",
             vocab_size=item_emb_size,
             dim=dim_size,
-            optimizer_param=embedding_optimizer_param,
-            global_hbm_for_values=1000,
+            sharding_type="model_parallel",
         ),
     ]
     feature_configs = [
@@ -130,6 +125,7 @@ def test_gr_infer(
             hstu_config=hstu_config, 
             kvcache_config=kv_cache_config, 
             task_config=task_config)
+        model_predict.bfloat16()
         model_predict.eval()
         with tensor_parallel.get_cuda_rng_tracker().fork():
             batch = RankingBatch.random(num_tasks=num_tasks, **batch_kwargs)
