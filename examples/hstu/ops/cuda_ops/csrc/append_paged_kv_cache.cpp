@@ -44,16 +44,14 @@ void append_paged_kv_cache(at::Tensor append_key, at::Tensor append_value, at::T
     num_heads = paged_k_cache.size(2);
   }
 
-  auto stride_page = num_heads * page_size * head_dim;
+  auto stride_page = paged_k_cache.stride(0);
   auto stride_n = (kv_layout == 1) ? head_dim : num_heads * head_dim;
   auto stride_h = (kv_layout == 1) ? page_size * head_dim : head_dim;
 
   // get kv_cache_strides
-  const int64_t* kv_cache_strides = nullptr;
   auto k_strides = paged_k_cache.strides();
   auto v_strides = paged_v_cache.strides();
   TORCH_CHECK(k_strides == v_strides, "k/v strides must be identical");
-  kv_cache_strides = k_strides.data();
 
 
   auto append_k_strides = append_key.strides();

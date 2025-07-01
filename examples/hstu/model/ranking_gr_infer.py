@@ -30,6 +30,7 @@ from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import DistributedDataParallelConfig
 from model.base_model import BaseModel
 from modules.embedding import ShardedEmbedding
+from modules.inference_embedding import InferenceEmbedding
 from modules.gpu_kv_cache_manager import HSTUGpuKVCacheManager
 from modules.host_kv_storage_manager import HSTUHostKVStorageManager
 from modules.hstu_block import HSTUBlock
@@ -118,7 +119,7 @@ class RankingGRInferenceModel(torch.nn.Module):
         self._logit_dim_list = [
             layer_sizes[-1] for layer_sizes in task_config.prediction_head_arch
         ]
-        self._embedding_collection = ShardedEmbedding(task_config.embedding_configs)
+        self._embedding_collection = InferenceEmbedding(task_config.embedding_configs)
         # temporary using a non-sharing GPU embeding
         self._embedding_collection.to_empty(device=self._device)
 
@@ -155,6 +156,7 @@ class RankingGRInferenceModel(torch.nn.Module):
             self._gpu_kv_cache_manager.get_buffers(layer_idx) for layer_idx in range(hstu_config.num_layers) ]
 
         if use_cudagraph:
+            self.use_cudagraph = use_cudagraph
             self._hstu_block.set_cudagraph(
                 max_batch_size, 
                 max_seq_len, 
@@ -205,8 +207,20 @@ class RankingGRInferenceModel(torch.nn.Module):
             kv_cache_metadata.kv_indices = kv_page_ids.view(-1)
             kv_cache_metadata.kv_indptr = onload_kv_page_indptr + kv_cache_metadata.kv_indptr
 
-        copy_kvcache_metadata(self._kvcache_metadata, kv_cache_metadata)
-        self._gpu_kv_cache_manager.onboard(self._host_kv_storage_manager.get_lookup_buffer(), onload_length, self._kvcache_metadata)
+        total_history_lengths = (kv_cache_metadata.kv_indptr[1:] - kv_cache_metadata.kv_indptr[:-1] - 1) * 32 + kv_cache_metadata.kv_last_page_len[:]
+        total_history_lengths = torch.clamp(total_history_lengths, 0)
+        kv_cache_metadata.total_history_offsets = torch.zeros_like(kv_cache_metadata.kv_indptr)
+        torch.cumsum(total_history_lengths, 0, out=kv_cache_metadata.total_history_offsets[1:])
+
+        kv_cache_metadata.onload_history_kv_buffer = self._kvcache_metadata.onload_history_kv_buffer[:]
+        kv_cache_metadata.kv_cache_table = self._kvcache_metadata.kv_cache_table[:]
+
+        if self.use_cudagraph:
+            copy_kvcache_metadata(self._kvcache_metadata, kv_cache_metadata)
+            self._gpu_kv_cache_manager.onboard(self._host_kv_storage_manager.get_lookup_buffer(), onload_length, self._kvcache_metadata)
+        else:
+            self._gpu_kv_cache_manager.onboard(self._host_kv_storage_manager.get_lookup_buffer(), onload_length, kv_cache_metadata)
+        return kv_cache_metadata
     
     def finalize_kv_cache(self, user_ids: torch.Tensor):
         self._gpu_kv_cache_manager.evict(user_ids)
@@ -218,14 +232,24 @@ class RankingGRInferenceModel(torch.nn.Module):
         user_ids: torch.Tensor,
     ):  
         with torch.inference_mode():
+            kvcache_metadata = self.prepare_kv_cache(batch, user_ids)
             jagged_data = self._hstu_block.hstu_preprocess(
                 embeddings=self._embedding_collection(batch.features),
                 batch=batch,
             )
-            self.prepare_kv_cache(batch, user_ids)
-            copy_jagged_metadata(self._jagged_metadata, jagged_data)
-            hstu_output = self._hstu_block.predict(batch.batch_size, jagged_data.seqlen_offsets[-1].item(), jagged_data.values, self._jagged_metadata, self._kvcache_metadata)
-            self.finalize_kv_cache(user_ids)
+
+            num_tokens = batch.features.values().shape[0]
+            if self.use_cudagraph:
+                self._hidden_states[:num_tokens, ...].copy_(jagged_data.values, non_blocking=True)
+                copy_jagged_metadata(self._jagged_metadata, jagged_data)
+                self._kvcache_metadata.total_history_offsets += self._jagged_metadata.num_candidates_offsets
+                hstu_output = self._hstu_block.predict(batch.batch_size, num_tokens, self._hidden_states, self._jagged_metadata, self._kvcache_metadata)
+            else:
+                kvcache_metadata.total_history_offsets += jagged_data.num_candidates_offsets
+                hstu_output = self._hstu_block.predict(batch.batch_size, num_tokens, jagged_data.values, jagged_data, self._kvcache_metadata)
+            
+            # self.finalize_kv_cache(user_ids) # test mode
+            hstu_output = self._hstu_block.hstu_postprocess(hstu_output)
             jagged_item_logit = self._dense_module(hstu_output.values)
             
         return jagged_item_logit

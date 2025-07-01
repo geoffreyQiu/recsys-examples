@@ -80,6 +80,7 @@ class PagedHSTUInferLayer(MegatronModule):
         )
         for param in self._linear_uvqk.parameters():
             param.requires_grad = False
+            param.copy_(torch.randn_like(param))
 
         # input norm 
         if config.learnable_input_layernorm:
@@ -110,6 +111,10 @@ class PagedHSTUInferLayer(MegatronModule):
             device=device
         )
 
+        for param in self._linear_proj.parameters():
+            param.requires_grad = False
+            param.copy_(torch.randn_like(param))
+
         # output buffer
         max_num_tokens = kv_cache_config.max_batch_size * kv_cache_config.max_seq_len
         self.output_buffer_ = torch.empty((max_num_tokens, config.hidden_size), 
@@ -122,78 +127,85 @@ class PagedHSTUInferLayer(MegatronModule):
         pass
 
     @torch.inference_mode()
-    # def forward(self, input_tensor: torch.Tensor, jd: JaggedData, kv_cache_handler) -> JaggedData:
-    #     normed_input = F.layer_norm(
-    #         input_tensor,
-    #         normalized_shape=[self._embedding_dim],
-    #         weight=self._input_layernorm_weight,
-    #         bias=self._input_layernorm_bias,
-    #         eps=self._eps,
-    #     )
+    def forward_naive(self, batch_size: int, num_tokens: int, layer_input: torch.Tensor, jd: JaggedData, kv_cache_metadata) -> JaggedData:
+        normed_input = F.layer_norm(
+            layer_input,
+            normalized_shape=[self._embedding_dim],
+            weight=self._input_layernorm_weight,
+            bias=self._input_layernorm_bias,
+            eps=self._eps,
+        )
         
-    #     mixed_uvqk = F.silu(self._linear_uvqk(normed_input))
-    #     (user, value, query, key) = torch.split(
-    #         mixed_uvqk,
-    #         self._split_arg_list,
-    #         dim=-1,
-    #     )
+        mixed_uvqk = F.silu(self._linear_uvqk(normed_input))
+        (user, value, query, key) = torch.split(
+            mixed_uvqk,
+            self._split_arg_list,
+            dim=-1,
+        )
 
-    #     value = value.view(-1, self._num_heads, self._linear_dim_per_head)
-    #     query = query.view(-1, self._num_heads, self._attention_dim_per_head)
-    #     key = key.view(-1, self._num_heads, self._attention_dim_per_head)
+        value = value.view(-1, self._num_heads, self._linear_dim_per_head)
+        query = query.view(-1, self._num_heads, self._attention_dim_per_head)
+        key = key.view(-1, self._num_heads, self._attention_dim_per_head)
 
-    #     (gpu_kv_cache_manager, kv_cache_metadata) = kv_cache_handler
-    #     gpu_kv_cache_manager.append_paged_kv_data(
-    #         self.layer_idx, 
-    #         key, 
-    #         value, 
-    #         kv_cache_metadata,
-    #         jd.seqlen_offsets,
-    #         jd.num_candidates_offsets)
+        kv_cache_table = kv_cache_metadata.kv_cache_table[self.layer_idx]
+        (paged_k_cache, paged_v_cache) = kv_cache_table.unbind(dim=1)
+        append_kvcache.forward(
+            key, value,
+            kv_cache_metadata.batch_indices,
+            kv_cache_metadata.position,
+            jd.num_candidates_offsets,
+            kv_cache_metadata.new_history_nnz_cuda,
+            num_tokens, # kv_cache_metadata.delta_history_token_nnz,
+            paged_k_cache, paged_v_cache,
+            kv_cache_metadata.kv_indices,
+            kv_cache_metadata.kv_indptr,
+            kv_cache_metadata.kv_last_page_len,
+            0
+        )
 
-    #     working_stream = torch.cuda.default_stream(query.device)
-    #     kv_cache_metadata.onload_history_kv_events[self.layer_idx].wait(working_stream)
+        working_stream = torch.cuda.default_stream(query.device)
+        kv_cache_metadata.onload_history_kv_events[self.layer_idx].wait(working_stream)
+
+        jagged_attn_output = hstu_attn.hstu_attn_varlen_func(
+            query,
+            key,
+            value,
+            jd.seqlen_offsets,
+            kv_cache_metadata.total_history_offsets[:batch_size+1], # jd.seqlen_offsets,
+            4096, # max{ new_history_seqlen + num_target }
+            4096, # max{ new_history_seqlen + num_target }
+            num_contexts=None,
+            num_targets=jd.num_candidates,
+
+            target_group_size=1,
+            window_size=(-1, 0),
+            alpha=self._alpha,
+            rab=None,
+            has_drab=False,
+            is_delta_q=True,
+            kv_cache=kv_cache_table,
+            page_offsets=kv_cache_metadata.kv_indptr,
+            page_ids=kv_cache_metadata.kv_indices,
+            last_page_lens=kv_cache_metadata.kv_last_page_len,
+            seq_offsets_t=jd.num_candidates_offsets,
+        )
+        kv_cache_metadata.onload_history_kv_buffer[self.layer_idx].record_stream(working_stream)
+
+        jagged_attn_output = jagged_attn_output.view(-1, self._num_heads*self._linear_dim_per_head)
+        parallel_input = user * F.layer_norm(
+            jagged_attn_output,
+            normalized_shape=[self._num_heads*self._linear_dim_per_head],
+            weight=self._output_layernorm_weight,
+            bias=self._output_layernorm_bias,
+            eps=self._eps,
+        )
+
+        layer_output = self._linear_proj(parallel_input)
+        if self._residual:
+            torch.add(layer_output, layer_input, out=layer_output)
         
-    #     jagged_attn_output = hstu_attn.hstu_attn_varlen_func(
-    #         query,
-    #         key,
-    #         value,
-    #         jd.seqlen_offsets,
-    #         jd.seqlen_offsets,
-    #         jd.max_seqlen,
-    #         jd.max_seqlen,
-    #         num_contexts=None,
-    #         num_targets=jd.num_candidates,
+        return layer_output
 
-    #         target_group_size=1,
-    #         window_size=(-1, 0),
-    #         alpha=self._alpha,
-    #         rab=None,
-    #         has_drab=False,
-    #         is_delta_q=False,
-    #         kv_cache=gpu_kv_cache_manager.get_buffers(self.layer_idx), 
-    #         page_offsets=kv_cache_metadata.kv_indptr,
-    #         page_ids=kv_cache_metadata.kv_indices,
-    #         last_page_lens=kv_cache_metadata.kv_last_page_len,
-    #         seq_offsets_t=jd.num_candidates_offsets,
-    #     )
-    #     kv_cache_metadata.onload_history_kv_buffer[self.layer_idx].record_stream(working_stream)
-
-    #     jagged_attn_output = jagged_attn_output.view(-1, self._num_heads*self._linear_dim_per_head)
-    #     parallel_input = user * F.layer_norm(
-    #         jagged_attn_output,
-    #         normalized_shape=[self._num_heads*self._linear_dim_per_head],
-    #         weight=self._output_layernorm_weight,
-    #         bias=self._output_layernorm_bias,
-    #         eps=self._eps,
-    #     )
-
-    #     output_tensor = self._linear_proj(parallel_input)
-    #     if self._residual:
-    #         output_tensor = output_tensor + input_tensor
-        
-    #     return output_tensor
-    
     @torch.inference_mode()
     def forward(self, batch_size: int, num_tokens: int, input_buffer: torch.Tensor, jd: JaggedData, kv_cache_metadata) -> JaggedData:
         input_tensor = input_buffer[:num_tokens, ...]
@@ -235,16 +247,14 @@ class PagedHSTUInferLayer(MegatronModule):
         working_stream = torch.cuda.default_stream(query.device)
         kv_cache_metadata.onload_history_kv_events[self.layer_idx].wait(working_stream)
 
-        jagged_attn_output = torch.zeros_like(query)
-        
         jagged_attn_output = hstu_attn.hstu_attn_varlen_func(
             query,
             key,
             value,
             jd.seqlen_offsets,
-            jd.seqlen_offsets,
-            num_tokens, # max{ new_history_seqlen + num_target }
-            num_tokens, # max{ new_history_seqlen + num_target }
+            kv_cache_metadata.total_history_offsets[:batch_size+1], # jd.seqlen_offsets,
+            4096, # max{ new_history_seqlen + num_target }
+            4096, # max{ new_history_seqlen + num_target }
             num_contexts=None,
             num_targets=jd.num_candidates,
 
@@ -253,7 +263,7 @@ class PagedHSTUInferLayer(MegatronModule):
             alpha=self._alpha,
             rab=None,
             has_drab=False,
-            is_delta_q=False,
+            is_delta_q=True,
             kv_cache=kv_cache_table,
             page_offsets=kv_cache_metadata.kv_indptr,
             page_ids=kv_cache_metadata.kv_indices,
@@ -271,9 +281,10 @@ class PagedHSTUInferLayer(MegatronModule):
             eps=self._eps,
         )
 
-        self.output_buffer_[:num_tokens, ...] = self._linear_proj(parallel_input)
         if self._residual:
-            self.output_buffer_[:num_tokens, ...].add(input_tensor)
+            torch.add(self._linear_proj(parallel_input), input_tensor, out=self.output_buffer_[:num_tokens, ...])
+        else:
+            self.output_buffer_[:num_tokens, ...] = self._linear_proj(parallel_input)
         
         return self.output_buffer_[:num_tokens, ...]
 

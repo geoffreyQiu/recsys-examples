@@ -277,21 +277,24 @@ class HSTUBlock(MegatronModule):
         return self.hstu_postprocess(jd)
 
     @output_nvtx_hook(nvtx_tag="hstu_predict")
-    def predict(self, batch_size: int, num_tokens: int, hidden_states: torch.Tensor, jd: JaggedData, kv_cache_metadata) -> JaggedData:
-        if self._hstu_graph is None:
+    def predict(self, batch_size: int, num_tokens: int, hidden_states: torch.Tensor, jd: JaggedData, kv_cache_metadata, use_cudagraph: bool = True) -> JaggedData:
+        if self._hstu_graph is None or not use_cudagraph:
             hidden_data = hidden_states
             for hstu_layer in self._attention_layers:
-                hidden_data = hstu_layer(num_tokens, hidden_data, jd, kv_cache_metadata)
-            jd.values = hidden_data
-            return jd
+                hidden_data = hstu_layer.forward_naive(batch_size, num_tokens, hidden_data, jd, kv_cache_metadata)
+            return hidden_data
         else:
             batch_size = 2**math.ceil(math.log2(batch_size))
-            num_tokens_pow2 = max(32, 2**math.ceil(math.log2(num_tokens)))
+            if num_tokens not in self._hstu_graph[batch_size]:
+                num_tokens_pow2 = max(32, 2**math.ceil(math.log2(num_tokens)))
+            else:
+                num_tokens_pow2 = num_tokens
+            # print("choosing", "batch_size", batch_size, "num_tokens", num_tokens_pow2)
             self._hstu_graph[batch_size][num_tokens_pow2].replay()
-            hidden_states[:num_tokens, ...].copy_(
+            hstu_output = torch.zeros_like(hidden_states[:num_tokens, ...])
+            hstu_output.copy_(
                 self._attention_layers[-1].output_buffer_[:num_tokens, ...], non_blocking = True)
-            jd.values = hidden_states
-            return jd
+            return self._attention_layers[-1].output_buffer_[:num_tokens, ...]
 
     def predict_naive(self, batch_size: int, num_tokens: int, hidden_states: torch.Tensor, jd: JaggedData, kv_cache_metadata) -> JaggedData:
         with torch.inference_mode():
@@ -312,8 +315,7 @@ class HSTUBlock(MegatronModule):
             hidden_data = hidden_states
             for hstu_layer in self._attention_layers:
                 hidden_data = hstu_layer(batch_size, num_tokens, hidden_data, jagged_metadata, kv_cache_metadata)
-            jd.values = hidden_data
-            return jd
+            return hidden_data
 
     def set_cudagraph(self, max_batch_size, max_seq_len, static_hidden_states, static_jagged_metadata, static_kvcache_metadata):
         if self._hstu_graph is None:
@@ -328,7 +330,9 @@ class HSTUBlock(MegatronModule):
             self._hstu_graph[max_batch_size][max_num_tokens] = graph_max
 
             bs_list = [ 2 ** i for i in range(math.ceil(math.log2(max_batch_size)) + 1) ]
-            num_tokens_list =  [ 2 ** i for i in range(5, math.ceil(math.log2(max_num_tokens)) + 1) ]
+            num_tokens_list = [ 2 ** i for i in range(5, math.ceil(math.log2(max_num_tokens)) + 1) ]
+            num_tokens_list = sorted(num_tokens_list + [1280, 2304, 2560, 4608, 5120, 9216])
+            print(num_tokens_list)
 
             for batch_size in bs_list:
                 if batch_size not in self._hstu_graph:
@@ -368,6 +372,8 @@ class HSTUBlock(MegatronModule):
                          device = static_jagged_metadata.num_candidates.device
             ) * default_num_candidates)
 
+        static_kvcache_metadata.total_history_offsets += static_jagged_metadata.num_candidates_offsets
+
         # Warmup
         with torch.cuda.stream(graph_capture_warmup_stream):
             for _ in range(3):
@@ -379,5 +385,7 @@ class HSTUBlock(MegatronModule):
         with torch.cuda.graph(graph, pool=memory_pool):
             static_output = self.predict_naive(batch_size, num_tokens, static_hidden_states, static_jagged_metadata, static_kvcache_metadata)
         end_free_memory = torch.cuda.mem_get_info()[0]
+
+        static_kvcache_metadata.total_history_offsets -= static_jagged_metadata.num_candidates_offsets
         print("Capture graph for", (batch_size, num_tokens), 'cuda graph memory: %fGB'%((start_free_memory - end_free_memory) / 1024 / 1024 / 1024))
         return graph

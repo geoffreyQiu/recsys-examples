@@ -99,31 +99,14 @@ class HSTUGpuKVCacheManager:
             dtype=torch.bfloat16, device=torch.cuda.current_device())
 
     def allocate(self, batch: RankingBatch, user_ids: torch.Tensor):
-        batch_size = user_ids.shape[0]
-        seq_lengths = batch.features.lengths()[:batch_size] + torch.zeros_like(batch.features.lengths()[:batch_size])
-        for idx in range(batch_size, batch.features.lengths().shape[0], batch_size):
-            seq_lengths += batch.features.lengths()[idx:idx+batch_size]
-        seq_lengths = seq_lengths.to('cpu')
-        num_candidates = batch.num_candidates.to('cpu') * 2
-        # allocate KV Cache
+        num_feas = len(batch.features.keys())
+        batch_size = batch.batch_size
+        new_history_lengths = torch.sum(batch.features.lengths().view(num_feas, batch_size), 0).view(-1) - batch.num_candidates * 2
+        new_history_lengths = new_history_lengths.cpu()
         for idx in range(batch_size):
             user_id = user_ids[idx].item()
-            req_beam_width = 1
-            delta_hist_length = seq_lengths[idx] - num_candidates[idx]
-            self.impl.add_sequence_with_eviction(user_id, delta_hist_length, req_beam_width, None)
-        
-        return
-    
-    def append_paged_kv_data(self, 
-        layer_idx: int,
-        key: torch.Tensor, 
-        value: torch.Tensor, 
-        metadata: KVCacheMetadata,
-        seqlen_offsets: torch.Tensor,
-        num_candidates_offsets: torch.Tensor
-    ):  
-        
-        return
+            new_history_length = new_history_lengths[idx].item()
+            self.impl.add_sequence_with_eviction(user_id, new_history_length, 1, None)
     
     def evict(self, user_ids):
         for idx in range(user_ids.shape[0]):
@@ -160,18 +143,26 @@ class HSTUGpuKVCacheManager:
         for idx in range(batch_size):
             user_id = user_ids[idx]
             
-            cached_history_length = int(os.getenv("CACHED_LEN")) + self.impl.get_num_tokens_cached(user_id)
+            cached_history_length = self.impl.get_num_tokens_cached(user_id)
             cached_history_lengths[idx] = cached_history_length
+
+            # synthetic test
+            cached_history_length += int(os.getenv("CACHED_LEN"))
+            cached_history_lengths[idx] = cached_history_length
+
             last_page_length = cached_history_length % self.tokens_per_block
             last_page_length = self.tokens_per_block if last_page_length == 0 else last_page_length
             kv_cache_last_page_lengths[idx] = last_page_length
 
             kv_page_ids = self.impl.get_cache_block_ids(user_id)[0]
-            fakeout_cached_pages_num = (cached_history_length - last_page_length)//self.tokens_per_block + 1 - len(kv_page_ids)
             page_ids.extend(kv_page_ids)
+
+            # synthetic test
+            fakeout_cached_pages_num = (cached_history_length - last_page_length)//self.tokens_per_block + 1 - len(kv_page_ids)
             page_ids.extend([ _ for _ in range(last_fakeout_page_id, last_fakeout_page_id+fakeout_cached_pages_num)])
-            kv_cache_page_indptr[idx + 1] = len(page_ids)
             last_fakeout_page_id = last_fakeout_page_id+fakeout_cached_pages_num
+
+            kv_cache_page_indptr[idx + 1] = len(page_ids)
 
         device = batch.features.values().device
         kv_cache_page_ids = torch.tensor(page_ids, dtype=torch.int32, device=device)
@@ -198,6 +189,9 @@ class HSTUGpuKVCacheManager:
         )
         new_history_nnz_cuda=torch.full((1,), delta_history_token_nnz, dtype=torch.int32, device=device)
 
+        total_history_offsets = torch.zeros_like(kv_cache_page_indptr)
+        # torch.cumsum(cached_history_lengths, 0, out=total_history_offsets[1:])
+
         max_delta_history_length = torch.max(delta_history_length).item()
         max_num_candidate = torch.max(num_candidates).item()
         return KVCacheMetadata(
@@ -207,7 +201,9 @@ class HSTUGpuKVCacheManager:
             batch_indices=history_batch_indices,
             position=history_positions,
             delta_history_token_nnz=delta_history_token_nnz,
-            new_history_nnz_cuda=new_history_nnz_cuda
+            new_history_nnz_cuda=new_history_nnz_cuda,
+            total_history_offsets=total_history_offsets,
+            onload_history_kv_events = [ torch.cuda.Event() for _ in range(self.num_layers) ],
         )
     
     def get_page_size(self) -> int:

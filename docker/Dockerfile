@@ -37,10 +37,10 @@ FROM ${DEVEL_IMAGE} AS build
 WORKDIR /workspace/recsys-examples
 COPY . .
 
-RUN cd /workspace/recsys-examples/corelib/dynamicemb && \
-    python setup.py install
+# RUN cd /workspace/recsys-examples/corelib/dynamicemb && \
+#     python setup.py install
     
-RUN cd /workspace/recsys-examples/corelib/hstu && \
-    HSTU_DISABLE_LOCAL=TRUE HSTU_DISABLE_RAB=TRUE HSTU_DISABLE_DELTA_Q=TRUE HSTU_DISABLE_DRAB=TRUE pip install . && \
-    cd hopper && \
-    HSTU_DISABLE_SM8x=TRUE HSTU_DISABLE_LOCAL=TRUE HSTU_DISABLE_RAB=TRUE HSTU_DISABLE_DELTA_Q=TRUE HSTU_DISABLE_DRAB=TRUE pip install .
+# RUN cd /workspace/recsys-examples/corelib/hstu && \
+#     HSTU_DISABLE_LOCAL=TRUE HSTU_DISABLE_RAB=TRUE HSTU_DISABLE_DELTA_Q=TRUE HSTU_DISABLE_DRAB=TRUE pip install . && \
+#     cd hopper && \
+#     HSTU_DISABLE_SM8x=TRUE HSTU_DISABLE_LOCAL=TRUE HSTU_DISABLE_RAB=TRUE HSTU_DISABLE_DELTA_Q=TRUE HSTU_DISABLE_DRAB=TRUE pip install .

@@ -114,9 +114,9 @@ __global__ void AppendPagedKVCacheKernel(DType* k_data,
 #pragma unroll 4
   for (uint32_t i = cta_id; i < nnz; i += num_ctas) {
     uint32_t page_iter, entry_idx;
-    divmod(indptr[batch_indices[i]] * page_size + positions[i], page_size, m, s, a,
+    divmod(positions[i], page_size, m, s, a,
            page_iter, entry_idx);
-    size_t elem_offset = __ldg(indices + page_iter) * stride_page + head_idx * stride_h + entry_idx * stride_n + tx * vec_size;
+    size_t elem_offset = __ldg(indices + indptr[batch_indices[i]] + page_iter) * stride_page + head_idx * stride_h + entry_idx * stride_n + tx * vec_size;
     DType* k_ptr = k_data + elem_offset;
     DType* v_ptr = v_data + elem_offset;
     vec_t<DType, vec_size>::memcpy(

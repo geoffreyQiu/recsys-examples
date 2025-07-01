@@ -110,7 +110,7 @@ class Batch:
         for fc in feature_configs:
             if fc.is_jagged:
                 seqlen = torch.randint(
-                    fc.max_sequence_length, (batch_size,), device=device
+                    fc.max_sequence_length // 2, fc.max_sequence_length, (batch_size,), device=device
                 )
             else:
                 seqlen = torch.full(
@@ -124,10 +124,13 @@ class Batch:
                 values.append(value)
                 lengths.append(seqlen)
                 if max_num_candidates > 0 and feature_name == item_feature_name:
-                    non_candidates_seqlen = torch.clamp(
-                        seqlen - max_num_candidates, min=0
-                    )
-                    num_candidates = seqlen - non_candidates_seqlen
+                    if fc.is_jagged:
+                        non_candidates_seqlen = torch.clamp(
+                            seqlen - torch.randint(max_num_candidates//2, max_num_candidates, (batch_size,), device=device), min=1
+                        )
+                        num_candidates = seqlen - non_candidates_seqlen
+                    else:
+                        num_candidates = torch.full((batch_size,), max_num_candidates, device=device)
                 feature_to_max_seqlen[feature_name] = fc.max_sequence_length
         return Batch(
             features=KeyedJaggedTensor.from_lengths_sync(

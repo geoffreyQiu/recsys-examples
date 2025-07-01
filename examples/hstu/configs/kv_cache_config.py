@@ -41,6 +41,7 @@ class KVCacheMetadata:
     # max_num_candidate: int
     delta_history_token_nnz: int
     new_history_nnz_cuda: torch.Tensor
+    total_history_offsets: torch.Tensor
 
     kv_cache_table: List[torch.Tensor] = None
 
@@ -117,17 +118,20 @@ def get_kvcache_metadata_buffer(hstu_config: HSTUConfig, kvcache_config: KVCache
         hstu_config.num_attention_heads * hstu_config.kv_channels
     )
 
+    default_num_pages_per_seq = 4
     paged_indices_buffer = torch.randint(
         kvcache_config.blocks_in_primary_pool, (kvcache_config.max_batch_size * max_num_pages_per_seq,),
         dtype=torch.int32, device=device)
     page_indptr_buffer = torch.arange(
-        kvcache_config.max_batch_size + 1, dtype=torch.int32, device=device) * max_num_pages_per_seq
+        kvcache_config.max_batch_size + 1, dtype=torch.int32, device=device) * default_num_pages_per_seq
     last_page_lens_buffer = torch.full(
         (kvcache_config.max_batch_size, ), kvcache_config.tokens_per_block, dtype=torch.int32, device=device)
     batch_indices_buffer = torch.zeros(
         (max_new_history_seqlen, ), dtype=torch.int32, device=device)
     position_buffer = torch.zeros(
         (max_new_history_seqlen, ), dtype=torch.int32, device=device)
+    total_history_offsets_buffer = torch.arange(
+        kvcache_config.max_batch_size + 1, dtype=torch.int32, device=device) * default_num_pages_per_seq * kvcache_config.tokens_per_block
     return KVCacheMetadata(
             kv_indices = paged_indices_buffer,
             kv_indptr = page_indptr_buffer,
@@ -136,7 +140,8 @@ def get_kvcache_metadata_buffer(hstu_config: HSTUConfig, kvcache_config: KVCache
             position = position_buffer,
             delta_history_token_nnz = max_new_history_seqlen,
             new_history_nnz_cuda = torch.ones((1), dtype=torch.int32, device=device),
-            onload_history_kv_buffer = [ 
+            total_history_offsets = total_history_offsets_buffer,
+            onload_history_kv_buffer = [
                 torch.empty(max_host_kv_buffer_size, dtype=dtype, device=device)
                 for _ in range(hstu_config.num_layers) ],
             onload_history_kv_events = [ torch.cuda.Event() for _ in range(hstu_config.num_layers) ]
@@ -146,6 +151,11 @@ def copy_kvcache_metadata(dst_metadata, src_metata):
 
     def copy_tensor(dst, src):
         dst[:src.shape[0], ...].copy_(src, non_blocking=True)
+        dst[src.shape[0]:, ...] *= 0
+    
+    def copy_offsets(dst, src):
+        dst[:src.shape[0], ...].copy_(src, non_blocking=True)
+        dst[src.shape[0]:, ...] = src[-1, ...]
     
     copy_tensor(dst_metadata.kv_indices, src_metata.kv_indices)
     copy_tensor(dst_metadata.kv_indptr, src_metata.kv_indptr)
@@ -153,5 +163,6 @@ def copy_kvcache_metadata(dst_metadata, src_metata):
     copy_tensor(dst_metadata.batch_indices, src_metata.batch_indices)
     copy_tensor(dst_metadata.position, src_metata.position)
     copy_tensor(dst_metadata.new_history_nnz_cuda, src_metata.new_history_nnz_cuda)
+    copy_offsets(dst_metadata.total_history_offsets, src_metata.total_history_offsets)
 
     dst_metadata.delta_history_token_nnz = src_metata.delta_history_token_nnz
