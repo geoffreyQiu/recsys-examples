@@ -27,7 +27,7 @@ from ops.triton_ops.triton_paged_hstu_attention import (
 import hstu_attn
 import append_kvcache
 
-class PagedHSTUInferLayer(MegatronModule):
+class PagedHSTUInferLayer(torch.nn.Module):
     """
     x = ln(x)
     u,v,q,k = silu(linear_bias(x))
@@ -54,7 +54,7 @@ class PagedHSTUInferLayer(MegatronModule):
         self._eps = config.layernorm_epsilon
         self._is_causal = config.is_causal
         self._target_group_size = config.target_group_size
-        self._alpha = 1.0
+        self._alpha = 1.0 / (self._attention_dim_per_head**0.5)
         self._residual = config.residual
 
         self._split_arg_list = [
@@ -158,7 +158,7 @@ class PagedHSTUInferLayer(MegatronModule):
             kv_cache_metadata.position,
             jd.num_candidates_offsets,
             kv_cache_metadata.new_history_nnz_cuda,
-            num_tokens, # kv_cache_metadata.delta_history_token_nnz,
+            num_tokens, # kv_cache_metadata.new_history_nnz,
             paged_k_cache, paged_v_cache,
             kv_cache_metadata.kv_indices,
             kv_cache_metadata.kv_indptr,
@@ -235,7 +235,7 @@ class PagedHSTUInferLayer(MegatronModule):
             kv_cache_metadata.position,
             jd.num_candidates_offsets[:batch_size+1],
             kv_cache_metadata.new_history_nnz_cuda,
-            num_tokens, # kv_cache_metadata.delta_history_token_nnz,
+            num_tokens, # kv_cache_metadata.new_history_nnz,
             paged_k_cache, paged_v_cache,
             kv_cache_metadata.kv_indices,
             kv_cache_metadata.kv_indptr,
@@ -329,7 +329,7 @@ class PagedHSTUInferLayer(MegatronModule):
             kv_cache_metadata.position,
             jd.num_candidates_offsets,
             kv_cache_metadata.new_history_nnz_cuda,
-            num_tokens, # kv_cache_metadata.delta_history_token_nnz,
+            num_tokens, # kv_cache_metadata.new_history_nnz,
             paged_k_cache, paged_v_cache,
             kv_cache_metadata.kv_indices,
             kv_cache_metadata.kv_indptr,
