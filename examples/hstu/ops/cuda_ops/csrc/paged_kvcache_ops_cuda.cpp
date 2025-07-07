@@ -26,7 +26,6 @@
 // #include <ATen/ATen.h>
 #include <torch/extension.h>
 #include <torch/serialize/tensor.h>
-#include <iostream>
 
 template <typename DType, typename IdType>
 cudaError_t AppendPagedKVCache(DType* k_data,
@@ -142,8 +141,7 @@ void append_paged_kv_cache(at::Tensor append_key, at::Tensor append_value, at::T
               "AppendPagedKVCache failed with error: ", cudaGetErrorString(status));
 }
 
-void offload_paged_kv_cache(at::Tensor host_kv_buffer,
-                            at::Tensor gather_kv_gpu_buffer,
+void gather_paged_kv_cache(t::Tensor gather_kv_gpu_buffer,
                             at::Tensor paged_kv_cache,
                             at::Tensor page_ids_to_offload,
                             unsigned int num_pages,
@@ -152,8 +150,6 @@ void offload_paged_kv_cache(at::Tensor host_kv_buffer,
 
   TORCH_CHECK(paged_kv_cache.ndimension() == 5, 
               "kv cache table must has 5 dimensions (num_pages, 2, page_size, num_head, head_dim).");
-  TORCH_CHECK(host_kv_buffer.nbytes() == gather_kv_gpu_buffer.nbytes(), 
-              "host kv buffer and gather_kv_gpu_buffer must have same nbytes");
   
   unsigned int num_heads, page_size, head_dim;
   head_dim = paged_kv_cache.size(4);
@@ -170,13 +166,11 @@ void offload_paged_kv_cache(at::Tensor host_kv_buffer,
   auto stride_h = (kv_layout == 1) ? page_size * head_dim : head_dim;
   auto stride_k2v = paged_kv_cache.stride(1);
 
-  // get input/output strides
-  TORCH_CHECK(host_kv_buffer.strides() == gather_kv_gpu_buffer.strides(), 
+  // check input/output strides
+  TORCH_CHECK(paged_kv_cache.strides() == gather_kv_gpu_buffer.strides(), 
               "input/ouput strides must be identical");
-  TORCH_CHECK(host_kv_buffer.strides() == paged_kv_cache.strides(), 
-              "input/ouput strides must be identical");
-  TORCH_CHECK(host_kv_buffer.is_contiguous() == paged_kv_cache.is_contiguous(), 
-              " buffer must be contiguous");
+  TORCH_CHECK(paged_kv_cache.is_contiguous() && paged_kv_cache.is_contiguous(), 
+              "buffer must be contiguous");
   
   auto kv_scalar_dtype = paged_kv_cache.scalar_type();
 
@@ -208,16 +202,9 @@ void offload_paged_kv_cache(at::Tensor host_kv_buffer,
   }
   TORCH_CHECK(status == cudaSuccess,
               "GatherPagedKVCache failed with error: ", cudaGetErrorString(status));
-  
-  auto data_size = host_kv_buffer.nbytes();
-  status = cudaMemcpyAsync(static_cast<void*>(host_kv_buffer.data_ptr()), 
-                           static_cast<void*>(gather_kv_gpu_buffer.data_ptr()), 
-                           data_size, cudaMemcpyDeviceToHost, stream);
-  TORCH_CHECK(status == cudaSuccess,
-              "OffloadPagedKVCache failed with error: ", cudaGetErrorString(status));
 }
 
 PYBIND11_MODULE(paged_kvcache_ops, m) {
   m.def("append_kvcache", &append_paged_kv_cache, "append paged kv cache on GPU");
-  m.def("offload_kvcache", &offload_paged_kv_cache, "gather paged kv cache and offload from GPU to host");
+  m.def("gather_kvcache", &offload_paged_kv_cache, "gather paged kv cache on GPU");
 }

@@ -6,6 +6,13 @@ from .hstu_config import (
     PositionEncodingConfig,
     get_hstu_config,
 )
+from .kv_cache_config import (
+    KVCacheConfig,
+    KVCacheMetadata,
+    copy_kvcache_metadata,
+    get_kvcache_config,
+    get_kvcache_metadata_buffer,
+)
 from .task_config import (
     OptimizerParam,
     RankingConfig,
@@ -26,4 +33,9 @@ __all__ = [
     "ShardedEmbeddingConfig",
     "KernelBackend",
     "HSTULayerType",
+    "KVCacheMetadata",
+    "KVCacheConfig",
+    "get_kvcache_config",
+    "get_kvcache_metadata_buffer",
+    "copy_kvcache_metadata",
 ]

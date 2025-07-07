@@ -275,12 +275,12 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             extension_args = ()
             if sm_major_version == 8:
                 cutlass_hstu_varlen_fwd = flash_attn_cuda_ampere.varlen_fwd
-		ampere_paged_kv_args = (None, None, None, None, None)
-		extension_args = ampere_paged_kv_args
+                ampere_paged_kv_args = (None, None, None, None, None)
+                extension_args = ampere_paged_kv_args
             elif sm_major_version == 9:
                 cutlass_hstu_varlen_fwd = flash_attn_cuda_hopper.varlen_fwd
                 hopper_fp8_args = (None, None, None)
-		extension_args = hopper_fp8_args
+                extension_args = hopper_fp8_args
 
             else:
                 raise ValueError(f"Unsupported SM major version: {sm_major_version}")
