@@ -13,14 +13,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from typing import List, Optional
+from functools import wraps
 
 import torch
-from commons.utils.nvtx_op import output_nvtx_hook
-from megatron.core.transformer.module import MegatronModule
+try:
+    from commons.utils.nvtx_op import output_nvtx_hook
+    from megatron.core.transformer.module import MegatronModule
+    BaseModule = MegatronModule
+except:
+    def output_nvtx_hook(nvtx_tag):
+        def decorator(module):
+            @wraps(module)
+            def forward(*args, **kwags):
+                return module(*args, **kwags)
+            return forward
+        return decorator
+    BaseModule = torch.nn.Module
 from modules.utils import init_mlp_weights_optional_bias
 
 
-class MLP(MegatronModule):
+class MLP(BaseModule):
     """
     Multi-Layer Perceptron (MLP) module wrapper for processing jagged data.
 
@@ -42,7 +54,10 @@ class MLP(MegatronModule):
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float32,
     ) -> None:
-        super(MegatronModule, self).__init__()
+        if BaseModule is torch.nn.Module:
+            super().__init__()
+        else:
+            super(BaseModule, self).__init__()
 
         if activation == "relu":
             activation_fn = torch.nn.ReLU
