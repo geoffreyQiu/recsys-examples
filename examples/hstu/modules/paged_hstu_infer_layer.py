@@ -237,7 +237,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
         if self._residual:
             torch.add(layer_output, layer_input, out=layer_output)
 
-        return jagged_attn_output
+        return layer_output
 
     @torch.inference_mode()
     def forward_input(
@@ -276,7 +276,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
             kv_cache_metadata.position,
             jd.num_candidates_offsets[: batch_size + 1],
             kv_cache_metadata.new_history_nnz_cuda,
-            num_tokens,  # kv_cache_metadata.new_history_nnz,
+            num_tokens,  # kv_cache_metadata.new_history_nnz
             paged_k_cache,
             paged_v_cache,
             kv_cache_metadata.kv_indices,
@@ -329,7 +329,6 @@ class PagedHSTUInferLayer(torch.nn.Module):
             last_page_lens=kv_cache_metadata.kv_last_page_len,
             seq_offsets_t=jd.num_candidates_offsets[: batch_size + 1],
         )
-        # torch.cuda.synchronize()
 
         jagged_attn_output = jagged_attn_output.view(
             -1, self._num_heads * self._linear_dim_per_head

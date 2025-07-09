@@ -168,7 +168,7 @@ def get_kvcache_metadata_buffer(hstu_config: HSTUConfig, kvcache_config: KVCache
 def copy_kvcache_metadata(dst_metadata: KVCacheMetadata, src_metata: KVCacheMetadata):
     def copy_tensor(dst, src):
         dst[: src.shape[0], ...].copy_(src, non_blocking=True)
-        dst[src.shape[0] :, ...] *= 0
+        dst[src.shape[0] :, ...] = 0
 
     def copy_offsets(dst, src):
         dst[: src.shape[0], ...].copy_(src, non_blocking=True)

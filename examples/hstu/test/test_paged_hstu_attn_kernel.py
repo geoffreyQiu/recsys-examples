@@ -98,7 +98,6 @@ def _hstu_attention_maybe_from_cache(
 ):
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     B: int = q_offsets.size(0) - 1
-    q.dtype
     if is_delta_q:
         padded_q = pad_input_delta_q(q, q_offsets, k_offsets, B, seqlen_k)
     else:
