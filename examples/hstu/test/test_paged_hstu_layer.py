@@ -14,14 +14,16 @@
 # limitations under the License.
 import itertools
 from typing import List, Optional
+import sys
+sys.path.append('../commons/utils')
+from hstu_assert_close import assert_hstu_close
 
 import flashinfer
 import pytest
 import torch
 import torch.nn.functional as F
-from commons.utils.hstu_assert_close import assert_hstu_close
 from configs import (
-    HSTUConfig,
+    InferenceHSTUConfig,
     KVCacheMetadata,
     copy_kvcache_metadata,
     get_kvcache_config,
@@ -509,11 +511,11 @@ def generate_test_input_data(
 
 class TestModule:
     def __init__(self):
-        hstu_config = HSTUConfig(
+        hstu_config = InferenceHSTUConfig(
             hidden_size=1024,
-            kv_channels=128,
-            num_attention_heads=4,
             num_layers=4,
+            num_heads=4,
+            head_dim=128,
             bf16=True,
         )
         self.kvcache_config = get_kvcache_config(
@@ -527,8 +529,8 @@ class TestModule:
 
         self.embedding_dim = hstu_config.hidden_size
         self.num_layers = hstu_config.num_layers
-        self.num_heads = hstu_config.num_attention_heads
-        self.head_dim = hstu_config.kv_channels
+        self.num_heads = hstu_config.num_heads
+        self.head_dim = hstu_config.head_dim
         self.dtype = torch.bfloat16
         self.max_batchsize = self.kvcache_config.max_batch_size
         self.max_len_per_seq = self.kvcache_config.max_seq_len
@@ -712,7 +714,8 @@ class TestModule:
             jagged_metadata,
             self.static_kvcache_metadata,
             host_kv_data,
-            use_cudagraph=False)
+            use_cudagraph=False,
+        )
         torch.cuda.synchronize()
 
         ref_output = self.get_reference_hstu_output(

@@ -16,7 +16,7 @@ import hstu_attn
 import paged_kvcache_ops
 import torch
 import torch.nn.functional as F
-from configs import HSTUConfig, KVCacheConfig
+from configs import InferenceHSTUConfig, KVCacheConfig
 from modules.jagged_data import JaggedData
 
 
@@ -32,19 +32,16 @@ class PagedHSTUInferLayer(torch.nn.Module):
     """
 
     def __init__(
-        self, config: HSTUConfig, kv_cache_config: KVCacheConfig, layer_idx: int
+        self, config: InferenceHSTUConfig, kv_cache_config: KVCacheConfig, layer_idx: int
     ):
-        assert (
-            config.tensor_model_parallel_size == 1
-        ), "PagedHSTUBlock does not support tensor model parallel"
         super().__init__()
         self.layer_idx = layer_idx
         self._embedding_dim: int = config.hidden_size
         # per head dim;
-        self._linear_dim_per_head: int = config.kv_channels
-        self._attention_dim_per_head: int = config.kv_channels
+        self._linear_dim_per_head: int = config.head_dim
+        self._attention_dim_per_head: int = config.head_dim
 
-        self._num_heads: int = config.num_attention_heads
+        self._num_heads: int = config.num_heads
 
         self._eps = config.layernorm_epsilon
         self._is_causal = config.is_causal

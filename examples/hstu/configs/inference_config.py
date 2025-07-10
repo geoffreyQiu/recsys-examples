@@ -17,7 +17,7 @@ from typing import List, Optional
 
 import torch
 
-from . import HSTUConfig
+from .hstu_config import PositionEncodingConfig
 
 
 @dataclass
@@ -103,7 +103,95 @@ def get_kvcache_config(
     )
 
 
-def get_kvcache_metadata_buffer(hstu_config: HSTUConfig, kvcache_config: KVCacheConfig):
+@dataclass
+class InferenceHSTUConfig:
+    """
+    InferenceHSTUConfig is a configuration data class for the inference HSTU model.
+
+    Args:
+        hidden_size (int): The hidden states dimension size.
+        num_layers (int): Number of attention layers.
+        num_heads (int): Number of attention heads.
+        head_dim (int): Number of key-value channels (per attention head).
+        layernorm_epsilon (float): Epsilon value for normalization.
+        bf16 (bool): Whether to inference in bfloat16.
+        fp16 (bool): Whether to inference in float16.
+
+        learnable_input_layernorm (bool): Whether to have input layernorm weights.
+        residual (bool): Whether to add residual connection.
+        is_causal (bool):Whether the attention is causal.
+        target_group_size (int):  The size of the sub-candidate group where causal attention is applied only within a sub-group (usually in the case of ranking).
+        position_encoding_config (PositionEncodingConfig, optional): Position embedding config.
+    """
+    hidden_size: int
+    num_layers: int
+    num_heads: int
+    head_dim: int
+    layernorm_epsilon: float = 1e-5
+    bf16: bool = True
+    fp16: bool = False
+
+    learnable_input_layernorm: bool = True
+    residual: bool = True
+    is_causal: bool = True
+    target_group_size: int = 1
+    position_encoding_config: Optional[PositionEncodingConfig] = None
+
+    def __post_init__(self):
+        assert self.is_causal
+        assert self.target_group_size == 1
+
+
+def get_inference_hstu_config(
+    hidden_size: int,
+    num_layers: int,
+    num_attention_heads: int,
+    head_dim: int,
+    norm_epsilon=1e-5,
+    dtype: torch.dtype = torch.bfloat16,
+    learnable_input_layernorm: bool = True,
+    residual: bool = True,
+    is_causal: bool = True,
+    target_group_size: int = 1,
+    position_encoding_config: Optional[PositionEncodingConfig] = None,
+) -> InferenceHSTUConfig:
+    """
+    Create the HSTU configuration.
+
+    Args:
+        hidden_size (int): The hidden dimension size.
+        num_layers (int): Number of attention layers.
+        num_attention_heads (int): Number of attention heads.
+        head_dim (int): Number of key-value channels (per attention head).
+        norm_epsilon (float, optional): Epsilon value for normalization. Defaults to 1e-5.
+        dtype (torch.dtype): Data type (e.g., torch.float16).
+        learnable_input_layernorm (bool, optional): Whether to have input layernorm weights. Defaults to True.
+        residual (bool, optional): Whether to add residual connection. Defaults to True.
+        is_causal (bool, optional): Whether the attention is causal. Defaults to False.
+        target_group_size (int, optional): The size of the sub-candidate group where causal attention is applied only within a sub-group (usually in the case of ranking). Defaults to 1.
+        position_encoding_config (Optional[PositionEncodingConfig], optional): Position embedding config. Defaults to None.
+    Returns:
+        HSTUConfig: The HSTU configuration object.
+    """
+    is_bf16 = dtype == torch.bfloat16
+    is_fp16 = dtype == torch.float16
+    return InferenceHSTUConfig(  # type: ignore
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        num_heads=num_attention_heads,
+        head_dim=head_dim,
+        layernorm_epsilon=norm_epsilon,
+        bf16=is_bf16,
+        fp16=is_fp16,
+        learnable_input_layernorm=learnable_input_layernorm,
+        residual=residual,
+        is_causal=is_causal,
+        target_group_size=target_group_size,
+        position_encoding_config=position_encoding_config,
+    )
+
+
+def get_kvcache_metadata_buffer(hstu_config: InferenceHSTUConfig, kvcache_config: KVCacheConfig):
     device = torch.cuda.current_device()
     torch.bfloat16 if hstu_config.bf16 else torch.float16 if hstu_config.fp16 else torch.float32
 
@@ -116,7 +204,7 @@ def get_kvcache_metadata_buffer(hstu_config: HSTUConfig, kvcache_config: KVCache
     ) // kvcache_config.page_size
     max_host_kv_buffer_size = (
         kvcache_config.max_batch_size * kvcache_config.max_seq_len,
-        hstu_config.num_attention_heads * hstu_config.kv_channels,
+        hstu_config.num_heads * hstu_config.head_dim,
     )
 
     default_num_pages_per_seq = 4

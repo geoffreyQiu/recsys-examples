@@ -5,11 +5,8 @@ import math
 from typing import Dict, Optional
 
 import torch
-from commons.utils.nvtx_op import output_nvtx_hook
-from configs.hstu_config import HSTUConfig
-from configs.kv_cache_config import KVCacheConfig
+from configs import InferenceHSTUConfig, KVCacheConfig
 from dataset.utils import Batch
-from megatron.core.transformer.module import MegatronModule
 from modules.jagged_data import JaggedData
 from modules.paged_hstu_infer_layer import PagedHSTUInferLayer
 from modules.position_encoder import HSTUPositionalEncoder
@@ -22,21 +19,21 @@ from ops.triton_ops.triton_jagged import (  # type: ignore[attr-defined]
 from torchrec.sparse.jagged_tensor import JaggedTensor
 
 
-class HSTUBlockInference(MegatronModule):
+class HSTUBlockInference(torch.nn.Module):
     """
     HSTUBlock module. A stack of HSTULayers.
 
     Args:
-        config (HSTUConfig): Configuration for the HSTU block.
+        config (InferenceHSTUConfig): Configuration for the HSTU block.
     """
 
     def __init__(
         self,
-        config: HSTUConfig,
-        kvcache_config: KVCacheConfig = None,
+        config: InferenceHSTUConfig,
+        kvcache_config: KVCacheConfig,
     ):
-        super().__init__(config=config)
-        self._training_dtype = torch.float32
+        super().__init__()
+        self.config = config
         if self.config.bf16:
             self._training_dtype = torch.bfloat16
         if self.config.fp16:
@@ -60,7 +57,6 @@ class HSTUBlockInference(MegatronModule):
         )
         self._hstu_graph = None
 
-    @output_nvtx_hook(nvtx_tag="HSTUBlock preprocess", hook_key_or_attr_name="values")
     def hstu_preprocess(
         self, embeddings: Dict[str, JaggedTensor], batch: Batch
     ) -> JaggedData:
@@ -97,13 +93,19 @@ class HSTUBlockInference(MegatronModule):
             item_embs, action_embs = item_jt.values(), action_jt.values()
 
             # pyre-ignore
-            interleaved_embeddings = [(
-                torch.cat([
-                    item_embs[item_offsets[idx] : candidates_indptr[idx]],
-                    action_embs[action_offsets[idx] : action_offsets[idx + 1]],
-                ], dim=1).view(-1, embedding_dim),
-                item_embs[candidates_indptr[idx] : item_offsets[idx + 1]],
-            ) for idx in range(batch.batch_size) ]
+            interleaved_embeddings = [
+                (
+                    torch.cat(
+                        [
+                            item_embs[item_offsets[idx] : candidates_indptr[idx]],
+                            action_embs[action_offsets[idx] : action_offsets[idx + 1]],
+                        ],
+                        dim=1,
+                    ).view(-1, embedding_dim),
+                    item_embs[candidates_indptr[idx] : item_offsets[idx + 1]],
+                )
+                for idx in range(batch.batch_size)
+            ]
             interleaved_embeddings = list(itertools.chain(*interleaved_embeddings))
             sequence_embeddings = torch.cat(interleaved_embeddings, dim=0).view(
                 -1, embedding_dim
@@ -200,7 +202,6 @@ class HSTUBlockInference(MegatronModule):
             has_interleaved_action=batch.action_feature_name is not None,
         )
 
-    @output_nvtx_hook(nvtx_tag="HSTUBlock postprocess", hook_key_or_attr_name="values")
     def hstu_postprocess(self, jd: JaggedData) -> JaggedData:
         """
         Postprocess the output from the HSTU architecture.
@@ -252,7 +253,6 @@ class HSTUBlockInference(MegatronModule):
             has_interleaved_action=False,
         )
 
-    @output_nvtx_hook(nvtx_tag="HSTUBlock", hook_key_or_attr_name="values")
     def forward(
         self,
         embeddings: Dict[str, JaggedTensor],
@@ -273,7 +273,6 @@ class HSTUBlockInference(MegatronModule):
             jd = hstu_layer(jd)
         return self.hstu_postprocess(jd)
 
-    @output_nvtx_hook(nvtx_tag="hstu_predict")
     def predict(
         self,
         batch_size: int,

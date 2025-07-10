@@ -13,12 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from typing import Optional
+import sys
+sys.path.append('../commons/utils')
+from hstu_assert_close import assert_hstu_close
 
-import commons.utils.initialize as init
 import pytest
 import torch
 import torch.nn.functional as F
-from commons.utils.hstu_assert_close import assert_hstu_close
 from einops import rearrange
 from hstu_attn import hstu_attn_varlen_func
 
@@ -359,12 +360,7 @@ def test_paged_hstu_attn_kernel(
     head_dim,
     max_contextual_seqlen,
 ):
-    init.initialize_distributed()
-    init.set_random_seed(1234)
     device = torch.cuda.current_device()
-    world_size = torch.distributed.get_world_size()
-    if world_size > 1:
-        return
     global_max_seqlen = 4096
 
     kvcache_page_size = 32
@@ -527,4 +523,3 @@ def test_paged_hstu_attn_kernel(
 
         assert_hstu_close(attn_out_paged, attn_out_torch, attn_out_ref, fwd=True)
 
-    init.destroy_global_state()
