@@ -1,4 +1,20 @@
 /******************************************************************************
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+******************************************************************************/
+/******************************************************************************
  * Copyright (c) 2023, Tri Dao.
  * Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES.
  ******************************************************************************/
@@ -338,28 +354,6 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
     cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
   }
 
-  if constexpr (kStages == 2) {
-    auto tVsV_stage_view = tVsV(_, _, _, buffer_stage);
-    flash::copy</*Is_even_MN=*/false, /*Clear_OOB_MN=*/true>(
-        gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV_stage_view, tKVcKV, actual_seqlen_k - n_block * kBlockN);
-    cute::cp_async_fence();
-
-    if (n_block > n_block_min) {
-      int n_block_next = n_block;
-      if (is_jump && n_masking_steps == 1) {
-        n_block_next = std::min(n_block, n_block_history);
-      }
-      auto tKsK_stage_view_next = tKsK(_, _, _, buffer_stage ^ 1);
-      auto tVsV_stage_view_next = tVsV(_, _, _, buffer_stage ^ 1);
-      flash::copy</*Is_even_MN=*/true>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block_next - 1), tKsK_stage_view_next, tKVcKV);
-      flash::copy</*Is_even_MN=*/true>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block_next - 1), tVsV_stage_view_next, tKVcKV);
-      if constexpr (Has_rab) {
-        copy_g2s_rab(n_block_next - 1, buffer_stage ^ 1);
-      }
-      cute::cp_async_fence();
-    }
-  }
-
   clear(acc_o);
 
   auto col_limit_right = [&](int row) {
@@ -420,14 +414,12 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
     }
   };
 
-  int masking_step = 0;
-  for (; n_block > n_block_min; ++masking_step, --n_block) {
+  for (int masking_step = 0; n_block >= n_block_min; ++masking_step, --n_block) {
     // When jumps occur, it is necessary to apply a mask for the mixed situation
     const bool is_masking = masking_step < n_masking_steps || (n_block + 1) * kBlockN > actual_seqlen_h;
     Tensor acc_s = partition_fragment_C(
         tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
-    constexpr int cp_async_wait_num = kStages == 1 ? 0 : 1;
-    flash::cp_async_wait<cp_async_wait_num>();
+    flash::cp_async_wait<0>();
     __syncthreads();
 
     // async load(v)
@@ -445,6 +437,7 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
             gmem_tiled_copy_QKV, tVgV_page(_, _, _, params.page_ids[page_offset + n_block]), tVsV_stage_view, tKVcKV);
       }
     }
+    cute::cp_async_fence();
 
     // compute q @ k + rab
     int n_block_prev = n_block;
@@ -506,64 +499,6 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
     // compute qk @ v
     flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt(_, _, _, buffer_stage), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
   }
-
-  const bool is_masking = masking_step < n_masking_steps || (n_block + 1) * kBlockN > actual_seqlen_h;
-  Tensor acc_s = partition_fragment_C(
-      tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
-  flash::cp_async_wait<0>();
-  __syncthreads();
-
-  if constexpr (kStages == 1) {
-    // async load(v)
-    auto tVsV_stage_view = tVsV(_, _, _, buffer_stage);
-    if (masking_step > 0) {
-      flash::copy</*Is_even_MN=*/true>(
-          gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV_stage_view, tKVcKV);
-    } else {
-      flash::copy</*Is_even_MN=*/false, /*Clear_OOB_MN=*/true>(
-          gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV_stage_view, tKVcKV, actual_seqlen_k - n_block * kBlockN);
-    }
-    cute::cp_async_fence();
-  }
-
-  // compute q @ k + rab
-  if constexpr (Has_rab) {
-    Tensor rRab = make_tensor<Element>(
-        partition_shape_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{}));
-    auto tSrRab_view = smem_thr_copy_rab.retile_D(rRab);
-    cute::copy(smem_tiled_copy_rab, tSsRab(_, _, _, buffer_stage), tSrRab_view(_, _, _));
-    flash::convert_type_safe(rRab, acc_s);
-  } else {
-    clear(acc_s);
-  }
-  flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
-      acc_s, tSrQ, tSrK, tSsQ, tSsK(_, _, _, buffer_stage), tiled_mma, smem_tiled_copy_Q,
-      smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K);
-
-  if (is_masking || Is_local) {
-    apply_mask(acc_s, n_block);
-  }
-  for (int i = 0; i < size(acc_s); ++i) {
-    acc_s(i) *= params.alpha;
-  }
-  fast_silu(acc_s);
-
-  // Convert acc_s from fp32 to fp16/bf16
-  Tensor rP = make_tensor_like<Element>(acc_s);
-  flash::convert_type_safe(acc_s, rP);
-
-  // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2) if using m16n8k16
-  // or (4, MMA_M, MMA_N) if using m16n8k8.
-  Tensor tOrP = make_tensor(
-      rP.data(),
-      flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
-
-  if constexpr (kStages == 1) {
-    flash::cp_async_wait<0>();
-    __syncthreads();
-  }
-  // compute qk @ v
-  flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt(_, _, _, buffer_stage), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
 
   // scale acc_o
   for (int i = 0; i < size(acc_o); ++i) {

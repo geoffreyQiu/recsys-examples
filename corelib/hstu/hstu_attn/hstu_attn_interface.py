@@ -15,9 +15,6 @@
 # Copyright (c) 2023, Tri Dao.
 # Copyright (c) 2024, NVIDIA Corporation & AFFILIATES.
 
-from typing import Optional, Union
-
-import torch
 
 import hstu_attn_2_cuda as hstu_attn_cuda
 import torch
@@ -148,8 +145,10 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
             )
 
         if has_drab:
-            rab_head = rab_padded.size(1) # TODO: need discuss with customer, casue we have padded rab
-            qkv_head = q.size(1)
+            rab_head = rab_padded.size(
+                1
+            )  # TODO: need discuss with customer, casue we have padded rab
+            q.size(1)
             dRab = dRab.view(-1, num_heads, max_seqlen_k, max_seqlen_k)
 
         # q & k grad shape
@@ -157,7 +156,6 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
             dq,
             dk,
             dv,
-            None,
             None,
             None,
             None,
@@ -227,9 +225,13 @@ def hstu_attn_varlen_func(
         out: (total, nheads, headdim).
     """
     if has_drab and (rab is None):
-        raise ValueError("AssertError: rab is None, but has_drab is True, is not allowed in backward")
+        raise ValueError(
+            "AssertError: rab is None, but has_drab is True, is not allowed in backward"
+        )
     if num_contexts != None and window_size != (-1, 0):
-        raise ValueError("AssertError: context is True and causal is not True, this is undefined behavior")
+        raise ValueError(
+            "AssertError: context is True and causal is not True, this is undefined behavior"
+        )
     if num_targets != None and window_size != (-1, 0):
         raise ValueError(
             "AssertError: target is True and causal is not True, this is undefined behavior"
@@ -237,11 +239,17 @@ def hstu_attn_varlen_func(
     # if (num_contexts != None and is_delta_q is True) or (num_targets != None and is_delta_q is True):
     #     raise ValueError("AssertError: delta_q is True, but num_contexts or num_targets is not None, this is undefined behavior")
     if num_targets is None and target_group_size < 1:
-        raise ValueError("AssertError: target_group_size should be greater than 0 when target is True")
+        raise ValueError(
+            "AssertError: target_group_size should be greater than 0 when target is True"
+        )
     if max_seqlen_q < max_seqlen_k and window_size != (-1, -1) and is_delta_q is False:
-        raise ValueError("AssertError: seq_len_q < seq_len_k, is_delta_q should be True, as is_delta_q represents mask behavior under the case")
+        raise ValueError(
+            "AssertError: seq_len_q < seq_len_k, is_delta_q should be True, as is_delta_q represents mask behavior under the case"
+        )
     if max_seqlen_q > max_seqlen_k:
-        raise ValueError("AssertError: seq_len_q >= seq_len_k, this is undefined behavior")
+        raise ValueError(
+            "AssertError: seq_len_q >= seq_len_k, this is undefined behavior"
+        )
 
     return HstuAttnVarlenFunc.apply(
         q,
@@ -266,6 +274,7 @@ def hstu_attn_varlen_func(
         seq_offsets_t,
     )
 
+
 class HstuAttnQKVPackedFunc(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -282,7 +291,7 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
         alpha=1.0,
         rab=None,  # need grad
         has_drab=False,
-        is_delta_q=False
+        is_delta_q=False,
     ):
         q = qkv[:, 0, :, :].detach()
         k = qkv[:, 1, :, :].detach()
@@ -366,9 +375,9 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
                 q,
                 k,
                 v,
-                dqkv[:,0,:,:], # dq
-                dqkv[:,1,:,:], # dk
-                dqkv[:,2,:,:], # dv
+                dqkv[:, 0, :, :],  # dq
+                dqkv[:, 1, :, :],  # dk
+                dqkv[:, 2, :, :],  # dv
                 seq_offsets_q,
                 seq_offsets_k,
                 max_seqlen_q,
@@ -386,8 +395,10 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
             )
 
         if has_drab:
-            rab_head = rab_padded.size(1) # TODO: need discuss with customer, casue we have padded rab
-            qkv_head = q.size(1)
+            rab_head = rab_padded.size(
+                1
+            )  # TODO: need discuss with customer, casue we have padded rab
+            q.size(1)
             dRab = dRab.view(-1, num_heads, max_seqlen_k, max_seqlen_k)
 
         # q & k grad shape
@@ -404,8 +415,9 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
             None,
             dRab if ctx.has_drab else None,
             None,
-            None
+            None,
         )
+
 
 def hstu_attn_qkvpacked_func(
     qkv,
@@ -420,7 +432,7 @@ def hstu_attn_qkvpacked_func(
     alpha=1.0,
     rab=None,
     has_drab=False,
-    is_delta_q=False
+    is_delta_q=False,
 ):
     """
     Arguments:
@@ -443,19 +455,35 @@ def hstu_attn_qkvpacked_func(
         out: (total, nheads, headdim).
     """
     if has_drab and (rab is None):
-        raise ValueError("AssertError: rab is None, but has_drab is True, is not allowed in backward")
+        raise ValueError(
+            "AssertError: rab is None, but has_drab is True, is not allowed in backward"
+        )
     if num_contexts != None and window_size != (-1, 0):
-        raise ValueError("AssertError: context is True and causal is not True, this is undefined behavior")
+        raise ValueError(
+            "AssertError: context is True and causal is not True, this is undefined behavior"
+        )
     if num_targets != None and window_size != (-1, 0):
-        raise ValueError("AssertError: target is True and causal is not True, this is undefined behavior")
-    if (num_contexts != None and is_delta_q is True) or (num_targets != None and is_delta_q is True):
-        raise ValueError("AssertError: delta_q is True, but num_contexts or num_targets is not None, this is undefined behavior")
+        raise ValueError(
+            "AssertError: target is True and causal is not True, this is undefined behavior"
+        )
+    if (num_contexts != None and is_delta_q is True) or (
+        num_targets != None and is_delta_q is True
+    ):
+        raise ValueError(
+            "AssertError: delta_q is True, but num_contexts or num_targets is not None, this is undefined behavior"
+        )
     if num_targets is None and target_group_size < 1:
-        raise ValueError("AssertError: target_group_size should be greater than 0 when target is True")
+        raise ValueError(
+            "AssertError: target_group_size should be greater than 0 when target is True"
+        )
     if max_seqlen_q < max_seqlen_k and window_size != (-1, -1) and is_delta_q is False:
-        raise ValueError("AssertError: seq_len_q < seq_len_k, is_delta_q should be True, as is_delta_q represents mask behavior under the case")
+        raise ValueError(
+            "AssertError: seq_len_q < seq_len_k, is_delta_q should be True, as is_delta_q represents mask behavior under the case"
+        )
     if max_seqlen_q > max_seqlen_k:
-        raise ValueError("AssertError: seq_len_q >= seq_len_k, this is undefined behavior")
+        raise ValueError(
+            "AssertError: seq_len_q >= seq_len_k, this is undefined behavior"
+        )
 
     return HstuAttnQKVPackedFunc.apply(
         qkv,
@@ -470,7 +498,7 @@ def hstu_attn_qkvpacked_func(
         alpha,
         rab,
         has_drab,
-        is_delta_q
+        is_delta_q,
     )
 
 
