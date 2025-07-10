@@ -41,7 +41,6 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
 
   // The thread index.
   const int tidx = threadIdx.x;
-  constexpr bool Is_delta_q = Kernel_traits::Is_delta_q;
   constexpr bool Is_causal = Kernel_traits::Is_causal;
   constexpr bool Is_target = Kernel_traits::Is_target;
   constexpr bool Is_context = Kernel_traits::Is_context;
@@ -55,7 +54,7 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
   constexpr int kBlockM = Kernel_traits::kBlockM;
   constexpr int kBlockN = Kernel_traits::kBlockN;
   constexpr int kHeadDim = Kernel_traits::kHeadDim;
-  constexpr int kStages = Kernel_traits::kStages;
+  // constexpr int kStages = Kernel_traits::kStages;
 
   const HstuBlockInfo<Kernel_traits, Params> binfo(params, bidb);
   if (m_block * kBlockM >= binfo.actual_seqlen_q) {
@@ -70,12 +69,12 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
   const int actual_seqlen_c = Is_context ? binfo.actual_seqlen_c : 0;
   // Actual history length of this sequence
   const int actual_seqlen_h = Is_target ? actual_seqlen_k - actual_seqlen_t : actual_seqlen_k;
-  const int actual_seqlen_offset = Is_delta_q ? actual_seqlen_k - actual_seqlen_q : 0;
+  const int actual_seqlen_offset = actual_seqlen_k - actual_seqlen_q;
   // Paged KV
   const int last_page_seqlen = binfo.last_page_seqlen;
   const int page_offset = binfo.sum_s_page;
 
-  const bool is_jump = Is_target && m_block * kBlockM > actual_seqlen_h;
+  const bool is_jump = Is_target && m_block * kBlockM + actual_seqlen_offset > actual_seqlen_h;
   const bool is_in_target = Is_target && (m_block + 1) * kBlockM + actual_seqlen_offset > actual_seqlen_h;
   const bool is_in_context = Is_context && (m_block + 1) * kBlockM <= actual_seqlen_c;
   const bool is_in_mixed_context = Is_context && (m_block + 1) * kBlockM > actual_seqlen_c && m_block * kBlockM < actual_seqlen_c;
@@ -104,7 +103,7 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
     n_block_max = (is_in_context || is_in_mixed_context) ? std::max(n_block_history, n_block_max) : n_block_max;
   }
   // calculate n_masking_block_max and n_masking_block_min
-  int n_masking_block_max = cute::ceil_div(std::min(actual_seqlen_k + last_page_offset, (m_block + 1) * kBlockM + actual_seqlen_offset + last_page_offset), kBlockN); // up
+  int n_masking_block_max = cute::ceil_div(std::min(actual_seqlen_k + last_page_offset, (m_block + 1) * kBlockM + actual_seqlen_offset + last_page_offset), kBlockN);
   int n_masking_block_min = (m_block * kBlockM + actual_seqlen_offset) / kBlockN;
   if constexpr (Is_target) {
     n_masking_block_min = is_jump ? (actual_seqlen_h + actual_seqlen_offset + target_index * params.target_group_size + last_page_offset) / kBlockN : n_masking_block_min;
@@ -320,7 +319,7 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
 
   // prefill k
   auto tKsK_stage_view = tKsK(_, _, _, buffer_stage);
-  bool is_paged_tile = n_block < n_block_paged && Paged_KV;
+  bool is_paged_tile = (n_block < n_block_paged) && Paged_KV;
   if (!is_paged_tile) {
     flash::copy</*Is_even_MN=*/false, /*Clear_OOB_MN=*/false>(
         gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - n_block_paged), tKsK_stage_view, tKVcKV,
@@ -431,23 +430,20 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
     flash::cp_async_wait<cp_async_wait_num>();
     __syncthreads();
 
-    if constexpr (kStages == 1) {
-      // async load(v)
-      auto tVsV_stage_view = tVsV(_, _, _, buffer_stage);
-      bool is_paged_tile = n_block < n_block_paged && Paged_KV;
-      if (masking_step > 0) {
-        flash::copy</*Is_even_MN=*/true>(
-            gmem_tiled_copy_QKV, !is_paged_tile ? tVgV(_, _, _, n_block - n_block_paged) : tVgV_page(_, _, _, params.page_ids[page_offset + n_block]), tVsV_stage_view, tKVcKV);
+    // async load(v)
+    auto tVsV_stage_view = tVsV(_, _, _, buffer_stage);
+    bool is_paged_tile = (n_block < n_block_paged) && Paged_KV;
+    if (masking_step > 0) {
+      flash::copy</*Is_even_MN=*/true>(
+          gmem_tiled_copy_QKV, is_paged_tile ? tVgV_page(_, _, _, params.page_ids[page_offset + n_block]) : tVgV(_, _, _, n_block - n_block_paged), tVsV_stage_view, tKVcKV);
+    } else {
+      if (!is_paged_tile) {
+        flash::copy</*Is_even_MN=*/false, /*Clear_OOB_MN=*/true>(
+            gmem_tiled_copy_QKV, tVgV(_, _, _, n_block - n_block_paged), tVsV_stage_view, tKVcKV, (Paged_KV ? actual_seqlen_t : actual_seqlen_k) - (n_block - n_block_paged) * kBlockN);
       } else {
-        if (!is_paged_tile) {
-          flash::copy</*Is_even_MN=*/false, /*Clear_OOB_MN=*/true>(
-              gmem_tiled_copy_QKV, tVgV(_, _, _, n_block - n_block_paged), tVsV_stage_view, tKVcKV, (Paged_KV ? actual_seqlen_t : actual_seqlen_k) - (n_block - n_block_paged) * kBlockN);
-        } else {
-          flash::copy</*Is_even_MN=*/true, /*Clear_OOB_MN=*/true>(
-              gmem_tiled_copy_QKV, tVgV_page(_, _, _, params.page_ids[page_offset + n_block]), tVsV_stage_view, tKVcKV);
-        }
+        flash::copy</*Is_even_MN=*/true>(
+            gmem_tiled_copy_QKV, tVgV_page(_, _, _, params.page_ids[page_offset + n_block]), tVsV_stage_view, tKVcKV);
       }
-      cute::cp_async_fence();
     }
 
     // compute q @ k + rab
@@ -458,17 +454,11 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
       auto tSrRab_view = smem_thr_copy_rab.retile_D(rRab);
       cute::copy(smem_tiled_copy_rab, tSsRab(_, _, _, buffer_stage), tSrRab_view(_, _, _));
       flash::convert_type_safe(rRab, acc_s);
-      if constexpr (kStages == 1) {
-        if (n_block > n_block_min) {
-          if (is_jump && masking_step == n_masking_steps - 1) {
-            n_block = std::min(n_block, n_block_history);
-          }
-          copy_g2s_rab(n_block - 1, buffer_stage);
+      if (n_block > n_block_min) {
+        if (is_jump && masking_step == n_masking_steps - 1) {
+          n_block = std::min(n_block, n_block_history);
         }
-      } else {
-        if (n_block > n_block_min + 1) {
-          copy_g2s_rab(n_block - 2, buffer_stage);
-        }
+        copy_g2s_rab(n_block - 1, buffer_stage);
       }
     } else {
       clear(acc_s);
@@ -481,20 +471,20 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
       apply_mask(acc_s, n_block_prev);
     }
 
-    if constexpr (kStages == 1) {
-      flash::cp_async_wait<0>();
-      __syncthreads();
-      if constexpr (!Has_rab) {
-        if (is_jump && masking_step == n_masking_steps - 1) {
-          n_block = std::min(n_block, n_block_paged);
-        }
+    flash::cp_async_wait<0>();
+    __syncthreads();
+    if constexpr (!Has_rab) {
+      if (is_jump && masking_step == n_masking_steps - 1) {
+        n_block = std::min(n_block, n_block_history);
       }
+    }
+    if (n_block > n_block_min) {
       // async load(next(k))
-      bool is_paged_tile = n_block - 1 < n_block_paged && Paged_KV;
+      bool is_paged_tile = (n_block - 1 < n_block_paged) && Paged_KV;
       auto tKsK_stage_view_next = tKsK(_, _, _, buffer_stage);
       flash::copy</*Is_even_MN=*/true>(gmem_tiled_copy_QKV,
-                                       !is_paged_tile ? tKgK(_, _, _, n_block - 1 - n_block_paged) : tKgK_page(_, _, _, params.page_ids[page_offset + n_block - 1]),
-                                       tKsK_stage_view_next, tKVcKV);
+                                      is_paged_tile ? tKgK_page(_, _, _, params.page_ids[page_offset + n_block - 1]) : tKgK(_, _, _, n_block - 1 - n_block_paged),
+                                      tKsK_stage_view_next, tKVcKV);
       cute::cp_async_fence();
     }
 
@@ -515,18 +505,6 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
 
     // compute qk @ v
     flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt(_, _, _, buffer_stage), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
-
-    if constexpr (kStages == 2) {
-      if (n_block > n_block_min + 1) {
-        __syncthreads();
-        auto tKsK_stage_view_next = tKsK(_, _, _, buffer_stage);
-        auto tVsV_stage_view_next = tVsV(_, _, _, buffer_stage);
-        flash::copy</*Is_even_MN=*/true>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 2), tKsK_stage_view_next, tKVcKV);
-        flash::copy</*Is_even_MN=*/true>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block - 2), tVsV_stage_view_next, tKVcKV);
-        cute::cp_async_fence();
-      }
-      buffer_stage ^= 1;
-    }
   }
 
   const bool is_masking = masking_step < n_masking_steps || (n_block + 1) * kBlockN > actual_seqlen_h;

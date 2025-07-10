@@ -86,7 +86,7 @@ struct Hstu_fwd_kernel_traits : public Base {
                                      (kHeadDim % 64 == 0 ? 64 : 32);
   static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
   static constexpr int kSwizzleRab = kBlockKSmemRab == 32 ? 2 : 3;
-  static constexpr int kStages = kHeadDim <= 64 ? 2 : 1;
+  static constexpr int kStages = 1;
 
   using TiledMma =
       TiledMMA<typename Base::MMA_Atom_Arch,

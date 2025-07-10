@@ -305,7 +305,10 @@ void run_hstu_fwd(Hstu_fwd_params &params, cudaStream_t stream) {
       #ifndef HSTU_DISABLE_DELTA_Q
       if (params.is_delta_q) {
         #ifndef HSTU_DISABLE_LOCAL
-        if (params.is_local) {run_hstu_fwd_headdim<Dtype, Has_rab, true, false, false, false, true>(params, stream); return; }
+        if (params.is_local) { run_hstu_fwd_headdim<Dtype, Has_rab, true, false, false, false, true>(params, stream); return; }
+        #endif
+        #ifndef HSTU_DISABLE_TARGET
+        if (params.is_target) { run_hstu_fwd_headdim<Dtype, Has_rab, false, true, false, true, true>(params, stream); return; }
         #endif
         run_hstu_fwd_headdim<Dtype, Has_rab, false, true, false, false, true>(params, stream); return;
       }

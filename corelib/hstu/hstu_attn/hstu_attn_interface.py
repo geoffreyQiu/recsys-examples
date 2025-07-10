@@ -74,7 +74,7 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
                 page_offsets,
                 page_ids,
                 last_page_lens,
-                seq_offsets_t
+                seq_offsets_t,
             )
         P = out[:, :, :head_dim].reshape(-1, num_heads * head_dim)
 
@@ -173,7 +173,8 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
             None,
             None,
             None,
-            None
+            None,
+            None,
         )
 
 
@@ -230,7 +231,9 @@ def hstu_attn_varlen_func(
     if num_contexts != None and window_size != (-1, 0):
         raise ValueError("AssertError: context is True and causal is not True, this is undefined behavior")
     if num_targets != None and window_size != (-1, 0):
-        raise ValueError("AssertError: target is True and causal is not True, this is undefined behavior")
+        raise ValueError(
+            "AssertError: target is True and causal is not True, this is undefined behavior"
+        )
     # if (num_contexts != None and is_delta_q is True) or (num_targets != None and is_delta_q is True):
     #     raise ValueError("AssertError: delta_q is True, but num_contexts or num_targets is not None, this is undefined behavior")
     if num_targets is None and target_group_size < 1:
@@ -260,7 +263,7 @@ def hstu_attn_varlen_func(
         page_offsets,
         page_ids,
         last_page_lens,
-        seq_offsets_t
+        seq_offsets_t,
     )
 
 class HstuAttnQKVPackedFunc(torch.autograd.Function):
@@ -305,7 +308,7 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
                 None,
                 None,
                 None,
-                None
+                None,
             )
         num_heads = q.size(1)
         head_dim = q.size(2)

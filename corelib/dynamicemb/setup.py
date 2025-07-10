@@ -16,6 +16,7 @@
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 from setuptools import find_packages, setup
@@ -97,7 +98,7 @@ def get_extensions():
             "-U__CUDA_NO_HALF_OPERATORS__",
             "-U__CUDA_NO_HALF_CONVERSIONS__",
             "-U__CUDA_NO_HALF2_OPERATORS__",
-            "-U__CUDA_NO_BFLOAT16_CONVERSIONS__"
+            "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
             "-UCUDA_ERROR_CHECK",  # this is to disable HKV error check
         ],
     }
