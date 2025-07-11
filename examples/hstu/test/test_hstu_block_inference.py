@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import sys
+
 import torch
 from configs import (
     InferenceEmbeddingConfig,
@@ -22,8 +24,7 @@ from configs import (
 from dataset.random_inference_dataset import RandomInferenceDataGenerator
 from dataset.utils import FeatureConfig
 
-import sys
-sys.path.append('./model/')
+sys.path.append("./model/")
 from inference_ranking_gr import InferenceRankingGR
 
 
@@ -48,14 +49,13 @@ def get_test_setup():
     num_heads = 4
     head_dim = 128
     num_layers = 4
-    inference_dtype = torch.bfloat16
 
     hstu_config = get_inference_hstu_config(
         hidden_dim_size,
         num_layers,
         num_heads,
         head_dim,
-    ) 
+    )
 
     _blocks_in_primary_pool = 10240
     _page_size = 32

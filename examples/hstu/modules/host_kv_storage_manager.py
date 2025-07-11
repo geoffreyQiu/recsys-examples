@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import tensorrt_llm
 import torch
@@ -33,6 +33,11 @@ class HSTUHostKVStorageImpl:
     def append_kvdata(
         self, user_id: int, start_pos: int, length: int, kv_data: List[torch.Tensor]
     ):
+        pass
+
+    def get_kv_data(
+        self, user_id: int, length: int, layer_idx: int, output_buffer: torch.Tensor
+    ) -> torch.Tensor:
         pass
 
 
@@ -75,7 +80,7 @@ class DummyHSTUHostKVStorageImpl(HSTUHostKVStorageImpl):
 
     def get_kv_data(
         self, user_id: int, length: int, layer_idx: int, output_buffer: torch.Tensor
-    ):
+    ) -> torch.Tensor:
         kv_data_list = []
         current_length = 0
         for data_chunk in self.kv_data_storage[layer_idx][user_id]:
@@ -88,7 +93,9 @@ class DummyHSTUHostKVStorageImpl(HSTUHostKVStorageImpl):
 
 
 class HSTUHostKVStorageManager:
-    def __init__(self, hstu_config: InferenceHSTUConfig, kv_cache_config: KVCacheConfig) -> None:
+    def __init__(
+        self, hstu_config: InferenceHSTUConfig, kv_cache_config: KVCacheConfig
+    ) -> None:
         self.num_layers = hstu_config.num_layers
         self.head_dim = hstu_config.head_dim
         self.num_heads = hstu_config.num_heads
@@ -129,43 +136,6 @@ class HSTUHostKVStorageManager:
             pin_memory=True,
         ).uniform_(-0.05, 0.05)
 
-    def allocate_new_kvdata(
-        self,
-        user_ids: List[int],
-        cached_start_pos: List[int],
-        offload_page_offsets: List[int],
-    ) -> List[torch.Tensor]:
-        total_num_pages = offload_page_offsets[-1]
-        single_page_shape = (2, self.page_size, self.num_heads, self.head_dim)
-        allocated_kvdata = [
-            torch.empty(
-                (total_num_pages, *single_page_shape),
-                dtype=self.kv_cache_dtype,
-                device=torch.device("cpu"),
-            )
-            for _ in range(self.num_layers)
-        ]
-
-        for idx in range(len(user_ids)):
-            uid = user_ids[idx]
-            start_pos = cached_start_pos[idx]
-
-            page_start = offload_page_offsets[idx]
-            page_end = offload_page_offsets[idx + 1]
-            length = (page_end - page_start) * self.page_size
-
-            self.impl.allocate_new_kvdata(
-                uid,
-                start_pos,
-                length,
-                [
-                    allocated_kvdata[layer_idx][page_start:page_end, ...]
-                    for layer_idx in range(self.num_layers)
-                ],
-            )
-
-        return allocated_kvdata
-
     def fetch_kv_data(
         self, user_id: int, length: int, layer_idx: int, output_buffer: torch.Tensor
     ):
@@ -179,7 +149,7 @@ class HSTUHostKVStorageManager:
         user_ids: torch.Tensor,
         cached_start_pos: torch.Tensor,
         cached_lengths: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[int]]:
         onload_history_seq_length = torch.zeros_like(
             user_ids, dtype=torch.int32, device=torch.device("cpu")
         )

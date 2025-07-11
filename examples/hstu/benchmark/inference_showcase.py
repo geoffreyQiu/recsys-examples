@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import sys
+
 import torch
 from configs import (
     InferenceEmbeddingConfig,
@@ -22,8 +24,7 @@ from configs import (
 from dataset.random_inference_dataset import RandomInferenceDataGenerator
 from dataset.utils import FeatureConfig
 
-import sys
-sys.path.append('./model/')
+sys.path.append("./model/")
 from inference_ranking_gr import InferenceRankingGR
 
 
@@ -45,10 +46,9 @@ def run_ranking_gr_inference():
         ),
     ]
     max_contextual_seqlen = 0
-    total_max_seqlen = sum([
-        fc.max_sequence_length * len(fc.feature_names)
-        for fc in feature_configs
-    ])
+    total_max_seqlen = sum(
+        [fc.max_sequence_length * len(fc.feature_names) for fc in feature_configs]
+    )
 
     hidden_dim_size = 512
     num_heads = 4

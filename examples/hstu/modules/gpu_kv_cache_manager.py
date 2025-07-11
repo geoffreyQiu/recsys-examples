@@ -27,7 +27,9 @@ DataType = tensorrt_llm.bindings.DataType
 
 
 class HSTUGpuKVCacheManager:
-    def __init__(self, hstu_config: InferenceHSTUConfig, kv_cache_config: KVCacheConfig) -> None:
+    def __init__(
+        self, hstu_config: InferenceHSTUConfig, kv_cache_config: KVCacheConfig
+    ) -> None:
         self.num_layers = hstu_config.num_layers
         self.head_dim = hstu_config.head_dim
         self.page_size = kv_cache_config.page_size
@@ -38,7 +40,7 @@ class HSTUGpuKVCacheManager:
             self.max_attention_window = kv_cache_config.max_seq_len
         else:
             self.max_attention_window = min(
-                max_seq_len, kv_cache_config.max_attention_window
+                self.max_seq_len, kv_cache_config.max_attention_window
             )
 
         max_pages_per_batch = math.ceil(
@@ -250,12 +252,12 @@ class HSTUGpuKVCacheManager:
 
         device = torch.cuda.current_device()
 
-        page_ids_to_offload = (
+        page_ids_offload = (
             page_ids_to_offload[0]
             if num_offload_user == 1
             else torch.cat(page_ids_to_offload, dim=0)
         )
-        num_pages = page_ids_to_offload.shape[0]
+        num_pages = page_ids_offload.shape[0]
         with torch.cuda.stream(self._offload_stream):
             self._offload_start_event.wait(self._offload_stream)
             gather_kv_gpu_buffers = [
@@ -270,7 +272,7 @@ class HSTUGpuKVCacheManager:
                 paged_kvcache_ops.gather_kvcache(
                     gather_kv_gpu_buffers[layer_idx],
                     self.get_kvcache_table(layer_idx),
-                    page_ids_to_offload,
+                    page_ids_offload,
                     num_pages,
                     0,  # NHD layout
                 )
@@ -318,15 +320,15 @@ class HSTUGpuKVCacheManager:
             [self.impl.get_num_tokens_cached(uid) for uid in user_ids_list],
             dtype=torch.int32,
         )
-        kv_page_indices = [
+        kv_page_ids = [
             torch.tensor(self.impl.get_cache_block_ids(uid)[0], dtype=torch.int32)
             for uid in user_ids_list
         ]
         kv_num_pages = torch.tensor(
-            [page_ids.shape[0] for page_ids in kv_page_indices], dtype=torch.int32
+            [page_ids.shape[0] for page_ids in kv_page_ids], dtype=torch.int32
         )
 
-        kv_page_indices = torch.cat(kv_page_indices, dim=0)
+        kv_page_indices = torch.cat(kv_page_ids, dim=0)
         kv_page_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32)
         torch.cumsum(kv_num_pages, 0, out=kv_page_indptr[1:])
         kv_last_page_len = torch.remainder(total_history_lengths, self.page_size)

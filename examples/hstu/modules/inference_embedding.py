@@ -14,7 +14,7 @@
 # limitations under the License.
 
 # pyre-strict
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 from configs import InferenceEmbeddingConfig
@@ -62,7 +62,7 @@ def create_dynamic_embedding_tables(
     embedding_configs: List[InferenceEmbeddingConfig],
     output_dtype: torch.dtype = torch.float32,
     device: torch.device = None,
-    ps: ParameterServer = None,
+    ps: Optional[ParameterServer] = None,
 ):
     table_options = [
         DynamicEmbTableOptions(
@@ -91,7 +91,10 @@ def create_dynamic_embedding_tables(
 
 class InferenceDynamicEmbeddingCollection(torch.nn.Module):
     def __init__(
-        self, embedding_configs, ps: ParameterServer = None, enable_cache: bool = False
+        self,
+        embedding_configs,
+        ps: Optional[ParameterServer] = None,
+        enable_cache: bool = False,
     ):
         super().__init__()
 
@@ -189,7 +192,7 @@ def create_embedding_collection(configs):
 
 
 def create_dynamic_embedding_collection(
-    configs, ps: ParameterServer = None, enable_cache: bool = False
+    configs, ps: Optional[ParameterServer] = None, enable_cache: bool = False
 ):
     return InferenceDynamicEmbeddingCollection(configs, ps, enable_cache)
 

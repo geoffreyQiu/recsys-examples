@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import sys
+
 import torch
 from configs import (
     InferenceEmbeddingConfig,
@@ -20,8 +22,8 @@ from configs import (
     get_kvcache_config,
 )
 from dataset.utils import Batch, FeatureConfig
-import sys
-sys.path.append('./model/')
+
+sys.path.append("./model/")
 from inference_ranking_gr import InferenceRankingGR
 from torchrec import KeyedJaggedTensor
 
@@ -101,7 +103,6 @@ def get_test_model(num_layers, blocks_in_primary_pool, page_size, offload_chunks
 
 
 def test_kvcache_offload_onload():
-
     keys = ["item_feat", "act_feat"]
     feat_max_len = {"item_feat": 256, "act_feat": 256}
 
