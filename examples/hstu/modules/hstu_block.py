@@ -11,11 +11,7 @@ from modules.fused_hstu_layer import FusedHSTULayer
 from modules.jagged_data import JaggedData
 from modules.native_hstu_layer import HSTULayer
 from modules.position_encoder import HSTUPositionalEncoder
-from modules.utils import (
-    hstu_preprocess_embeddings, 
-    hstu_postprocess_embeddings,
-)
-from ops.cuda_ops.JaggedTensorOpFunction import jagged_2D_tensor_concat
+from modules.utils import hstu_postprocess_embeddings, hstu_preprocess_embeddings
 from ops.triton_ops.triton_jagged import (  # type: ignore[attr-defined]
     triton_concat_2D_jagged,
     triton_split_2D_jagged,

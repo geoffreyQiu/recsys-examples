@@ -36,15 +36,15 @@ class KVCacheMetadata:
     # appending metadata
     batch_indices: torch.Tensor = None
     position: torch.Tensor = None
-    new_history_nnz: int = None
+    new_history_nnz: int = 0
     new_history_nnz_cuda: torch.Tensor = None
 
     # onload utility
-    onload_history_kv_buffer: List[torch.Tensor] = None
-    onload_history_kv_events: List[torch.cuda.Event] = None
+    onload_history_kv_buffer: Optional[List[torch.Tensor]] = None
+    onload_history_kv_events: Optional[List[torch.cuda.Event]] = None
 
     # paged cache table pointers
-    kv_cache_table: List[torch.Tensor] = None
+    kv_cache_table: Optional[List[torch.Tensor]] = None
 
 
 @dataclass
@@ -123,6 +123,7 @@ class InferenceHSTUConfig:
         target_group_size (int):  The size of the sub-candidate group where causal attention is applied only within a sub-group (usually in the case of ranking).
         position_encoding_config (PositionEncodingConfig, optional): Position embedding config.
     """
+
     hidden_size: int
     num_layers: int
     num_heads: int
@@ -191,7 +192,9 @@ def get_inference_hstu_config(
     )
 
 
-def get_kvcache_metadata_buffer(hstu_config: InferenceHSTUConfig, kvcache_config: KVCacheConfig):
+def get_kvcache_metadata_buffer(
+    hstu_config: InferenceHSTUConfig, kvcache_config: KVCacheConfig
+):
     device = torch.cuda.current_device()
     torch.bfloat16 if hstu_config.bf16 else torch.float16 if hstu_config.fp16 else torch.float32
 

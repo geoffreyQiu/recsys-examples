@@ -1,8 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-import itertools
 import math
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import torch
 from configs import InferenceHSTUConfig, KVCacheConfig
@@ -10,12 +9,7 @@ from dataset.utils import Batch
 from modules.jagged_data import JaggedData
 from modules.paged_hstu_infer_layer import PagedHSTUInferLayer
 from modules.position_encoder import HSTUPositionalEncoder
-from modules.utils import (
-    hstu_preprocess_embeddings,
-    hstu_postprocess_embeddings,
-)
-from ops.cuda_ops.JaggedTensorOpFunction import jagged_2D_tensor_concat
-from ops.length_to_offsets import length_to_complete_offsets
+from modules.utils import hstu_postprocess_embeddings, hstu_preprocess_embeddings
 from ops.triton_ops.triton_jagged import (  # type: ignore[attr-defined]
     triton_concat_2D_jagged,
     triton_split_2D_jagged,
@@ -59,7 +53,7 @@ class HSTUBlockInference(torch.nn.Module):
                 for layer_idx in range(self.config.num_layers)
             ]
         )
-        self._hstu_graph = None
+        self._hstu_graph: Optional[Dict[int, Any]] = None  # type: ignore
 
     def hstu_preprocess(
         self, embeddings: Dict[str, JaggedTensor], batch: Batch
@@ -81,8 +75,13 @@ class HSTUBlockInference(torch.nn.Module):
         """
 
         # Interleaving & Concatenation
-        jd = hstu_preprocess_embeddings(embeddings, batc, is_inference=True)
-        
+        jd = hstu_preprocess_embeddings(
+            embeddings, batch, is_inference=True, dtype=self._dtype
+        )
+        device = jd.seqlen_offsets.device
+        jd.num_candidates = jd.num_candidates.to(device=device)
+        jd.num_candidates_offsets = jd.num_candidates_offsets.to(device=device)
+
         # Position Encoding
         if self._positional_encoder is not None:
             jd.values = self._positional_encoder(
@@ -202,17 +201,17 @@ class HSTUBlockInference(torch.nn.Module):
     ) -> torch.Tensor:
         with torch.inference_mode():
             batch_size = 2 ** math.ceil(math.log2(batch_size))
-            if num_tokens not in self._hstu_graph[batch_size]:
+            if num_tokens not in self._hstu_graph[batch_size]:  # type: ignore
                 num_tokens_pow2 = max(32, 2 ** math.ceil(math.log2(num_tokens)))
             else:
                 num_tokens_pow2 = num_tokens
 
-            self._hstu_graph[batch_size][num_tokens_pow2][0].replay()
+            self._hstu_graph[batch_size][num_tokens_pow2][0].replay()  # type: ignore
             for idx in range(1, self.config.num_layers + 1):
                 kv_cache_metadata.onload_history_kv_events[idx - 1].wait(
                     torch.cuda.current_stream()
                 )
-                self._hstu_graph[batch_size][num_tokens_pow2][idx].replay()
+                self._hstu_graph[batch_size][num_tokens_pow2][idx].replay()  # type: ignore
 
             hstu_output = torch.zeros_like(hidden_states[:num_tokens, ...])
             hstu_output.copy_(

@@ -12,15 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Optional
 import sys
-sys.path.append('../commons/utils')
-from hstu_assert_close import assert_hstu_close
+from typing import Optional
 
+sys.path.append("../commons/utils")
 import pytest
 import torch
 import torch.nn.functional as F
 from einops import rearrange
+from hstu_assert_close import assert_hstu_close
 from hstu_attn import hstu_attn_varlen_func
 
 
@@ -522,4 +522,3 @@ def test_paged_hstu_attn_kernel(
         attn_out_torch = attn_out_torch.view(-1, num_heads, head_dim)
 
         assert_hstu_close(attn_out_paged, attn_out_torch, attn_out_ref, fwd=True)
-

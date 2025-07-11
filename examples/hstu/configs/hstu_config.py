@@ -17,13 +17,16 @@ from enum import Enum, unique
 from typing import Optional
 
 import torch
+
 try:
     from megatron.core import parallel_state
     from megatron.core.transformer import TransformerConfig
 except:
-    parallel_state=None
-    class TransformerConfig:
+    parallel_state = None
+
+    class TransformerConfig:  # type: ignore
         pass
+
 
 @unique
 class HSTULayerType(Enum):

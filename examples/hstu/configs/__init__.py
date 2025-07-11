@@ -7,13 +7,13 @@ from .hstu_config import (
     get_hstu_config,
 )
 from .inference_config import (
+    InferenceHSTUConfig,
     KVCacheConfig,
     KVCacheMetadata,
-    InferenceHSTUConfig,
     copy_kvcache_metadata,
+    get_inference_hstu_config,
     get_kvcache_config,
     get_kvcache_metadata_buffer,
-    get_inference_hstu_config,
 )
 from .task_config import (
     OptimizerParam,

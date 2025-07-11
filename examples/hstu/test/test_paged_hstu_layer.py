@@ -13,11 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import itertools
-from typing import List, Optional
 import sys
-sys.path.append('../commons/utils')
-from hstu_assert_close import assert_hstu_close
+from typing import List, Optional
 
+sys.path.append("../commons/utils")
 import flashinfer
 import pytest
 import torch
@@ -29,6 +28,7 @@ from configs import (
     get_kvcache_config,
     get_kvcache_metadata_buffer,
 )
+from hstu_assert_close import assert_hstu_close
 from modules.hstu_block_inference import HSTUBlockInference
 from modules.jagged_data import JaggedData
 from test_paged_hstu_attn_kernel import _hstu_attention_maybe_from_cache

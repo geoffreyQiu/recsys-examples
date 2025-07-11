@@ -32,7 +32,10 @@ class PagedHSTUInferLayer(torch.nn.Module):
     """
 
     def __init__(
-        self, config: InferenceHSTUConfig, kv_cache_config: KVCacheConfig, layer_idx: int
+        self,
+        config: InferenceHSTUConfig,
+        kv_cache_config: KVCacheConfig,
+        layer_idx: int,
     ):
         super().__init__()
         self.layer_idx = layer_idx

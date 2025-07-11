@@ -12,18 +12,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Dict, Optional, Union
+import itertools
+from typing import Dict, Optional
 
 import torch
-from dataset.utils import RankingBatch, RetrievalBatch
+from dataset.utils import RankingBatch
 from modules.jagged_data import JaggedData
-from ops.length_to_offsets import length_to_complete_offsets
 from ops.cuda_ops.JaggedTensorOpFunction import jagged_2D_tensor_concat
+from ops.length_to_offsets import length_to_complete_offsets
 from ops.triton_ops.triton_jagged import (  # type: ignore[attr-defined]
     triton_concat_2D_jagged,
     triton_split_2D_jagged,
 )
 from torchrec.sparse.jagged_tensor import JaggedTensor
+
 
 def init_mlp_weights_optional_bias(
     m: torch.nn.Module,
@@ -40,22 +42,26 @@ def init_mlp_weights_optional_bias(
         if m.bias is not None:
             m.bias.data.fill_(0.0)
 
+
 def hstu_preprocess_embeddings(
-    embeddings: Dict[str, JaggedTensor], batch: RankingBatch, is_inference: bool
+    embeddings: Dict[str, JaggedTensor],
+    batch: RankingBatch,
+    is_inference: bool,
+    dtype: Optional[torch.dtype] = None,
 ) -> JaggedData:
     """
     Preprocesses the embeddings for use in the HSTU architecture.
 
     This method performs the following steps:
     1. **Interleaving**: If action embeddings are present, interleaves them with item embeddings.
-                         During inference, action embeddings are only for the history squence, and
-                         they will be interleaved with item embeddings of the history part, while 
+                         During inference, action embeddings are only for the history sequence, and
+                         they will be interleaved with item embeddings of the history part, while
                          the embeddings of candidates need no interleaving.
-    2. **Concatenation**: Concatenates contextual, item, and action embeddings for each sample, 
+    2. **Concatenation**: Concatenates contextual, item, and action embeddings for each sample,
                           following the order specified in the batch.
                           During inference, we concatenate three parts:
-                          1) contextual embeedings, 
-                          2) interleaved *item & action* history embeddings, and 
+                          1) contextual embeedings,
+                          2) interleaved *item & action* history embeddings, and
                           3) (item) candidates embeddings
                           for each sample, following the order specified in the batch.
 
@@ -63,11 +69,13 @@ def hstu_preprocess_embeddings(
         embeddings (Dict[str, JaggedTensor]): A dictionary of embeddings where each key corresponds to a feature name and the value is a jagged tensor.
         batch (RankingBatch): The batch of ranking data.
         is_inference (bool): Whether is for inference
+        dtype (dtype, optional): The output data type of the embeddings.
     Returns:
         JaggedData: The preprocessed jagged data, ready for further processing in the HSTU architecture.
     """
     item_jt = embeddings[batch.item_feature_name]  # history + candidate
-    sequence_embeddings = item_jt.values()
+    dtype = item_jt.values().dtype if dtype is None else dtype
+    sequence_embeddings = item_jt.values().to(dtype)
     sequence_embeddings_lengths = item_jt.lengths()
     sequence_embeddings_lengths_offsets = item_jt.offsets()
     sequence_max_seqlen = batch.feature_to_max_seqlen[batch.item_feature_name]
@@ -79,7 +87,7 @@ def hstu_preprocess_embeddings(
 
         if not is_inference:
             sequence_embeddings = torch.cat(
-                [sequence_embeddings, action_jt.values()], dim=1
+                [sequence_embeddings, action_jt.values().to(dtype)], dim=1
             ).view(2 * jagged_size, embedding_dim)
             sequence_embeddings_lengths = sequence_embeddings_lengths * 2
             sequence_embeddings_lengths_offsets = (
@@ -91,7 +99,8 @@ def hstu_preprocess_embeddings(
             item_offsets = item_jt.offsets()
             candidates_indptr = item_offsets[: batch.batch_size] + action_jt.lengths()
 
-            item_embs, action_embs = item_jt.values(), action_jt.values()
+            item_embs = item_jt.values().to(dtype)
+            action_embs = action_jt.values().to(dtype)
             interleaved_embeddings = [
                 (
                     torch.cat(
@@ -117,7 +126,11 @@ def hstu_preprocess_embeddings(
                 batch.action_feature_name
             ]
 
-    if batch.num_candidates is not None and batch.action_feature_name is not None and not is_inference:
+    if (
+        batch.num_candidates is not None
+        and batch.action_feature_name is not None
+        and not is_inference
+    ):
         num_candidates = batch.num_candidates * 2
         max_num_candidates = batch.max_num_candidates * 2
     else:
@@ -129,13 +142,12 @@ def hstu_preprocess_embeddings(
     contextual_seqlen_offsets = None
     if len(batch.contextual_feature_names) > 0:
         contextual_max_seqlens = [
-            batch.feature_to_max_seqlen[name]
-            for name in batch.contextual_feature_names
+            batch.feature_to_max_seqlen[name] for name in batch.contextual_feature_names
         ]
-        contextual_jts = [
-            embeddings[name] for name in batch.contextual_feature_names
+        contextual_jts = [embeddings[name] for name in batch.contextual_feature_names]
+        all_values = [jt.values().to(dtype) for jt in contextual_jts] + [
+            sequence_embeddings
         ]
-        all_values = [jt.values() for jt in contextual_jts] + [sequence_embeddings]
         all_offsets = [jt.offsets() for jt in contextual_jts] + [
             sequence_embeddings_lengths_offsets
         ]
@@ -158,9 +170,7 @@ def hstu_preprocess_embeddings(
         sequence_embeddings_lengths = sequence_embeddings_lengths_after_concat
 
         sequence_embeddings_lengths_offsets = (
-            torch.ops.fbgemm.asynchronous_complete_cumsum(
-                sequence_embeddings_lengths
-            )
+            torch.ops.fbgemm.asynchronous_complete_cumsum(sequence_embeddings_lengths)
         )
 
         contextual_seqlen_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
@@ -195,9 +205,8 @@ def hstu_preprocess_embeddings(
         has_interleaved_action=batch.action_feature_name is not None,
     )
 
-def hstu_postprocess_embeddings(
-    jd: JaggedData, is_inference: bool
-) -> JaggedData:
+
+def hstu_postprocess_embeddings(jd: JaggedData, is_inference: bool) -> JaggedData:
     sequence_embeddings: torch.Tensor
     seqlen_offsets: torch.Tensor
     max_seqlen: int
@@ -231,7 +240,7 @@ def hstu_postprocess_embeddings(
 
     sequence_embeddings = sequence_embeddings / torch.linalg.norm(
         sequence_embeddings, ord=2, dim=-1, keepdim=True
-    ).clamp(min=1e-6) 
+    ).clamp(min=1e-6)
 
     return JaggedData(
         values=sequence_embeddings,
