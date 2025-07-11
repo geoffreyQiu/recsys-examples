@@ -12,27 +12,33 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import List, Optional
 from functools import wraps
+from typing import List, Optional
 
 import torch
+
 try:
     from commons.utils.nvtx_op import output_nvtx_hook
     from megatron.core.transformer.module import MegatronModule
+
     BaseModule = MegatronModule
 except:
+
     def output_nvtx_hook(nvtx_tag):
         def decorator(module):
             @wraps(module)
             def forward(*args, **kwags):
                 return module(*args, **kwags)
+
             return forward
+
         return decorator
+
     BaseModule = torch.nn.Module
 from modules.utils import init_mlp_weights_optional_bias
 
 
-class MLP(BaseModule):
+class MLP(BaseModule):  # type: ignore
     """
     Multi-Layer Perceptron (MLP) module wrapper for processing jagged data.
 

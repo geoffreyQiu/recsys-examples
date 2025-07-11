@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import warnings
-from typing import List, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 from configs import (
@@ -127,9 +127,7 @@ class InferenceRankingGR(torch.nn.Module):
             hstu_config, kvcache_config
         )
 
-        self._hstu_block = HSTUBlockInference(
-            hstu_config, kvcache_config
-        )
+        self._hstu_block = HSTUBlockInference(hstu_config, kvcache_config)
         self._dense_module = MLP(
             self._embedding_dim,
             task_config.prediction_head_arch[0],
@@ -235,7 +233,7 @@ class InferenceRankingGR(torch.nn.Module):
 
     def prepare_kv_cache(
         self, batch: Batch, user_ids: torch.Tensor, user_start_pos: torch.Tensor
-    ) -> Tuple[torch.Tensor, KVCacheMetadata]:
+    ) -> KVCacheMetadata:
         batch_size = user_ids.shape[0]
         new_history_lengths = (
             torch.sum(batch.features.lengths().view(-1, batch_size), 0).view(-1)
@@ -340,8 +338,8 @@ class InferenceRankingGR(torch.nn.Module):
 
     def offload_kv_cache_wait(
         self,
-        offload_results: Tuple[
-            List[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor
+        offload_results: Optional[
+            Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]
         ],
     ):
         if offload_results is not None:

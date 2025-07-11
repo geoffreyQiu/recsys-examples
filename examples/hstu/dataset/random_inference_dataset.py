@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import random
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import torch
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
@@ -46,8 +46,8 @@ class RandomInferenceDataGenerator:
         feature_configs: List[FeatureConfig],
         item_feature_name: str,
         contextual_feature_names: List[str] = [],
-        action_feature_name: Optional[str] = None,
-        max_num_users: Optional[int] = None,
+        action_feature_name: str = "",
+        max_num_users: int = 1,
         max_batch_size: int = 32,
         max_seqlen: int = 4096,
         max_num_candidates: int = 200,
@@ -76,8 +76,8 @@ class RandomInferenceDataGenerator:
         self._max_incr_fea_len = max(max_incremental_seqlen // 2, 1)
         self._max_num_candidates = max_num_candidates
 
-        self._item_history = dict()
-        self._action_history = dict() if action_feature_name is not None else None
+        self._item_history: Dict[int, torch.Tensor] = dict()
+        self._action_history: Dict[int, torch.Tensor] = dict()
 
     def get_inference_batch_user_ids(self) -> Optional[torch.Tensor]:
         batch_size = random.randint(1, self._max_batch_size)
@@ -99,7 +99,7 @@ class RandomInferenceDataGenerator:
     ) -> Optional[Batch]:
         batch_size = len(user_ids)
         if batch_size == 0:
-            return
+            return None
         user_ids = user_ids.tolist()
         item_hists = [
             self._item_history[uid] if uid in self._item_history else torch.tensor([])
