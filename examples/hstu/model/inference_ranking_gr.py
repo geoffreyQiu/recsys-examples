@@ -101,8 +101,7 @@ class InferenceRankingGR(torch.nn.Module):
         kvcache_config: KVCacheConfig,
         task_config: RankingConfig,
         use_cudagraph=False,
-        # gpu_kv_cache_impl = None,
-        # host_kv_storage_impl = None,
+        cudagraph_configs=None,
     ):
         super().__init__()
         self._device = torch.cuda.current_device()
@@ -172,6 +171,7 @@ class InferenceRankingGR(torch.nn.Module):
             for layer_idx in range(hstu_config.num_layers)
         ]
 
+        # TODO(junyiq): Add cudagraph optimization for the MLP as well.
         self.use_cudagraph = use_cudagraph
         if use_cudagraph:
             self._hstu_block.set_cudagraph(
@@ -180,6 +180,7 @@ class InferenceRankingGR(torch.nn.Module):
                 self._hidden_states,
                 self._jagged_metadata,
                 self._kvcache_metadata,
+                cudagraph_configs=cudagraph_configs,
             )
 
     def bfloat16(self):
