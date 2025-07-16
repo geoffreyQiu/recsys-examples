@@ -48,15 +48,20 @@ The GPU KV cache is organized as a paged KV-data table, and supports KV data add
 
 The host KV data storage support adding/appending and lookup. We only present an example implementation, since this can be built over other database and can vary widely in the deployment.
 
-2. Optimization with CUDA graph
+2. Asynchronous H2D transfer of host KV data 
 
-We utilize the graph capture and replay support in Torch for convenient CUDA graph optimization on the HSTU layers. This decreases the overhead for kernel launch, especially for input with a small batch size.
+By using asynchronous data copy on the side CUDA stream, we overlap the host-to-device KV data transfer with HSTU computation layer-wise, to reduce the latency of HSTU inference.
 
-We break down the CUDA graph of HSTU blocks by layers, so that host KV data transfer to GPU can be overlapped with HSTU computation. Also, the input data (hidden states) fed to HSTU layers needs paddding to pre-determined batch size and sequence length, due to the requirement of static shape in CUDA graph.
+
+3. Optimization with CUDA graph
+
+We utilize the graph capture and replay support in Torch for convenient CUDA graph optimization on the HSTU layers. This decreases the overhead for kernel launch, especially for input with a small batch size. The input data (hidden states) fed to HSTU layers needs paddding to pre-determined batch size and sequence length, due to the requirement of static shape in CUDA graph.
+
+
 
 ## Benchmark Results
 
-Here we present the benchmark results of the HSTU layers with KV cache on L20 and L40 gpus.
+Here we present the benchmark results of the HSTU layers with KV cache on L20 gpus.
 
 HSTU Setup for benchmark:
 
@@ -70,11 +75,28 @@ HSTU Setup for benchmark:
 | Max Per Sequence Length | 4096 |
 | Per Sequence Targets Number | 256 |
 
+1. End-to-end inference performance
 
-Performance results for HSTU block (8-layers) on L20 GPU:
+Here we benchmarked with a synthetic input dataset:
+* Each user's input sequence starts from 256 tokens to 4096 in increments of 256.
+* Each input request has 256 item candidates for ranking.
+* Generate data for 1, 2, 4 and 8 users to benchmark with different batch size. 
+
+We can achieve **1.4x ~ 2.7x** performance speedup for inference (with batch size ranging from 1 to 8), after utilizing the KV cache and CUDA graph optimization.
+
+Performance results:
+
+![Local Image](inference_benchmark_l20.png)
+
+2. HSTU block performance
+
+Performance Results:
 
 ![Local Image](hstu_inference_l20_batch1.png)
 ![Local Image](hstu_inference_l20_batch8.png)
+
+When the input sequence has 2048 tokens in which 1920 tokens have KV data cached, we can achieve **5x ~ 10x** performance speedup on HSTU block (for batch size = 1 and 8 respectively).
+
 
 
 

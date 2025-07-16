@@ -294,6 +294,9 @@ class InferenceRankingGR(torch.nn.Module):
                 kv_cache_metadata.onload_history_kv_buffer = (
                     self._kvcache_metadata.onload_history_kv_buffer[:]
                 )
+                kv_cache_metadata.onload_history_kv_events = (
+                    self._kvcache_metadata.onload_history_kv_events[:]
+                )
                 self._gpu_kv_cache_manager.onload(
                     self._host_kv_storage_manager.get_lookup_buffer(),
                     onload_length,

@@ -38,7 +38,7 @@ class RandomInferenceDataGenerator:
         max_num_candidates (int): The maximum candidates number.
         max_incremental_seqlen (int): The maximum incremental length of HISTORY
                                       item AND action sequence.
-        incremental_mode (bool): The flag for incremental mode.
+        full_mode (bool): The flag for full batch mode.
     """
 
     def __init__(
@@ -52,7 +52,7 @@ class RandomInferenceDataGenerator:
         max_seqlen: int = 4096,
         max_num_candidates: int = 200,
         max_incremental_seqlen: int = 64,
-        incremental_mode: bool = False,
+        full_mode: bool = False,
     ):
         super().__init__()
 
@@ -73,16 +73,22 @@ class RandomInferenceDataGenerator:
         self._max_num_users = min(max_num_users, 2**16)
         self._max_batch_size = max_batch_size
         self._max_hist_len = max_seqlen - max_num_candidates
-        self._max_incr_fea_len = max(max_incremental_seqlen // 2, 1)
+        self._max_incr_fea_len = max(max_incremental_seqlen, 1)
         self._max_num_candidates = max_num_candidates
+
+        self._full_mode = full_mode
 
         self._item_history: Dict[int, torch.Tensor] = dict()
         self._action_history: Dict[int, torch.Tensor] = dict()
 
     def get_inference_batch_user_ids(self) -> Optional[torch.Tensor]:
-        batch_size = random.randint(1, self._max_batch_size)
-        user_ids = torch.randint(self._max_num_users, (batch_size,)).tolist()
-        user_ids = list(set(user_ids))
+        if self._full_mode:
+            batch_size = self._max_batch_size
+            user_ids = list(range(self._max_batch_size))
+        else:
+            batch_size = random.randint(1, self._max_batch_size)
+            user_ids = torch.randint(self._max_num_users, (batch_size,)).tolist()
+            user_ids = list(set(user_ids))
 
         user_ids = torch.tensor(
             [
@@ -92,6 +98,15 @@ class RandomInferenceDataGenerator:
                 or len(self._item_history[uid]) < self._max_hist_len
             ]
         ).long()
+        if self._full_mode and len(user_ids) == 0:
+            batch_size = self._max_batch_size
+            user_ids = list(
+                range(
+                    self._max_batch_size,
+                    min(self._max_batch_size * 2, self._max_num_users),
+                )
+            )
+            user_ids = torch.tensor(user_ids).long()
         return user_ids if len(user_ids) > 0 else None
 
     def get_random_inference_batch(
@@ -122,6 +137,13 @@ class RandomInferenceDataGenerator:
         num_candidates = torch.randint(
             low=1, high=self._max_num_candidates + 1, size=(batch_size,)
         )
+        if self._full_mode:
+            incr_lengths = torch.full((batch_size,), self._max_incr_fea_len)
+            new_lengths = torch.clamp(
+                lengths + incr_lengths, max=self._max_hist_len
+            ).long()
+            incr_lengths = new_lengths - lengths
+            num_candidates = torch.full((batch_size,), self._max_num_candidates)
 
         # Caveats: truncate_start_positions is for interleaved item-action sequence
         item_start_positions = (truncate_start_positions / 2).to(torch.int32)
