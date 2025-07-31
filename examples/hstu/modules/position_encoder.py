@@ -139,7 +139,10 @@ class HSTUPositionalEncoder(torch.nn.Module):
         else:  # use position embeddings and inference
             ind_offsets = seq_start_position
             high_inds = _get_high_inds(
-                seq_lengths + seq_start_position, self._position_embeddings_weight, num_targets, False
+                seq_lengths + seq_start_position,
+                self._position_embeddings_weight,
+                num_targets,
+                False,
             )
             if not is_fx_tracing():
                 _, D = seq_embeddings.shape
