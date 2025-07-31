@@ -111,7 +111,9 @@ def _add_position_embeddings_kernel(
         clamped_offs_n = tl.where(offs_n >= max_ind, max_ind, offs_n)
     else:
         ind_offset = tl.load(ind_offsets + off_b)
-        clamped_offs_n = tl.where(offs_n + ind_offset >= max_ind, max_ind, offs_n + ind_offset)
+        clamped_offs_n = tl.where(
+            offs_n + ind_offset >= max_ind, max_ind, offs_n + ind_offset
+        )
     offs_d = tl.arange(0, BLOCK_D)
     Jagged += seq_start.to(tl.int64) * stride_jn
     jagged_ptr_offsets = offs_n[:, None] * stride_jn + offs_d[None, :]
@@ -260,7 +262,9 @@ class _AddPositionEmbeddingsFunction(torch.autograd.Function):
     def backward(
         ctx, d_out: torch.Tensor
     ) -> Tuple[torch.Tensor, None, None, None, torch.Tensor, None]:
-        assert ctx.no_ind_offsets, "No backward support for position encoder with incremental input"
+        assert (
+            ctx.no_ind_offsets
+        ), "No backward support for position encoder with incremental input"
         jagged_offsets, high_inds = ctx.saved_tensors
         d_dense = torch.empty((ctx.K, ctx.D), device=d_out.device, dtype=d_out.dtype)
         scale_jagged = ctx.scale != 1.0

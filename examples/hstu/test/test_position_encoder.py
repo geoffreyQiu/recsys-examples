@@ -14,12 +14,11 @@
 # limitations under the License.
 import pytest
 import torch
-from configs import get_hstu_config
+
 # from dataset.utils import Batch, FeatureConfig
 from modules.position_encoder import HSTUPositionalEncoder
 from ops.length_to_offsets import length_to_complete_offsets
 from ops.triton_ops.triton_jagged import triton_concat_2D_jagged
-from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 
 def merge_jagged_list(
@@ -32,7 +31,8 @@ def merge_jagged_list(
         return (jagged_values[0], jagged_seqlens[0])
 
     merge_embeddings = triton_concat_2D_jagged(
-        max_seq_len=torch.max(jagged_seqlens[0]).item() + torch.max(jagged_seqlens[1]).item(),
+        max_seq_len=torch.max(jagged_seqlens[0]).item()
+        + torch.max(jagged_seqlens[1]).item(),
         values_a=jagged_values[0],
         values_b=jagged_values[1],
         offsets_a=length_to_complete_offsets(jagged_seqlens[0]),
@@ -42,15 +42,17 @@ def merge_jagged_list(
 
     for idx in range(2, len(jagged_values)):
         merge_embeddings = triton_concat_2D_jagged(
-            max_seq_len=torch.max(merge_seqlen).item() + torch.max(jagged_seqlens[idx]).item(),
+            max_seq_len=torch.max(merge_seqlen).item()
+            + torch.max(jagged_seqlens[idx]).item(),
             values_a=merge_embeddings,
             values_b=jagged_values[idx],
             offsets_a=length_to_complete_offsets(merge_seqlen),
             offsets_b=length_to_complete_offsets(jagged_seqlens[idx]),
         )
         merge_seqlen += jagged_seqlens[idx]
-    
+
     return (merge_embeddings, merge_seqlen)
+
 
 def get_test_input(
     batch_size,
@@ -59,35 +61,40 @@ def get_test_input(
     embedding_dim,
 ):
     num_splits = 4
-    max_split_len = (max_seq_len-max_num_candidates) // num_splits
+    max_split_len = (max_seq_len - max_num_candidates) // num_splits
 
     split_embeddings = list()
     split_seqlen = list()
     split_start_position = list()
 
     for idx in range(num_splits):
-        seqlen = torch.randint(low=1, high=max_split_len, size=(batch_size,)).long().cuda()
+        seqlen = (
+            torch.randint(low=1, high=max_split_len, size=(batch_size,)).long().cuda()
+        )
         if idx == num_splits - 1:
-            num_candidates = torch.randint(low=1, high=max_num_candidates, size=(batch_size,)).long().cuda()
+            num_candidates = (
+                torch.randint(low=1, high=max_num_candidates, size=(batch_size,))
+                .long()
+                .cuda()
+            )
             seqlen += num_candidates
         split_seqlen.append(seqlen)
-    
+
     for idx in range(num_splits):
         split_start_position.append(
-            torch.zeros((batch_size,)).long().cuda() if idx == 0 else (
-                split_start_position[idx-1] + split_seqlen[idx-1]
-            )
-        )
-    
-    for idx in range(num_splits):
-        split_embeddings.append(
-            torch.randn((torch.sum(split_seqlen[idx]), embedding_dim), dtype=torch.bfloat16).cuda()
+            torch.zeros((batch_size,)).long().cuda()
+            if idx == 0
+            else (split_start_position[idx - 1] + split_seqlen[idx - 1])
         )
 
-    merge_embeddings, merge_seqlen = merge_jagged_list(
-        split_embeddings,
-        split_seqlen
-    )
+    for idx in range(num_splits):
+        split_embeddings.append(
+            torch.randn(
+                (torch.sum(split_seqlen[idx]), embedding_dim), dtype=torch.bfloat16
+            ).cuda()
+        )
+
+    merge_embeddings, merge_seqlen = merge_jagged_list(split_embeddings, split_seqlen)
 
     # print("[[debug]]", merge_embeddings.shape, merge_seqlen.tolist())
     # print("---")
@@ -109,6 +116,7 @@ def get_test_input(
         split_start_position,
     )
 
+
 @pytest.mark.parametrize("max_seq_len", [4096])
 @pytest.mark.parametrize("max_num_candidates", [100, 256, 500])
 def test_hstu_position_encoder_with_offsets(
@@ -128,7 +136,6 @@ def test_hstu_position_encoder_with_offsets(
     position_encoder = HSTUPositionalEncoder(**kwargs)
     device = torch.cuda.current_device()
     position_encoder = position_encoder.to(device)
-
 
     with torch.inference_mode():
         (
@@ -153,18 +160,20 @@ def test_hstu_position_encoder_with_offsets(
                     seq_lengths=split_seqlen[idx],
                     seq_offsets=length_to_complete_offsets(split_seqlen[idx]),
                     seq_embeddings=split_embeddings[idx],
-                    num_targets=num_candidates if idx == len(split_embeddings) - 1 else None,
+                    num_targets=num_candidates
+                    if idx == len(split_embeddings) - 1
+                    else None,
                     seq_timestamps=None,
                     seq_start_position=split_start_position[idx],
                 )
             )
-        
+
         merged_embeddings, merged_seqlen = merge_jagged_list(
             split_posed_embedding,
             split_seqlen,
         )
         assert torch.allclose(merged_seqlen, seqlen)
-        
+
         ref_embeddings = position_encoder(
             max_seq_len=max_seq_len,
             seq_lengths=seqlen,
