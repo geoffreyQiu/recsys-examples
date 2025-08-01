@@ -387,6 +387,15 @@ class InferenceRankingGR(torch.nn.Module):
                     jagged_data.num_candidates_offsets
                 )
                 # self.offload_kv_cache_wait(self._offload_states)
+                
+                indptr = kvcache_metadata.kv_indptr.tolist()
+                print("[debug][kv_indptr]", indptr)
+                for i in range(len(indptr)-1):
+                    print("[debug][kv_pageids][Seq #{}]".format(i), 
+                          kvcache_metadata.kv_indices.tolist()[indptr[i]:indptr[i+1]])
+                print("[debug][kv_last_page]", kvcache_metadata.kv_last_page_len.tolist())
+                print("[debug][kv_cache]", kvcache_metadata.kv_cache_table[0].shape)
+                
                 hstu_output = self._hstu_block.predict(
                     batch.batch_size,
                     num_tokens,
