@@ -28,7 +28,7 @@ sys.path.append("./model/")
 from inference_ranking_gr import InferenceRankingGR
 
 
-def run_ranking_gr_inference():
+def run_ranking_gr_inference(use_kvcache = True):
     max_batch_size = 16
     max_seqlen = 4096
     max_num_candidates = 256
@@ -133,11 +133,15 @@ def run_ranking_gr_inference():
             if uids is None:
                 break
 
-            cached_start_pos, cached_len = model_predict.get_user_kvdata_info(uids)
-            truncate_start_pos = cached_start_pos + cached_len
-            batch = data_generator.get_random_inference_batch(uids, truncate_start_pos)
-
-            model_predict.forward(batch, uids, truncate_start_pos)
+            if use_kvcache:
+                cached_start_pos, cached_len = model_predict.get_user_kvdata_info(uids)
+                truncate_start_pos = cached_start_pos + cached_len
+                batch = data_generator.get_random_inference_batch(uids, truncate_start_pos)
+                model_predict.forward(batch, uids, truncate_start_pos)
+            else:
+                truncate_start_pos = torch.zeros_like(uids)
+                batch = data_generator.get_random_inference_batch(uids, truncate_start_pos)
+                model_predict.forward_no_cache(batch, uids)
 
         num_test_batches = 16
         ts_start, ts_end = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
@@ -148,18 +152,28 @@ def run_ranking_gr_inference():
             if uids is None:
                 break
 
-            cached_start_pos, cached_len = model_predict.get_user_kvdata_info(uids)
-            truncate_start_pos = cached_start_pos + cached_len
-            batch = data_generator.get_random_inference_batch(uids, truncate_start_pos)
+            if use_kvcache:
+                cached_start_pos, cached_len = model_predict.get_user_kvdata_info(uids)
+                truncate_start_pos = cached_start_pos + cached_len
+                batch = data_generator.get_random_inference_batch(uids, truncate_start_pos)
 
-            torch.cuda.synchronize()
-            ts_start.record()
-            model_predict.forward(batch, uids, truncate_start_pos)
-            ts_end.record()
-            torch.cuda.synchronize()
+                torch.cuda.synchronize()
+                ts_start.record()
+                model_predict.forward(batch, uids, truncate_start_pos)
+                ts_end.record()
+                torch.cuda.synchronize()
+            else:
+                truncate_start_pos = torch.zeros_like(uids)
+                batch = data_generator.get_random_inference_batch(uids, truncate_start_pos)
+
+                torch.cuda.synchronize()
+                ts_start.record()
+                model_predict.forward_no_cache(batch, uids)
+                ts_end.record()
+                torch.cuda.synchronize()
             predict_time += ts_start.elapsed_time(ts_end)
         print("Total time(ms):", predict_time)
 
 
 if __name__ == "__main__":
-    run_ranking_gr_inference()
+    run_ranking_gr_inference(use_kvcache = False)

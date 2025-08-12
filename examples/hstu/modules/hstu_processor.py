@@ -291,11 +291,12 @@ class HSTUBlockPreprocessor(torch.nn.Module):
                 num_targets=jd.num_candidates,
             )
 
-        jd.values = torch.nn.functional.dropout(
-            jd.values,
-            p=self._dropout_ratio,
-            training=self.training,
-        ).to(self._training_dtype)
+        if not self._is_inference:
+            jd.values = torch.nn.functional.dropout(
+                jd.values,
+                p=self._dropout_ratio,
+                training=self.training,
+            ).to(self._training_dtype)
 
         return jd
 

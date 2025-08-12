@@ -409,3 +409,44 @@ class InferenceRankingGR(torch.nn.Module):
             self.finalize_kv_cache(user_ids)
 
         return jagged_item_logit
+
+    def forward_no_cache(
+        self,
+        batch: Batch,
+        user_ids: torch.Tensor,
+    ):
+        with torch.inference_mode():
+            jagged_data = self._hstu_block._preprocessor(
+                embeddings=self._embedding_collection(batch.features),
+                batch=batch,
+            )
+
+            num_tokens = batch.features.values().shape[0]
+            if self.use_cudagraph:
+                self._hidden_states[:num_tokens, ...].copy_(
+                    jagged_data.values, non_blocking=True
+                )
+                copy_jagged_metadata(self._jagged_metadata, jagged_data)
+
+                hstu_output = self._hstu_block.predict_no_cache(
+                    batch.batch_size,
+                    num_tokens,
+                    self._hidden_states,
+                    self._jagged_metadata,
+                    False,
+                )
+                jagged_data.values = hstu_output
+            else:
+                hstu_output = self._hstu_block.predict_no_cache(
+                    batch.batch_size,
+                    num_tokens,
+                    jagged_data.values,
+                    jagged_data,
+                    False,
+                )
+                jagged_data.values = hstu_output
+
+            jagged_data = self._hstu_block._postprocessor(jagged_data)
+            jagged_item_logit = self._dense_module(jagged_data.values)
+
+        return jagged_item_logit
