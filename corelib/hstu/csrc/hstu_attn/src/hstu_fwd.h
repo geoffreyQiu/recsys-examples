@@ -388,6 +388,10 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
         }
       } else {
         if constexpr (Is_context) {
+          if (Paged_KV && row < actual_seqlen_c && col >= actual_seqlen_c) {
+            tensor(i) = -INFINITY;
+            continue;
+          }
           if (row < actual_seqlen_c && col < actual_seqlen_h) {
             continue;
           }

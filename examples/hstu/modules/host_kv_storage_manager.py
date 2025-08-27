@@ -94,6 +94,8 @@ class DummyHSTUHostKVStorageImpl(HSTUHostKVStorageImpl):
             else:
                 kv_data_list.append(data_chunk)
             current_length += kv_data_list[-1].shape[0] * self._page_size
+        assert sum([ t.shape[0] for t in kv_data_list ]) == output_buffer.shape[0], \
+            f"[user_id] ({user_id})" + str(user_id) + ", " + str(sum([ t.shape[0] for t in kv_data_list ])) + ", " + str(int(output_buffer.shape[0]))
         return torch.cat(kv_data_list, dim=0, out=output_buffer)
     
     def evict_all_kvdata(self):

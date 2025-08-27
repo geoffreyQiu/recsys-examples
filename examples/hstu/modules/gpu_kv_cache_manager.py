@@ -320,7 +320,7 @@ class HSTUGpuKVCacheManager:
 
         user_ids_list = user_ids.tolist()
         total_history_lengths = torch.tensor(
-            [self.impl.get_num_tokens_cached(uid) for uid in user_ids_list],
+            [self.impl.get_num_tokens_cached(uid) + self.impl.get_cached_start_position(uid) for uid in user_ids_list],
             dtype=torch.int32,
         )
         kv_page_ids = [
