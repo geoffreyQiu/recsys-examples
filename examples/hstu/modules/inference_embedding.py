@@ -111,52 +111,17 @@ class InferenceDynamicEmbeddingCollection(torch.nn.Module):
             feature for config in embedding_configs for feature in config.feature_names
         ]
 
-        self._has_uninitialized_input_dist = True
-        self._features_order: List[int] = []
-        self._features_order_tensor = torch.zeros(
-            (len(self._feature_names)),
-            device=torch.cuda.current_device(),
-            dtype=torch.int32,
-        )
+        self._features_split_sizes: List[int] = []
+        self._features_split_indices: List[int] = []
 
-    def get_input_dist(
-        self,
-        input_feature_names: List[str],
-    ) -> int:
-        input_features_order = []
-        for f in self._feature_names:
-            if f in input_feature_names:
-                input_features_order.append(input_feature_names.index(f))
-
-        num_input_features = len(input_features_order)
-
-        if (
-            self._has_uninitialized_input_dist
-            or input_features_order != self._features_order
-        ):
-            self._features_order = (
-                []
-                if input_features_order == list(range(num_input_features))
-                else input_features_order
-            )
-            if len(self._features_order) > 0:
-                self._features_order_tensor[:num_input_features].copy_(
-                    torch.tensor(
-                        input_features_order,
-                        device=torch.cuda.current_device(),
-                        dtype=torch.int32,
-                    )
-                )
-
-        if self._has_uninitialized_input_dist:
-            self._has_uninitialized_input_dist = False
-
-        return num_input_features
+    def set_feature_splits(self, features_split_size, features_split_indices):
+        self._features_split_sizes = features_split_size
+        self._features_split_indices = features_split_indices
 
     def forward(self, features: KeyedJaggedTensor) -> Dict[str, JaggedTensor]:
         with torch.no_grad():
-            num_input_features = len(features.keys())
-            features = features.split([num_input_features-1, 1])[0]
+            features_split = features.split(self._features_split_sizes)
+            features = KeyedJaggedTensor.concat([features_split[idx] for idx in self._features_split_indices])
             embeddings = self._embedding_tables(features.values(), features.offsets())
         embeddings_kjt = KeyedJaggedTensor(
             values=embeddings,
@@ -270,13 +235,30 @@ class InferenceEmbedding(torch.nn.Module):
         self._static_embedding_collection = self._static_embedding_collection.to(
             torch.cuda.current_device()
         )
+    
+        features_split_sizes, features_split_indices = self.get_features_splits(embedding_configs)
+        self._dynamic_embedding_collection.set_feature_splits(
+            features_split_sizes,
+            features_split_indices
+        )
 
-        @torch.no_grad()
-        def init_weights(m):
-            for param in m.parameters():
-                torch.nn.init.ones_(param)
+    def get_features_splits(self, embedding_configs):
+        last_dynamic = None
+        last_index = -1
+        features_split_sizes = []
+        for idx, emb_config in enumerate(embedding_configs):
+            use_dynamicemb = emb_config.use_dynamicemb
+            if last_dynamic != emb_config.use_dynamicemb:
+                if last_dynamic is not None:
+                    features_split_sizes.append(idx - last_index)
+                last_index = idx
+            last_dynamic = use_dynamicemb
+        features_split_sizes.append(len(embedding_configs) - last_index)
+        
+        index = 1 if len(embedding_configs) % 2 != 0 ^ last_dynamic else 0
+        features_split_indices = list(range(index, len(features_split_sizes), 2))
 
-        self._static_embedding_collection.apply(init_weights)
+        return (features_split_sizes, features_split_indices)
 
     # @output_nvtx_hook(nvtx_tag="InferenceEmbedding", hook_tensor_attr_name="_values")
     def forward(self, kjt: KeyedJaggedTensor) -> Dict[str, JaggedTensor]:

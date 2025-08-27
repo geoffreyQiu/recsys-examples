@@ -30,6 +30,7 @@ from dataset import get_data_loader
 from dataset.inference_dataset import InferenceDataset
 from dataset.random_inference_dataset import RandomInferenceDataGenerator
 from dataset.utils import FeatureConfig
+import math
 from modules.metrics import get_multi_event_metric_module
 from preprocessor import get_common_preprocessors
 from typing import List, Tuple, cast
@@ -59,40 +60,96 @@ class RankingArgs:
                 "gelu",
             ], "prediction_head_act_type should be in ['relu', 'gelu']"
 
-def run_ranking_gr_inference(
-    check_auc: bool = False
+def get_inference_dataset_and_embedding_configs(
+    disable_contextual_features: bool = False
 ):
-    max_batch_size = 16
-    max_seqlen = 4096
-    max_num_candidates = 256
-    max_incremental_seqlen = 128
+    dataset_args = DatasetArgs()
+    embedding_dim = NetworkArgs().hidden_size
+    HASH_SIZE = 10_000_000
+    if dataset_args.dataset_name == "kuairand-1k":
+        embedding_configs = [
+            InferenceEmbeddingConfig(
+                feature_names=["user_id"],
+                table_name="user_id",
+                vocab_size=1000,
+                dim=embedding_dim,
+                use_dynamicemb=True,
+            ),
+            InferenceEmbeddingConfig(
+                feature_names=["user_active_degree"],
+                table_name="user_active_degree",
+                vocab_size=8,
+                dim=embedding_dim,
+                use_dynamicemb=False,
+            ),
+            InferenceEmbeddingConfig(
+                feature_names=["follow_user_num_range"],
+                table_name="follow_user_num_range",
+                vocab_size=9,
+                dim=embedding_dim,
+                use_dynamicemb=False,
+            ),
+            InferenceEmbeddingConfig(
+                feature_names=["fans_user_num_range"],
+                table_name="fans_user_num_range",
+                vocab_size=9,
+                dim=embedding_dim,
+                use_dynamicemb=False,
+            ),
+            InferenceEmbeddingConfig(
+                feature_names=["friend_user_num_range"],
+                table_name="friend_user_num_range",
+                vocab_size=8,
+                dim=embedding_dim,
+                use_dynamicemb=False,
+            ),
+            InferenceEmbeddingConfig(
+                feature_names=["register_days_range"],
+                table_name="register_days_range",
+                vocab_size=8,
+                dim=embedding_dim,
+                use_dynamicemb=False,
+            ),
+            InferenceEmbeddingConfig(
+                feature_names=["video_id"],
+                table_name="video_id",
+                vocab_size=HASH_SIZE,
+                dim=embedding_dim,
+                use_dynamicemb=True,
+            ),
+            InferenceEmbeddingConfig(
+                feature_names=["action_weights"],
+                table_name="action_weights",
+                vocab_size=233,
+                dim=embedding_dim,
+                use_dynamicemb=False,
+            ),
+        ]
+        return dataset_args, embedding_configs if not disable_contextual_features else embedding_configs[-2:]
+    
+    raise ValueError(f"dataset {dataset_args.dataset_name} is not supported")
 
-    # context_emb_size = 1000
-    item_fea_name, item_vocab_size = "video_id", 10_000_000
-    action_fea_name, action_vocab_size = "action_weights", 256
-    feature_configs = [
-        FeatureConfig(
-            feature_names=[item_fea_name, action_fea_name],
-            max_item_ids=[item_vocab_size - 1, action_vocab_size - 1],
-            max_sequence_length=max_seqlen,
-            is_jagged=False,
-        ),
-    ]
-    max_contextual_seqlen = 0
-    total_max_seqlen = sum(
-        [fc.max_sequence_length * len(fc.feature_names) for fc in feature_configs]
-    )
+
+def run_ranking_gr_inference(
+    checkpoint_dir: str,
+    check_auc: bool = False,
+    disable_contextual_features: bool = False
+):
+    dataset_args, emb_configs = get_inference_dataset_and_embedding_configs(disable_contextual_features)
+    network_args = NetworkArgs()
+    if network_args.dtype_str == "bfloat16":
+        inference_dtype = torch.bfloat16
+    elif network_args.dtype_str == "float16":
+        inference_dtype = torch.float16
+    else:
+        raise ValueError(f"Inference data type {network_args.dtype_str} is not supported")
+
+    dataproc = get_common_preprocessors("")[dataset_args.dataset_name]
+    dataproc._batching_file = dataproc._output_file.replace("processed_seqs", "processed_batches")
+    num_contextual_features = len(dataproc._contextual_feature_names) if not disable_contextual_features else 0
+
+    total_max_seqlen = dataset_args.max_sequence_length * 2 + num_contextual_features
     print("total_max_seqlen", total_max_seqlen)
-
-    hidden_dim_size = 1024
-    num_heads = 4
-    head_dim = 256
-    num_layers = 8
-    inference_dtype = torch.bfloat16
-    hstu_cudagraph_configs = {
-        "batch_size": [1],
-        "length_per_sequence": [i * 256 for i in range(2, 34)],
-    }
 
     position_encoding_config = PositionEncodingConfig(
         num_position_buckets=8192,
@@ -101,42 +158,23 @@ def run_ranking_gr_inference(
     )
 
     hstu_config = get_inference_hstu_config(
-        hidden_size=hidden_dim_size,
-        num_layers=num_layers,
-        num_attention_heads=num_heads,
-        head_dim=head_dim,
+        hidden_size=network_args.hidden_size,
+        num_layers=network_args.num_layers,
+        num_attention_heads=network_args.num_attention_heads,
+        head_dim=network_args.kv_channels,
         dtype=inference_dtype,
         position_encoding_config=position_encoding_config,
+        contextual_max_seqlen=num_contextual_features,
     )
 
-    _blocks_in_primary_pool = 10240
-    _page_size = 32
-    _offload_chunksize = 8192
-    kv_cache_config = get_kvcache_config(
-        blocks_in_primary_pool=_blocks_in_primary_pool,
-        page_size=_page_size,
-        offload_chunksize=_offload_chunksize,
-        max_batch_size=max_batch_size,
-        max_seq_len=total_max_seqlen,
-    )
-    emb_configs = [
-        InferenceEmbeddingConfig(
-            feature_names=[action_fea_name],
-            table_name="act",
-            vocab_size=action_vocab_size,
-            dim=hidden_dim_size,
-            use_dynamicemb=False,
-        ),
-        InferenceEmbeddingConfig(
-            feature_names=["context_feat", item_fea_name]
-            if max_contextual_seqlen > 0
-            else [item_fea_name],
-            table_name="item",
-            vocab_size=item_vocab_size,
-            dim=hidden_dim_size,
-            use_dynamicemb=True,
-        ),
-    ]
+    kvcache_args = {
+        "blocks_in_primary_pool": 512,
+        "page_size": 32,
+        "offload_chunksize": 32,
+        "max_batch_size": 1,
+        "max_seq_len": math.ceil(total_max_seqlen / 32) * 32,
+    }
+    kv_cache_config = get_kvcache_config(**kvcache_args)
 
     # TODO: need to init & setup
     ranking_args = RankingArgs()
@@ -149,6 +187,11 @@ def run_ranking_gr_inference(
         eval_metrics=ranking_args.eval_metrics,
     )
 
+    hstu_cudagraph_configs = {
+        "batch_size": [1],
+        "length_per_sequence": [128] + [i * 256 for i in range(1, 34)],
+    }
+
     with torch.inference_mode():
         model_predict = InferenceRankingGR(
             hstu_config=hstu_config,
@@ -157,7 +200,11 @@ def run_ranking_gr_inference(
             use_cudagraph=True,
             cudagraph_configs=hstu_cudagraph_configs,
         )
-        model_predict.bfloat16()
+        if hstu_config.bf16:
+            model_predict.bfloat16()
+        elif hstu_config.fp16:
+            model_predict.half()
+        model_predict.load_checkpoint(checkpoint_dir)
         model_predict.eval()
 
         if check_auc:
@@ -167,18 +214,15 @@ def run_ranking_gr_inference(
                 metric_types=task_config.eval_metrics,
             )
 
-        dataproc = get_common_preprocessors("")["kuairand-1k"]
-        dataproc._batching_file = dataproc._output_file.replace("processed_seqs", "processed_batches")
-
         dataset = InferenceDataset(
             seq_logs_file=dataproc._output_file,
             batch_logs_file=dataproc._batching_file,
-            batch_size=1,
-            max_seqlen=max_seqlen,
+            batch_size=kvcache_args["max_batch_size"],
+            max_seqlen=dataset_args.max_sequence_length,
             item_feature_name=dataproc._item_feature_name,
-            contextual_feature_names=dataproc._contextual_feature_names,
+            contextual_feature_names=dataproc._contextual_feature_names if not disable_contextual_features else [],
             action_feature_name=dataproc._action_feature_name,
-            max_num_candidates=max_num_candidates,
+            max_num_candidates=dataset_args.max_num_candidates,
 
             item_vocab_size=10_000_000,
             userid_name='user_id',
@@ -191,7 +235,6 @@ def run_ranking_gr_inference(
         dataloader_iter = iter(dataloader)
 
         num_batches_ctr = 0
-        num_skipped_ctr = 0
         seq_lengths = set()
         seqlen_histogram = dict()
 
@@ -210,26 +253,47 @@ def run_ranking_gr_inference(
                         )
                     model_predict.clear_kv_cache()
                     cur_date = dates[0]
-                cached_start_pos, cached_len = model_predict.get_user_kvdata_info(uids)
-                truncate_start_pos = cached_start_pos + cached_len
-                batch = dataset.get_input_batch(uids, dates, seq_endptrs, (truncate_start_pos / 2).int().tolist(), False, with_ranking_labels = True)
-                if batch is None:
-                    num_skipped_ctr += 1
-                    continue
-                logits = model_predict.forward(batch, torch.tensor(uids).int(), truncate_start_pos)
-                eval_module(logits, batch.labels)
+                cached_start_pos, cached_len = model_predict.get_user_kvdata_info(uids, dbg_print=True)
+                new_cache_start_pos = cached_start_pos + cached_len
+                non_contextual_mask = new_cache_start_pos >= num_contextual_features
+                contextual_mask = torch.logical_not(non_contextual_mask)
+                seq_startptrs = (torch.clip(new_cache_start_pos - num_contextual_features, 0) / 2).int()
+
+                batch_0 = dataset.get_input_batch(
+                    uids[non_contextual_mask],
+                    dates[non_contextual_mask],
+                    seq_endptrs[non_contextual_mask],
+                    seq_startptrs[non_contextual_mask], 
+                    with_contextual_features = False, 
+                    with_ranking_labels = True)
+                if batch_0 is not None:
+                    logits = model_predict.forward(batch_0, uids[non_contextual_mask].int(), new_cache_start_pos[non_contextual_mask])
+                    eval_module(logits, batch_0.labels)
+
+                batch_1 = dataset.get_input_batch(
+                    uids[contextual_mask],
+                    dates[contextual_mask],
+                    seq_endptrs[contextual_mask],
+                    seq_startptrs[contextual_mask], 
+                    with_contextual_features = True, 
+                    with_ranking_labels = True)
+                if batch_1 is not None:
+                    logits = model_predict.forward(batch_1, uids[contextual_mask].int(), new_cache_start_pos[contextual_mask])
+                    eval_module(logits, batch_1.labels)
+
                 num_batches_ctr += 1
-                if num_batches_ctr == 100000:
-                    break
             except StopIteration:
                 break
         end_time = time.time()
-        print("Total:", num_batches_ctr, "skipped", num_skipped_ctr)
-        print("Total inference:", num_batches_ctr - num_skipped_ctr)
-        print("Total time(s):", end_time-start_time)        
+        print("Total #batch:", num_batches_ctr)
+        print("Total time(s):", end_time-start_time)
 
 if __name__ == "__main__":
     # TODO: change to args (argsparser)
     gin.parse_config_file("./kuairand_1k_inference_ranking.gin")
+    checkpoint_dir = '/home/junyiq//newscratch/june/kuairand1k_checkpoints/iter1500/'
     check_auc = True
-    run_ranking_gr_inference(check_auc = check_auc)
+    run_ranking_gr_inference(
+        checkpoint_dir = checkpoint_dir,
+        check_auc = check_auc
+    )
