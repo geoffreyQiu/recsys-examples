@@ -1,0 +1,33 @@
+megatron.core is not installed, training is not supported.
+CUDA_VISIBLE_DEVICES = 0
+megatron.core is not installed, training is not supported.
+[TensorRT-LLM] TensorRT-LLM version: 0.19.0
+[TensorRT-LLM][INFO] Number of tokens per block: 32.
+[TensorRT-LLM][INFO] [MemUsageChange] Allocated 0.14 GiB for max tokens in paged KV cache (16384).
+total_max_seqlen 8192
+No embedding config found for user_active_degree. Skipped as disabled contextual features.
+No embedding config found for follow_user_num_range. Skipped as disabled contextual features.
+No embedding config found for fans_user_num_range. Skipped as disabled contextual features.
+No embedding config found for friend_user_num_range. Skipped as disabled contextual features.
+No embedding config found for register_days_range. Skipped as disabled contextual features.
+==================fwd without kvcache==================
+--------------running iter 0--------------
+dates[0] is 20220408, cur_date is None, dates is tensor([20220408])
+clear with use_kvcache = False
+cached_start_pos: [0], cached_len: [0], new_cache_start_pos: [0]
+.--------------running iter 1--------------
+dates[0] is 20220408, cur_date is 20220408, dates is tensor([20220408])
+clear with use_kvcache = False
+cached_start_pos: [0], cached_len: [0], new_cache_start_pos: [0]
+==================fwd with kvcache==================
+--------------running iter 0--------------
+dates[0] is 20220408, cur_date is None, dates is tensor([20220408])
+cached_start_pos: [0], cached_len: [0], new_cache_start_pos: [0]
+.--------------running iter 1--------------
+dates[0] is 20220408, cur_date is 20220408, dates is tensor([20220408])
+cached_start_pos: [0], cached_len: [22], new_cache_start_pos: [22]
+==================check kvcache accuracy==================
+✅ Batch 0 match, uid: tensor([867])
+⚠️ Batch 1 mismatch (max difference: 7.06e+00), base_uid: tensor([867]), kv_uid: tensor([867])
+
+❌ Some batches differ, please check model output or cache logic.
