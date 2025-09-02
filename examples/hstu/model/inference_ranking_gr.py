@@ -281,6 +281,9 @@ class InferenceRankingGR(torch.nn.Module):
             new_state_dict[newk] = model_state_dict[k] if not is_transposed else model_state_dict[k].T
 
         unloaded_modules = super().load_state_dict(new_state_dict, *args, **kwargs)
+        for hstu_layer in self._hstu_block._attention_layers:
+            hstu_layer._linear_uvqk_weight.copy_(hstu_layer._linear_uvqk.weight.T)
+
         assert unloaded_modules.missing_keys == ['_embedding_collection._dynamic_embedding_collection._embedding_tables._empty_tensor']
         if self._hstu_config.contextual_max_seqlen != 0:
             assert unloaded_modules.unexpected_keys == []
@@ -365,6 +368,9 @@ class InferenceRankingGR(torch.nn.Module):
             user_ids, cached_start_pos, cached_lengths
         )
 
+        kv_cache_metadata.onload_history_kv_buffer = self._kvcache_metadata.onload_history_kv_buffer[:]
+        kv_cache_metadata.onload_history_kv_events = self._kvcache_metadata.onload_history_kv_events[:]
+        kv_cache_metadata.kv_cache_table = self._kvcache_metadata.kv_cache_table[:]
         if onload_length > 0:
             kv_page_ids = triton_concat_2D_jagged(
                 max_seq_len=onload_kv_page_indptr[-1]
@@ -378,33 +384,16 @@ class InferenceRankingGR(torch.nn.Module):
             kv_cache_metadata.kv_indptr = (
                 onload_kv_page_indptr + kv_cache_metadata.kv_indptr
             )
+            self._gpu_kv_cache_manager.onload(
+                self._host_kv_storage_manager.get_lookup_buffer(),
+                onload_length,
+                self._kvcache_metadata if self.use_cudagraph else kv_cache_metadata,
+            )
 
-            if self.use_cudagraph:
-                self._gpu_kv_cache_manager.onload(
-                    self._host_kv_storage_manager.get_lookup_buffer(),
-                    onload_length,
-                    self._kvcache_metadata,
-                )
-            else:
-                kv_cache_metadata.onload_history_kv_buffer = (
-                    self._kvcache_metadata.onload_history_kv_buffer[:]
-                )
-                kv_cache_metadata.onload_history_kv_events = (
-                    self._kvcache_metadata.onload_history_kv_events[:]
-                )
-                self._gpu_kv_cache_manager.onload(
-                    self._host_kv_storage_manager.get_lookup_buffer(),
-                    onload_length,
-                    kv_cache_metadata,
-                )
-        assert max(kv_cache_metadata.kv_indices.tolist()) < self._kvcache_metadata.kv_cache_table[0].shape[0]
         # cudagraph preparation
-        copy_kvcache_metadata(self._kvcache_metadata, kv_cache_metadata)
-        # preparation due to cudagraph codepath
-        kv_cache_metadata.onload_history_kv_buffer = (
-            self._kvcache_metadata.onload_history_kv_buffer[:]
-        )
-        kv_cache_metadata.kv_cache_table = self._kvcache_metadata.kv_cache_table[:]
+        if self.use_cudagraph:
+            copy_kvcache_metadata(self._kvcache_metadata, kv_cache_metadata)
+        # assert max(kv_cache_metadata.kv_indices.tolist()) < self._kvcache_metadata.kv_cache_table[0].shape[0]
 
         return kv_cache_metadata
 
@@ -495,7 +484,8 @@ class InferenceRankingGR(torch.nn.Module):
                     num_tokens,
                     jagged_data.values,
                     jagged_data,
-                    self._kvcache_metadata,
+                    kvcache_metadata,
+                    # self._kvcache_metadata,
                 )
                 jagged_data.values = hstu_output
 
