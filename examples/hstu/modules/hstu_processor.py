@@ -244,6 +244,7 @@ class HSTUBlockPreprocessor(torch.nn.Module):
                 training_dtype=self._training_dtype,
             )
         self._is_inference = is_inference
+        self._dropout_ratio = 0.0
         if not self._is_inference:
             assert isinstance(
                 config, HSTUConfig
@@ -292,12 +293,11 @@ class HSTUBlockPreprocessor(torch.nn.Module):
                 seq_start_position=seq_start_position,
             )
 
-        if not self._is_inference:
-            jd.values = torch.nn.functional.dropout(
-                jd.values,
-                p=self._dropout_ratio,
-                training=self.training,
-            ).to(self._training_dtype)
+        jd.values = torch.nn.functional.dropout(
+            jd.values,
+            p=self._dropout_ratio,
+            training=self.training,
+        ).to(self._training_dtype)
 
         return jd
 
