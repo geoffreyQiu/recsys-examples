@@ -12,15 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import sys
-import time
 import argparse
 import enum
-
-from commons.utils.stringify import stringify_dict
+import math
+import sys
+import time
 from dataclasses import dataclass
+from typing import List, Tuple, cast
+
 import gin
 import torch
+from commons.utils.stringify import stringify_dict
 from configs import (
     InferenceEmbeddingConfig,
     PositionEncodingConfig,
@@ -30,19 +32,16 @@ from configs import (
 )
 from dataset import get_data_loader
 from dataset.inference_dataset import InferenceDataset
-from dataset.sequence_dataset import SequenceDataset, get_dataset
-from dataset.utils import FeatureConfig
-import math
+from dataset.sequence_dataset import get_dataset
 from modules.metrics import get_multi_event_metric_module
 from preprocessor import get_common_preprocessors
-from typing import List, Tuple, cast
-
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 sys.path.append("./model/")
 from inference_ranking_gr import InferenceRankingGR
+
 sys.path.append("./training/")
-from gin_config_args import TrainerArgs, EmbeddingArgs, DatasetArgs, NetworkArgs, OptimizerArgs
+from gin_config_args import DatasetArgs, NetworkArgs
 
 
 class RunningMode(enum.Enum):
@@ -50,9 +49,10 @@ class RunningMode(enum.Enum):
     SIMULATE = "simulate"
 
     def __str__(self):
-            return self.value
+        return self.value
 
-#duplicate
+
+# duplicate
 @gin.configurable
 @dataclass
 class RankingArgs:
@@ -72,8 +72,9 @@ class RankingArgs:
                 "gelu",
             ], "prediction_head_act_type should be in ['relu', 'gelu']"
 
+
 def get_inference_dataset_and_embedding_configs(
-    disable_contextual_features: bool = False
+    disable_contextual_features: bool = False,
 ):
     dataset_args = DatasetArgs()
     embedding_dim = NetworkArgs().hidden_size
@@ -137,19 +138,33 @@ def get_inference_dataset_and_embedding_configs(
                 use_dynamicemb=False,
             ),
         ]
-        return dataset_args, embedding_configs if not disable_contextual_features else embedding_configs[-2:]
-    
+        return (
+            dataset_args,
+            embedding_configs
+            if not disable_contextual_features
+            else embedding_configs[-2:],
+        )
+
     raise ValueError(f"dataset {dataset_args.dataset_name} is not supported")
 
-def get_inference_hstu_model(emb_configs, max_batch_size, num_contextual_features, total_max_seqlen, checkpoint_dir):
+
+def get_inference_hstu_model(
+    emb_configs,
+    max_batch_size,
+    num_contextual_features,
+    total_max_seqlen,
+    checkpoint_dir,
+):
     network_args = NetworkArgs()
     if network_args.dtype_str == "bfloat16":
         inference_dtype = torch.bfloat16
     # elif network_args.dtype_str == "float16":
     #     inference_dtype = torch.float16
     else:
-        raise ValueError(f"Inference data type {network_args.dtype_str} is not supported")
-    
+        raise ValueError(
+            f"Inference data type {network_args.dtype_str} is not supported"
+        )
+
     position_encoding_config = PositionEncodingConfig(
         num_position_buckets=8192,
         num_time_buckets=2048,
@@ -203,26 +218,38 @@ def get_inference_hstu_model(emb_configs, max_batch_size, num_contextual_feature
         model.half()
     model.load_checkpoint(checkpoint_dir)
     model.eval()
-    
+
     return model
 
 
 def run_ranking_gr_simulate(
     checkpoint_dir: str,
     check_auc: bool = False,
-    disable_contextual_features: bool = False
+    disable_contextual_features: bool = False,
 ):
-    dataset_args, emb_configs = get_inference_dataset_and_embedding_configs(disable_contextual_features)
+    dataset_args, emb_configs = get_inference_dataset_and_embedding_configs(
+        disable_contextual_features
+    )
 
     dataproc = get_common_preprocessors("")[dataset_args.dataset_name]
-    num_contextual_features = len(dataproc._contextual_feature_names) if not disable_contextual_features else 0
+    num_contextual_features = (
+        len(dataproc._contextual_feature_names)
+        if not disable_contextual_features
+        else 0
+    )
 
     max_batch_size = 1
     total_max_seqlen = dataset_args.max_sequence_length * 2 + num_contextual_features
     print("total_max_seqlen", total_max_seqlen)
 
     with torch.inference_mode():
-        model = get_inference_hstu_model(emb_configs, max_batch_size, num_contextual_features, total_max_seqlen, checkpoint_dir)
+        model = get_inference_hstu_model(
+            emb_configs,
+            max_batch_size,
+            num_contextual_features,
+            total_max_seqlen,
+            checkpoint_dir,
+        )
 
         if check_auc:
             eval_module = get_multi_event_metric_module(
@@ -237,15 +264,16 @@ def run_ranking_gr_simulate(
             batch_size=max_batch_size,
             max_seqlen=dataset_args.max_sequence_length,
             item_feature_name=dataproc._item_feature_name,
-            contextual_feature_names=dataproc._contextual_feature_names if not disable_contextual_features else [],
+            contextual_feature_names=dataproc._contextual_feature_names
+            if not disable_contextual_features
+            else [],
             action_feature_name=dataproc._action_feature_name,
             max_num_candidates=dataset_args.max_num_candidates,
-
             item_vocab_size=10_000_000,
-            userid_name='user_id',
-            date_name='date',
-            sequence_endptr_name='interval_indptr',
-            timestamp_names=['date', 'interval_end_ts'],
+            userid_name="user_id",
+            date_name="date",
+            sequence_endptr_name="interval_indptr",
+            timestamp_names=["date", "interval_end_ts"],
         )
 
         dataloader = get_data_loader(dataset=dataset)
@@ -257,41 +285,57 @@ def run_ranking_gr_simulate(
         while True:
             try:
                 uids, dates, seq_endptrs = next(dataloader_iter)
-                if dates[0] != cur_date or num_batches_ctr >= 100:
+                if dates[0] != cur_date:
                     if cur_date is not None:
                         eval_metric_dict = eval_module.compute()
                         print(
                             f"[eval]:\n    "
-                            + stringify_dict(eval_metric_dict, prefix="Metrics", sep="\n    ")
+                            + stringify_dict(
+                                eval_metric_dict, prefix="Metrics", sep="\n    "
+                            )
                         )
                     model.clear_kv_cache()
                     cur_date = dates[0]
-                cached_start_pos, cached_len = model.get_user_kvdata_info(uids, dbg_print=True)
+                cached_start_pos, cached_len = model.get_user_kvdata_info(
+                    uids, dbg_print=True
+                )
                 new_cache_start_pos = cached_start_pos + cached_len
                 non_contextual_mask = new_cache_start_pos >= num_contextual_features
                 contextual_mask = torch.logical_not(non_contextual_mask)
-                seq_startptrs = (torch.clip(new_cache_start_pos - num_contextual_features, 0) / 2).int()
+                seq_startptrs = (
+                    torch.clip(new_cache_start_pos - num_contextual_features, 0) / 2
+                ).int()
 
                 batch_0 = dataset.get_input_batch(
                     uids[non_contextual_mask],
                     dates[non_contextual_mask],
                     seq_endptrs[non_contextual_mask],
-                    seq_startptrs[non_contextual_mask], 
-                    with_contextual_features = False, 
-                    with_ranking_labels = True)
+                    seq_startptrs[non_contextual_mask],
+                    with_contextual_features=False,
+                    with_ranking_labels=True,
+                )
                 if batch_0 is not None:
-                    logits = model.forward(batch_0, uids[non_contextual_mask].int(), new_cache_start_pos[non_contextual_mask])
+                    logits = model.forward(
+                        batch_0,
+                        uids[non_contextual_mask].int(),
+                        new_cache_start_pos[non_contextual_mask],
+                    )
                     eval_module(logits, batch_0.labels)
 
                 batch_1 = dataset.get_input_batch(
                     uids[contextual_mask],
                     dates[contextual_mask],
                     seq_endptrs[contextual_mask],
-                    seq_startptrs[contextual_mask], 
-                    with_contextual_features = True, 
-                    with_ranking_labels = True)
+                    seq_startptrs[contextual_mask],
+                    with_contextual_features=True,
+                    with_ranking_labels=True,
+                )
                 if batch_1 is not None:
-                    logits = model.forward(batch_1, uids[contextual_mask].int(), new_cache_start_pos[contextual_mask])
+                    logits = model.forward(
+                        batch_1,
+                        uids[contextual_mask].int(),
+                        new_cache_start_pos[contextual_mask],
+                    )
                     eval_module(logits, batch_1.labels)
 
                 num_batches_ctr += 1
@@ -299,16 +343,22 @@ def run_ranking_gr_simulate(
                 break
         end_time = time.time()
         print("Total #batch:", num_batches_ctr)
-        print("Total time(s):", end_time-start_time)
+        print("Total time(s):", end_time - start_time)
+
 
 def run_ranking_gr_evaluate(
-    checkpoint_dir: str,
-    disable_contextual_features: bool = False
+    checkpoint_dir: str, disable_contextual_features: bool = False
 ):
-    dataset_args, emb_configs = get_inference_dataset_and_embedding_configs(disable_contextual_features)
+    dataset_args, emb_configs = get_inference_dataset_and_embedding_configs(
+        disable_contextual_features
+    )
 
     dataproc = get_common_preprocessors("")[dataset_args.dataset_name]
-    num_contextual_features = len(dataproc._contextual_feature_names) if not disable_contextual_features else 0
+    num_contextual_features = (
+        len(dataproc._contextual_feature_names)
+        if not disable_contextual_features
+        else 0
+    )
 
     max_batch_size = 1
     total_max_seqlen = dataset_args.max_sequence_length * 2 + num_contextual_features
@@ -320,14 +370,22 @@ def run_ranking_gr_evaluate(
         values = action_jagged_tensor.values()
         lengths = action_jagged_tensor.lengths()
         num_candidates = batch.num_candidates
-        split_lengths = torch.stack([lengths - num_candidates, num_candidates], dim=1).reshape((-1,))
+        split_lengths = torch.stack(
+            [lengths - num_candidates, num_candidates], dim=1
+        ).reshape((-1,))
         stripped_value = torch.split(values, split_lengths.tolist())[::2]
         kjt_dict[action_feature_name] = JaggedTensor.from_dense(stripped_value)
         batch.features = KeyedJaggedTensor.from_jt_dict(kjt_dict)
         return batch
 
     with torch.inference_mode():
-        model = get_inference_hstu_model(emb_configs, max_batch_size, num_contextual_features, total_max_seqlen, checkpoint_dir)
+        model = get_inference_hstu_model(
+            emb_configs,
+            max_batch_size,
+            num_contextual_features,
+            total_max_seqlen,
+            checkpoint_dir,
+        )
 
         eval_module = get_multi_event_metric_module(
             num_classes=model._task_config.prediction_head_arch[-1],
@@ -356,7 +414,9 @@ def run_ranking_gr_evaluate(
             try:
                 batch = next(dataloader_iter)
                 if model._task_config.num_tasks > 0:
-                    batch = strip_candidate_action_tokens(batch, dataproc._action_feature_name)
+                    batch = strip_candidate_action_tokens(
+                        batch, dataproc._action_feature_name
+                    )
 
                 batch = batch.to(device=torch.cuda.current_device())
                 d = batch.features.to_dict()
@@ -367,7 +427,7 @@ def run_ranking_gr_evaluate(
                 eval_module(logits, batch.labels)
             except StopIteration:
                 break
-        
+
         eval_metric_dict = eval_module.compute()
         print(
             f"[eval]:\n    "
@@ -379,9 +439,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Inference End-to-end Example")
     parser.add_argument("--gin_config_file", type=str, required=True)
     parser.add_argument("--checkpoint_dir", type=str, required=True)
-    parser.add_argument("--mode", type=RunningMode, choices=list(RunningMode), required=True)
-    parser.add_argument("--disable_auc", action='store_true')
-    parser.add_argument("--disable_context", action='store_true')
+    parser.add_argument(
+        "--mode", type=RunningMode, choices=list(RunningMode), required=True
+    )
+    parser.add_argument("--disable_auc", action="store_true")
+    parser.add_argument("--disable_context", action="store_true")
 
     args = parser.parse_args()
     gin.parse_config_file(args.gin_config_file)
@@ -391,10 +453,10 @@ if __name__ == "__main__":
             print("disable_auc is ignored in Eval mode.")
         if args.disable_context:
             print("disable_context is ignored in Eval mode.")
-        run_ranking_gr_evaluate(checkpoint_dir = args.checkpoint_dir)
+        run_ranking_gr_evaluate(checkpoint_dir=args.checkpoint_dir)
     elif args.mode == RunningMode.SIMULATE:
         run_ranking_gr_simulate(
-            checkpoint_dir = args.checkpoint_dir,
-            check_auc = not args.disable_auc,
-            disable_contextual_features = args.disable_context
+            checkpoint_dir=args.checkpoint_dir,
+            check_auc=not args.disable_auc,
+            disable_contextual_features=args.disable_context,
         )

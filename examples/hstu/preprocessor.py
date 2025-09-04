@@ -31,9 +31,9 @@ import logging
 import os
 import sys
 import tarfile
+import warnings
 from typing import Dict, List, Tuple
 from urllib.request import urlretrieve
-import warnings
 from zipfile import ZipFile
 
 import numpy as np
@@ -41,8 +41,8 @@ import pandas as pd
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 log = logging.getLogger("main")
-warnings.filterwarnings("ignore", category=DeprecationWarning) 
-warnings.filterwarnings("ignore", category=FutureWarning) 
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 import time
 
@@ -92,10 +92,10 @@ class DataProcessor:
         os.makedirs(self._data_path, exist_ok=True)
         self._file_name = file_name
         self._prefix = prefix
-    
+
     def _log_info(
         self,
-        final_df: pd.DataFrame, 
+        final_df: pd.DataFrame,
         contextual_feature_names: List[str],
         item_feature_name: str,
         action_feature_name: str,
@@ -147,8 +147,10 @@ class DataProcessor:
         final_df.to_csv(output_file, index=False, sep=",")
         log.info(f"Processed file saved to {output_file}")
         log.info(f"num users: {len(final_df[user_id_feature_name])}")
-        self._log_info(final_df, contextual_feature_names, item_feature_name, action_feature_name)
-    
+        self._log_info(
+            final_df, contextual_feature_names, item_feature_name, action_feature_name
+        )
+
     def _post_process_for_inference(
         self,
         user_feature_df,
@@ -176,22 +178,22 @@ class DataProcessor:
             log.info(f"num dates: {len(final_df[date_feature_name].unique())}")
         log.info(f"num batches: {len(batching_df)}")
         self._log_info(
-            final_df, 
-            contextual_feature_names, 
-            item_feature_name,
-            action_feature_name)
+            final_df, contextual_feature_names, item_feature_name, action_feature_name
+        )
 
     def file_exists(self, name: str) -> bool:
         if os.path.isabs(name):
             return os.path.isfile(name)
         else:
             return os.path.isfile("%s/%s" % (os.getcwd(), name))
-    
-    def preprocess(self,
-        training_data: bool,
-        inference_data: bool,
-        **kwargs
-    ):
+
+    def preprocess_training(self):
+        pass
+
+    def preprocess_inference(self, **kwargs):
+        pass
+
+    def preprocess(self, training_data: bool, inference_data: bool, **kwargs):
         if training_data:
             log.info("[========= Generating Training Data =========]")
             self.preprocess_training()
@@ -256,8 +258,12 @@ class MovielensDataProcessor(DataProcessor):
                 10: 9,
             }
         self._output_file: str = os.path.join(data_path, prefix, "processed_seqs.csv")
-        self._inference_sequence_file: str = os.path.join(data_path, prefix, "processed_seqs_inference.csv")
-        self._inference_batch_file: str = os.path.join(data_path, prefix, "processed_batches.csv")
+        self._inference_sequence_file: str = os.path.join(
+            data_path, prefix, "processed_seqs_inference.csv"
+        )
+        self._inference_batch_file: str = os.path.join(
+            data_path, prefix, "processed_batches.csv"
+        )
 
     def download(self) -> None:
         """
@@ -272,7 +278,7 @@ class MovielensDataProcessor(DataProcessor):
         else:
             with tarfile.open(file_path, "r:*") as tar_ref:
                 tar_ref.extractall(self._data_path)
-    
+
     def load(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
         if self._prefix == "ml-1m":
             users = pd.read_csv(
@@ -345,8 +351,16 @@ class MovielensDataProcessor(DataProcessor):
 
         # timestamp in KuaiRand dataset is in milliseconds
         time_interval = kwargs["time_interval"]
+
         def create_interval(group):
-            sorted_group = sorted(zip(*(group[_col_name] for _col_name in ["movie_id", "unix_timestamp", "rating"])))
+            sorted_group = sorted(
+                zip(
+                    *(
+                        group[_col_name]
+                        for _col_name in ["movie_id", "unix_timestamp", "rating"]
+                    )
+                )
+            )
             interval_group = [0]
             for idx in range(1, len(group["unix_timestamp"])):
                 delta_time = sorted_group[idx][1] - sorted_group[interval_group[-1]][1]
@@ -354,16 +368,19 @@ class MovielensDataProcessor(DataProcessor):
                     interval_group.append(idx)
             interval_group.append(len(group["unix_timestamp"]))
             return pd.Series(
-                [ group.user_id ] + [ list(l) for l in zip(*sorted_group) ] + [ interval_group, len(interval_group)-1 ],
-                index=[ "user_id" ] + ["movie_id", "unix_timestamp", "rating"] + [ "interval_indptr", "num_intervals" ]
+                [group.user_id]
+                + [list(l) for l in zip(*sorted_group)]
+                + [interval_group, len(interval_group) - 1],
+                index=["user_id"]
+                + ["movie_id", "unix_timestamp", "rating"]
+                + ["interval_indptr", "num_intervals"],
             )
-        
+
         def filter_interval(group):
-            timestamp_col_name = "unix_timestamp"
             idx = group.interval_indptr[int(group.interval_counter)]
             return pd.Series(
-                [ group.user_id, group["unix_timestamp"][idx-1], idx ],
-                index=[ "user_id", "interval_end_ts", "interval_indptr" ],
+                [group.user_id, group["unix_timestamp"][idx - 1], idx],
+                index=["user_id", "interval_end_ts", "interval_indptr"],
                 dtype=np.int64,
             )
 
@@ -376,7 +393,9 @@ class MovielensDataProcessor(DataProcessor):
 
         df_sorted = df_grouped_by_user.apply(create_interval, axis=1)
         df_filtered = df_sorted.groupby(level=0).apply(
-            lambda group: group.reset_index(drop=True).reindex(np.arange(np.int64(group.num_intervals))).fillna(method='ffill')
+            lambda group: group.reset_index(drop=True)
+            .reindex(np.arange(np.int64(group.num_intervals)))
+            .fillna(method="ffill")
         )
         df_filtered["interval_counter"] = df_filtered.index.get_level_values(1) + 1
         df_filtered = df_filtered.apply(filter_interval, axis=1)
@@ -402,6 +421,7 @@ class MovielensDataProcessor(DataProcessor):
             sequence_file=self._inference_sequence_file,
             batching_file=self._inference_batch_file,
         )
+
 
 class DLRMKuaiRandProcessor(DataProcessor):
     """
@@ -456,8 +476,12 @@ class DLRMKuaiRandProcessor(DataProcessor):
             ]
             self._user_features_file = os.path.join(base_path, "user_features_27k.csv")
         self._output_file: str = os.path.join(base_path, "processed_seqs.csv")
-        self._inference_sequence_file: str = os.path.join(base_path, "processed_seqs_inference.csv")
-        self._inference_batch_file: str = os.path.join(base_path, "processed_batches.csv")
+        self._inference_sequence_file: str = os.path.join(
+            base_path, "processed_seqs_inference.csv"
+        )
+        self._inference_batch_file: str = os.path.join(
+            base_path, "processed_batches.csv"
+        )
         self._event_merge_weight: Dict[str, int] = {
             "is_click": 1,
             "is_like": 2,
@@ -577,7 +601,7 @@ class DLRMKuaiRandProcessor(DataProcessor):
             action_feature_name="action_weights",
             output_file=self._output_file,
         )
-    
+
     def preprocess_inference(self, **kwargs) -> None:
         """
         Preprocess the raw data. The support dataset are "KuaiRand-Pure", "KuaiRand-1K", "KuaiRand-27K".
@@ -594,8 +618,12 @@ class DLRMKuaiRandProcessor(DataProcessor):
         ]
         # timestamp in KuaiRand dataset is in milliseconds
         time_interval = kwargs["time_interval"] * 1000
+
         def create_interval(group):
-            sorted_group = sorted(zip(*(group[_col_name] for _col_name in seq_cols)),  key=lambda item: item[1])
+            sorted_group = sorted(
+                zip(*(group[_col_name] for _col_name in seq_cols)),
+                key=lambda item: item[1],
+            )
             interval_group = [0]
             for idx in range(1, len(group["time_ms"])):
                 delta_time = sorted_group[idx][1] - sorted_group[interval_group[-1]][1]
@@ -603,16 +631,19 @@ class DLRMKuaiRandProcessor(DataProcessor):
                     interval_group.append(idx)
             interval_group.append(len(group["time_ms"]))
             return pd.Series(
-                [ group.user_id, group.date ] + [ list(l) for l in zip(*sorted_group) ] + [ interval_group, len(interval_group)-1 ],
-                index=[ "user_id", "date" ] + seq_cols + [ "interval_indptr", "num_intervals" ]
+                [group.user_id, group.date]
+                + [list(l) for l in zip(*sorted_group)]
+                + [interval_group, len(interval_group) - 1],
+                index=["user_id", "date"]
+                + seq_cols
+                + ["interval_indptr", "num_intervals"],
             )
-        
+
         def filter_interval(group):
-            timestamp_col_name = "time_ms"
             idx = group.interval_indptr[int(group.interval_counter)]
             return pd.Series(
-                [ group.user_id, group.date, group["time_ms"][idx-1], idx ],
-                index=[ "user_id", "date", "interval_end_ts", "interval_indptr" ],
+                [group.user_id, group.date, group["time_ms"][idx - 1], idx],
+                index=["user_id", "date", "interval_end_ts", "interval_indptr"],
                 dtype=np.int64,
             )
 
@@ -622,7 +653,9 @@ class DLRMKuaiRandProcessor(DataProcessor):
                 log_file,
                 delimiter=",",
             )
-            df_grouped_by_user = log_df.groupby(["user_id", "date"]).agg(list).reset_index()
+            df_grouped_by_user = (
+                log_df.groupby(["user_id", "date"]).agg(list).reset_index()
+            )
 
             for event, weight in self._event_merge_weight.items():
                 df_grouped_by_user[event] = df_grouped_by_user[event].apply(
@@ -638,9 +671,11 @@ class DLRMKuaiRandProcessor(DataProcessor):
 
             df_sorted = df_grouped_by_user.apply(create_interval, axis=1)
             df_filtered = df_sorted.groupby(level=0).apply(
-                lambda group: group.reset_index(drop=True).reindex(np.arange(np.int64(group.num_intervals))).fillna(method='ffill')
+                lambda group: group.reset_index(drop=True)
+                .reindex(np.arange(np.int64(group.num_intervals)))
+                .fillna(method="ffill")
             )
-            
+
             df_filtered["interval_counter"] = df_filtered.index.get_level_values(1) + 1
             df_filtered = df_filtered.apply(filter_interval, axis=1)
             df_filtered.reset_index()
@@ -666,12 +701,13 @@ class DLRMKuaiRandProcessor(DataProcessor):
             batching_df,
             "user_id",
             "date",
-            contextual_feature_names=self._contextual_feature_names + [ "date" ],
+            contextual_feature_names=self._contextual_feature_names + ["date"],
             item_feature_name="video_id",
             action_feature_name="action_weights",
             sequence_file=self._inference_sequence_file,
             batching_file=self._inference_batch_file,
         )
+
 
 dataset_names = (
     "ml-1m",
@@ -747,7 +783,7 @@ if __name__ == "__main__":
         "--batch_ts_interval",
         type=int,
         default=60,
-        help="Batching time interval for inference data (seconds)."
+        help="Batching time interval for inference data (seconds).",
     )
     args = parser.parse_args()
     if not args.training and not args.inference:

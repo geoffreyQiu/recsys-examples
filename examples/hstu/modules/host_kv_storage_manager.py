@@ -39,7 +39,7 @@ class HSTUHostKVStorageImpl:
         self, user_id: int, length: int, layer_idx: int, output_buffer: torch.Tensor
     ) -> torch.Tensor:
         pass
-    
+
     def evict_all_kvdata(self):
         pass
 
@@ -94,15 +94,15 @@ class DummyHSTUHostKVStorageImpl(HSTUHostKVStorageImpl):
             else:
                 kv_data_list.append(data_chunk)
             current_length += kv_data_list[-1].shape[0] * self._page_size
-        assert sum([ t.shape[0] for t in kv_data_list ]) == output_buffer.shape[0], \
-            f"[user_id] ({user_id})" + str(user_id) + ", " + str(sum([ t.shape[0] for t in kv_data_list ])) + ", " + str(int(output_buffer.shape[0]))
+        # assert sum([t.shape[0] for t in kv_data_list]) == output_buffer.shape[0]
         return torch.cat(kv_data_list, dim=0, out=output_buffer)
-    
+
     def evict_all_kvdata(self):
         self.sequence_start_pos.clear()
         self.sequence_length.clear()
         for layer_idx in range(self._num_layers):
             self.kv_data_storage[layer_idx].clear()
+
 
 class HSTUHostKVStorageManager:
     def __init__(
@@ -241,7 +241,7 @@ class HSTUHostKVStorageManager:
                     for layer_idx in range(self.num_layers)
                 ],
             )
-    
+
     def evict_all_kvdata(self):
         self.impl.evict_all_kvdata()
 

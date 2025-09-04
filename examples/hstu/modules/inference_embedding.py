@@ -121,7 +121,9 @@ class InferenceDynamicEmbeddingCollection(torch.nn.Module):
     def forward(self, features: KeyedJaggedTensor) -> Dict[str, JaggedTensor]:
         with torch.no_grad():
             features_split = features.split(self._features_split_sizes)
-            features = KeyedJaggedTensor.concat([features_split[idx] for idx in self._features_split_indices])
+            features = KeyedJaggedTensor.concat(
+                [features_split[idx] for idx in self._features_split_indices]
+            )
             embeddings = self._embedding_tables(features.values(), features.offsets())
         embeddings_kjt = KeyedJaggedTensor(
             values=embeddings,
@@ -235,11 +237,12 @@ class InferenceEmbedding(torch.nn.Module):
         self._static_embedding_collection = self._static_embedding_collection.to(
             torch.cuda.current_device()
         )
-    
-        features_split_sizes, features_split_indices = self.get_features_splits(embedding_configs)
+
+        features_split_sizes, features_split_indices = self.get_features_splits(
+            embedding_configs
+        )
         self._dynamic_embedding_collection.set_feature_splits(
-            features_split_sizes,
-            features_split_indices
+            features_split_sizes, features_split_indices
         )
 
     def get_features_splits(self, embedding_configs):
@@ -254,7 +257,7 @@ class InferenceEmbedding(torch.nn.Module):
                 last_index = idx
             last_dynamic = use_dynamicemb
         features_split_sizes.append(len(embedding_configs) - last_index)
-        
+
         index = 1 if len(embedding_configs) % 2 != 0 ^ last_dynamic else 0
         features_split_indices = list(range(index, len(features_split_sizes), 2))
 

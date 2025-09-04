@@ -29,13 +29,12 @@
 import json
 import math
 from collections import defaultdict
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional
 
 import numpy as np
 import pandas as pd
 import torch
-from dataset.utils import Batch, RankingBatch, RetrievalBatch
-from preprocessor import get_common_preprocessors
+from dataset.utils import Batch, RankingBatch
 from torch.utils.data.dataset import IterableDataset
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
@@ -112,9 +111,9 @@ class InferenceDataset(IterableDataset[Batch]):
             self._batch_logs_frame = pd.read_csv(
                 batch_logs_file, delimiter=",", nrows=batch_nrows
             )
-        
+
         self._batch_logs_frame.sort_values(by=timestamp_names, inplace=True)
-        num_total_samples = len(self._batch_logs_frame)
+        len(self._batch_logs_frame)
 
         self._num_samples = len(self._batch_logs_frame)
         self._max_seqlen = max_seqlen
@@ -143,8 +142,11 @@ class InferenceDataset(IterableDataset[Batch]):
 
     def __iter__(self) -> Iterator[Batch]:
         for i in range(len(self)):
-            batch_start = (i * self._batch_size)
-            batch_end = min((i + 1) * self._batch_size, len(self._sample_ids),)
+            batch_start = i * self._batch_size
+            batch_end = min(
+                (i + 1) * self._batch_size,
+                len(self._sample_ids),
+            )
             sample_ids = self._sample_ids[batch_start:batch_end]
             user_ids: List[int] = []
             dates: List[int] = []
@@ -153,21 +155,27 @@ class InferenceDataset(IterableDataset[Batch]):
                 seq_endptr = self._batch_logs_frame.iloc[sample_id][self._seq_end_name]
                 if seq_endptr > self._max_seqlen:
                     continue
-                user_ids.append(self._batch_logs_frame.iloc[sample_id][self._userid_name])
+                user_ids.append(
+                    self._batch_logs_frame.iloc[sample_id][self._userid_name]
+                )
                 dates.append(self._batch_logs_frame.iloc[sample_id][self._date_name])
                 seq_endptrs.append(seq_endptr)
             if len(user_ids) == 0:
                 continue
-            yield (torch.tensor(user_ids), torch.tensor(dates), torch.tensor(seq_endptrs))
-    
+            yield (
+                torch.tensor(user_ids),
+                torch.tensor(dates),
+                torch.tensor(seq_endptrs),
+            )
+
     def get_input_batch(
         self,
         user_ids,
         dates,
         sequence_endptrs,
         sequence_startptrs,
-        with_contextual_features = False,
-        with_ranking_labels = False,
+        with_contextual_features=False,
+        with_ranking_labels=False,
     ):
         contextual_features: Dict[str, List[int]] = defaultdict(list)
         contextual_features_seqlen: Dict[str, List[int]] = defaultdict(list)
@@ -177,7 +185,7 @@ class InferenceDataset(IterableDataset[Batch]):
         action_features_seqlen: List[int] = []
         num_candidates: List[int] = []
         labels: List[int] = []
-        
+
         packed_user_ids: List[int] = []
 
         if len(user_ids) == 0:
@@ -190,7 +198,10 @@ class InferenceDataset(IterableDataset[Batch]):
             end_pos = sequence_endptrs[idx].item()  # history_end_pos
             start_pos = sequence_startptrs[idx].item()
 
-            data = self._seq_logs_frame[(self._seq_logs_frame[self._userid_name] == uid) & (self._seq_logs_frame[self._date_name] == date)]
+            data = self._seq_logs_frame[
+                (self._seq_logs_frame[self._userid_name] == uid)
+                & (self._seq_logs_frame[self._date_name] == date)
+            ]
             data = data.iloc[0]
             if with_contextual_features:
                 for contextual_feature_name in self._contextual_feature_names:
@@ -207,15 +218,32 @@ class InferenceDataset(IterableDataset[Batch]):
                 if not with_ranking_labels:
                     # num_candidate = (torch.randint(self._max_num_candidates) + 1).item()
                     num_candidate = self._max_num_candidates
-                    candidate_seq = torch.randint(self._item_vocab_size, (num_candidate,)).tolist()
-                
+                    candidate_seq = torch.randint(
+                        self._item_vocab_size, (num_candidate,)
+                    ).tolist()
+
                 # extract candidates from following sequences
                 else:
-                    all_seqs = self._seq_logs_frame[(self._seq_logs_frame[self._userid_name] == uid) & (self._seq_logs_frame[self._date_name] >= date)]
-                    candidate_seq = sum([load_seq(all_seqs.iloc[idx][self._item_feature_name]) for idx in range(len(all_seqs))], start=[])[end_pos:end_pos + self._max_num_candidates]
+                    all_seqs = self._seq_logs_frame[
+                        (self._seq_logs_frame[self._userid_name] == uid)
+                        & (self._seq_logs_frame[self._date_name] >= date)
+                    ]
+                    candidate_seq = sum(
+                        [
+                            load_seq(all_seqs.iloc[idx][self._item_feature_name])
+                            for idx in range(len(all_seqs))
+                        ],
+                        start=[],
+                    )[end_pos : end_pos + self._max_num_candidates]
                     num_candidate = len(candidate_seq)
-                    label_seq = sum([load_seq(all_seqs.iloc[idx][self._action_feature_name]) for idx in range(len(all_seqs))], start=[])[end_pos:end_pos + self._max_num_candidates]
-                
+                    label_seq = sum(
+                        [
+                            load_seq(all_seqs.iloc[idx][self._action_feature_name])
+                            for idx in range(len(all_seqs))
+                        ],
+                        start=[],
+                    )[end_pos : end_pos + self._max_num_candidates]
+
                 all_item_seq = item_seq + candidate_seq
 
             item_features.extend(all_item_seq)
@@ -228,13 +256,15 @@ class InferenceDataset(IterableDataset[Batch]):
             action_features_seqlen.append(len(action_seq))
 
             packed_user_ids.append(uid)
-        
+
         if len(packed_user_ids) == 0:
             return None
 
         feature_to_max_seqlen = {}
         for name in self._contextual_feature_names:
-            feature_to_max_seqlen[name] = max(contextual_features_seqlen[name], default=0)
+            feature_to_max_seqlen[name] = max(
+                contextual_features_seqlen[name], default=0
+            )
 
         ### Currently use clipped maxlen. check how this impacts the hstu results
         feature_to_max_seqlen[self._item_feature_name] = max(item_features_seqlen)
@@ -253,11 +283,11 @@ class InferenceDataset(IterableDataset[Batch]):
         else:
             contextual_features_tensor = torch.empty((0,), dtype=torch.int64)
             contextual_features_lengths_tensor = torch.tensor(
-                [ 0 for name in self._contextual_feature_names ]
+                [0 for name in self._contextual_feature_names]
             ).view(-1)
         features = KeyedJaggedTensor.from_lengths_sync(
             keys=self._contextual_feature_names
-                + [self._item_feature_name, self._action_feature_name],
+            + [self._item_feature_name, self._action_feature_name],
             values=torch.concat(
                 [
                     contextual_features_tensor.to(device=self._device),
@@ -287,6 +317,6 @@ class InferenceDataset(IterableDataset[Batch]):
             else None,
         )
         if with_ranking_labels:
-            return RankingBatch(labels = labels, **batch_kwargs)
-        
+            return RankingBatch(labels=labels, **batch_kwargs)
+
         return Batch(**batch_kwargs)

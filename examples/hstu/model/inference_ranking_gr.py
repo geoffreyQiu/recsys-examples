@@ -27,7 +27,6 @@ from configs import (
     get_kvcache_metadata_buffer,
 )
 from dataset.utils import Batch
-from dynamicemb.dump_load import DynamicEmbLoad as dynamic_emb_load
 from dynamicemb.dump_load import load_table
 from modules.gpu_kv_cache_manager import HSTUGpuKVCacheManager
 from modules.host_kv_storage_manager import HSTUHostKVStorageManager
@@ -66,10 +65,14 @@ def get_jagged_metadata_buffer(max_batch_size, max_seq_len, contextual_max_seqle
         contextual_max_seqlen=contextual_max_seqlen,
         contextual_seqlen=torch.full(
             (max_batch_size,), 0, dtype=int_dtype, device=device
-        ) if contextual_max_seqlen > 0 else None,
+        )
+        if contextual_max_seqlen > 0
+        else None,
         contextual_seqlen_offsets=torch.full(
             (max_batch_size + 1,), 0, dtype=int_dtype, device=device
-        ) if contextual_max_seqlen > 0 else None,
+        )
+        if contextual_max_seqlen > 0
+        else None,
         has_interleaved_action=True,
     )
 
@@ -96,7 +99,8 @@ def copy_jagged_metadata(dst_metadata, src_metata):
     if src_metata.contextual_max_seqlen > 0:
         copy_tensor(dst_metadata.contextual_seqlen, src_metata.contextual_seqlen[:bs])
         copy_offsets(
-            dst_metadata.contextual_seqlen_offsets, src_metata.contextual_seqlen_offsets[: bs + 1]
+            dst_metadata.contextual_seqlen_offsets,
+            src_metata.contextual_seqlen_offsets[: bs + 1],
         )
 
 
@@ -215,38 +219,42 @@ class InferenceRankingGR(torch.nn.Module):
         self._hstu_block.half()
         self._mlp.half()
         return self
-    
+
     def load_checkpoint(self, checkpoint_dir):
         embedding_table_dir = os.path.join(
-            checkpoint_dir, 
+            checkpoint_dir,
             "dynamicemb_module",
-            "model._embedding_collection._model_parallel_embedding_collection"
+            "model._embedding_collection._model_parallel_embedding_collection",
         )
         # FIXME: remove dist init in the future.
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = "0000"
         dist.init_process_group(world_size=1, rank=0)
-        dynamic_tables = self._embedding_collection._dynamic_embedding_collection._embedding_tables
+        dynamic_tables = (
+            self._embedding_collection._dynamic_embedding_collection._embedding_tables
+        )
         for idx, table_name in enumerate(dynamic_tables.table_names):
-            load_table(
-                dynamic_tables.tables[idx],
-                embedding_table_dir,
-                table_name
-            )
+            load_table(dynamic_tables.tables[idx], embedding_table_dir, table_name)
         dist.destroy_process_group()
         os.environ.pop("MASTER_ADDR")
         os.environ.pop("MASTER_PORT")
 
-        model_state_dict_path = os.path.join(checkpoint_dir, "torch_module", "model.0.pth")
-        model_state_dict = torch.load(model_state_dict_path)['model_state_dict']
-        self.load_state_dict(model_state_dict, strict = False)
-    
+        model_state_dict_path = os.path.join(
+            checkpoint_dir, "torch_module", "model.0.pth"
+        )
+        model_state_dict = torch.load(model_state_dict_path)["model_state_dict"]
+        self.load_state_dict(model_state_dict, strict=False)
+
     def load_state_dict(self, model_state_dict, *args, **kwargs):
         new_state_dict = {}
         for k in model_state_dict:
-            if k.startswith("_embedding_collection._data_parallel_embedding_collection.embeddings."):
-                emb_table_names = k.split('.')[-1].removesuffix("_weights").split('/')
-                old_emb_table_weights = model_state_dict[k].view(-1, self._embedding_dim)
+            if k.startswith(
+                "_embedding_collection._data_parallel_embedding_collection.embeddings."
+            ):
+                emb_table_names = k.split(".")[-1].removesuffix("_weights").split("/")
+                old_emb_table_weights = model_state_dict[k].view(
+                    -1, self._embedding_dim
+                )
                 weight_offset = 0
                 # TODO(junyiq): Use a more flexible way to skip contextual features.
                 for name in emb_table_names:
@@ -254,20 +262,30 @@ class InferenceRankingGR(torch.nn.Module):
                         if name == emb_config.table_name:
                             emb_table_size = emb_config.vocab_size
                             if self._hstu_config.contextual_max_seqlen == 0:
-                                weight_offset = old_emb_table_weights.shape[0] - emb_table_size
+                                weight_offset = (
+                                    old_emb_table_weights.shape[0] - emb_table_size
+                                )
                             break
                     else:
                         if self._hstu_config.contextual_max_seqlen == 0:
-                            print(f"No embedding config found for {name}. Skipped as disabled contextual features.")
+                            print(
+                                f"No embedding config found for {name}. Skipped as disabled contextual features."
+                            )
                             continue
                         raise Exception("No embedding config found for " + name)
-                    newk = "_embedding_collection._static_embedding_collection.embeddings." + name + ".weight"
-                    new_state_dict[newk] = old_emb_table_weights[weight_offset:weight_offset+emb_table_size]
+                    newk = (
+                        "_embedding_collection._static_embedding_collection.embeddings."
+                        + name
+                        + ".weight"
+                    )
+                    new_state_dict[newk] = old_emb_table_weights[
+                        weight_offset : weight_offset + emb_table_size
+                    ]
                     weight_offset += emb_table_size
                 continue
             elif "_model_parallel_embedding_collection" in k:
                 continue
-            
+
             is_transposed = False
             if k.endswith("_linear_uvqk_weight"):
                 newk = k.removesuffix("_linear_uvqk_weight") + "_linear_uvqk.weight"
@@ -279,18 +297,25 @@ class InferenceRankingGR(torch.nn.Module):
                 is_transposed = True
             else:
                 newk = k
-            new_state_dict[newk] = model_state_dict[k] if not is_transposed else model_state_dict[k].T
+            new_state_dict[newk] = (
+                model_state_dict[k] if not is_transposed else model_state_dict[k].T
+            )
 
         unloaded_modules = super().load_state_dict(new_state_dict, *args, **kwargs)
         for hstu_layer in self._hstu_block._attention_layers:
             hstu_layer._linear_uvqk_weight.copy_(hstu_layer._linear_uvqk.weight.T)
-        
-        assert unloaded_modules.missing_keys == ['_embedding_collection._dynamic_embedding_collection._embedding_tables._empty_tensor']
+
+        assert unloaded_modules.missing_keys == [
+            "_embedding_collection._dynamic_embedding_collection._embedding_tables._empty_tensor"
+        ]
         if self._hstu_config.contextual_max_seqlen != 0:
             assert unloaded_modules.unexpected_keys == []
 
     def get_user_kvdata_info(
-        self, user_ids: Union[List[int], torch.Tensor], allow_bubble: bool = False, dbg_print: bool = False
+        self,
+        user_ids: Union[List[int], torch.Tensor],
+        allow_bubble: bool = False,
+        dbg_print: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         kvdata_start_pos = list()
         kvdata_lengths = list()
@@ -315,10 +340,8 @@ class InferenceRankingGR(torch.nn.Module):
             torch.tensor(kvdata_start_pos, dtype=torch.int32),
             torch.tensor(kvdata_lengths, dtype=torch.int32),
         )
-    
-    def strip_contextual_features(
-        self, embeddings, batch, user_start_pos
-    ):
+
+    def strip_contextual_features(self, embeddings, batch, user_start_pos):
         if int(min(user_start_pos)) >= len(batch.contextual_feature_names):
             embeddings = {
                 batch.item_feature_name: embeddings[batch.item_feature_name],
@@ -360,7 +383,7 @@ class InferenceRankingGR(torch.nn.Module):
             setattr(
                 kv_cache_metadata, _field_name, getattr(append_metadata, _field_name)
             )
-    
+
         kv_cache_metadata.onload_history_kv_buffer = (
             self._kvcache_metadata.onload_history_kv_buffer[:]
         )
@@ -377,8 +400,7 @@ class InferenceRankingGR(torch.nn.Module):
         )
         if onload_length > 0:
             kv_page_ids = triton_concat_2D_jagged(
-                max_seq_len=onload_kv_page_indptr[-1]
-                + kv_cache_metadata.kv_indptr[-1],
+                max_seq_len=onload_kv_page_indptr[-1] + kv_cache_metadata.kv_indptr[-1],
                 values_a=onload_kv_page_ids.view(-1, 1),
                 values_b=kv_cache_metadata.kv_indices.view(-1, 1),
                 offsets_a=onload_kv_page_indptr.to(torch.int64),
@@ -393,7 +415,7 @@ class InferenceRankingGR(torch.nn.Module):
                 onload_length,
                 self._kvcache_metadata if self.use_cudagraph else kv_cache_metadata,
             )
-        
+
         # cudagraph preparation
         if self.use_cudagraph:
             copy_kvcache_metadata(self._kvcache_metadata, kv_cache_metadata)
@@ -403,7 +425,7 @@ class InferenceRankingGR(torch.nn.Module):
 
     def finalize_kv_cache(self, user_ids: torch.Tensor, **kwargs):
         pass
-    
+
     def clear_kv_cache(self):
         self._gpu_kv_cache_manager.evict_all()
         self._host_kv_storage_manager.evict_all_kvdata()
@@ -449,10 +471,14 @@ class InferenceRankingGR(torch.nn.Module):
         user_start_pos: torch.Tensor,
     ):
         with torch.inference_mode():
-            user_start_pos_cuda = user_start_pos.to(device=torch.cuda.current_device(), non_blocking=True)
+            user_start_pos_cuda = user_start_pos.to(
+                device=torch.cuda.current_device(), non_blocking=True
+            )
             kvcache_metadata = self.prepare_kv_cache(batch, user_ids, user_start_pos)
             embeddings = self._embedding_collection(batch.features)
-            embeddings, batch = self.strip_contextual_features(embeddings, batch, user_start_pos)
+            embeddings, batch = self.strip_contextual_features(
+                embeddings, batch, user_start_pos
+            )
             jagged_data = self._hstu_block._preprocessor(
                 embeddings=embeddings,
                 batch=batch,

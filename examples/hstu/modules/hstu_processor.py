@@ -253,7 +253,10 @@ class HSTUBlockPreprocessor(torch.nn.Module):
 
     @output_nvtx_hook(nvtx_tag="HSTUBlock preprocess", hook_key_or_attr_name="values")
     def forward(
-        self, embeddings: Dict[str, JaggedTensor], batch: RankingBatch, seq_start_position : torch.Tensor = None
+        self,
+        embeddings: Dict[str, JaggedTensor],
+        batch: RankingBatch,
+        seq_start_position: torch.Tensor = None,
     ) -> JaggedData:
         """
         Preprocesses the embeddings for use in the HSTU architecture.
