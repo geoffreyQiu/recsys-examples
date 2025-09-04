@@ -261,7 +261,7 @@ class _AddPositionEmbeddingsFunction(torch.autograd.Function):
     # pyre-ignore[14]
     def backward(
         ctx, d_out: torch.Tensor
-    ) -> Tuple[torch.Tensor, None, None, None, torch.Tensor, None]:
+    ) -> Tuple[torch.Tensor, None, None, None, torch.Tensor, None, None]:
         assert (
             ctx.no_ind_offsets
         ), "No backward support for position encoder with incremental input"
@@ -287,7 +287,15 @@ class _AddPositionEmbeddingsFunction(torch.autograd.Function):
             BLOCK_D=BLOCK_D,
         )
         # pyre-ignore[61]
-        return d_jagged if scale_jagged else d_out, None, None, None, d_dense, None
+        return (
+            d_jagged if scale_jagged else d_out,
+            None,
+            None,
+            None,
+            d_dense,
+            None,
+            None,
+        )
 
 
 @triton_autotune(
