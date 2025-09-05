@@ -208,7 +208,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
             kv_cache_metadata.total_history_offsets[: batch_size + 1],
             self._max_seqlen,
             self._max_seqlen,
-            num_contexts=None,
+            num_contexts=jd.contextual_seqlen,
             num_targets=jd.num_candidates,
             target_group_size=1,
             window_size=(-1, 0),
@@ -321,7 +321,9 @@ class PagedHSTUInferLayer(torch.nn.Module):
             kv_cache_metadata.total_history_offsets[: batch_size + 1],
             self._max_seqlen,
             self._max_seqlen,
-            num_contexts=None,
+            num_contexts=jd.contextual_seqlen[:batch_size]
+            if jd.contextual_seqlen
+            else None,
             num_targets=jd.num_candidates[:batch_size],
             target_group_size=1,
             window_size=(-1, 0),
