@@ -297,6 +297,7 @@ class InferenceRankingGR(torch.nn.Module):
         unloaded_modules = super().load_state_dict(new_state_dict, *args, **kwargs)
         for hstu_layer in self._hstu_block._attention_layers:
             hstu_layer._linear_uvqk_weight.copy_(hstu_layer._linear_uvqk.weight.T)
+            hstu_layer._linear_proj_weight.copy_(hstu_layer._linear_proj.weight.T)
 
         assert unloaded_modules.missing_keys == [
             "_embedding_collection._dynamic_embedding_collection._embedding_tables._empty_tensor"
