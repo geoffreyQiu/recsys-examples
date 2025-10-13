@@ -227,9 +227,16 @@ class InferenceRankingGR(torch.nn.Module):
         dynamic_tables = (
             self._embedding_collection._dynamic_embedding_collection._embedding_tables
         )
-        for idx, table_name in enumerate(dynamic_tables.table_names):
-            dynamic_tables.load(
-                embedding_table_dir, optim=False, table_names=[table_name]
+
+        try:
+            for idx, table_name in enumerate(dynamic_tables.table_names):
+                dynamic_tables.load(
+                    embedding_table_dir, optim=False, table_names=[table_name]
+                )
+        except ValueError as e:
+            warnings.warn(
+                f"FAILED TO LOAD dynamic embedding tables failed due to ValueError:\n\t{e}\n\n"
+                "Please check if the checkpoint is version 1. The loading of this old version is disabled."
             )
 
         model_state_dict_path = os.path.join(

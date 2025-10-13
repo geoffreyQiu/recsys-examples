@@ -25,7 +25,6 @@ from dynamicemb import (
     DynamicEmbTableOptions,
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
-from dynamicemb_extensions import OptimizerType
 from torchrec.modules.embedding_configs import EmbeddingConfig, dtype_to_data_type
 from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
@@ -66,7 +65,6 @@ def create_dynamic_embedding_tables(
         DynamicEmbTableOptions(
             index_type=torch.int64,
             embedding_dtype=torch.float32,
-            optimizer_type=OptimizerType.Adam,
             dim=config.dim,
             max_capacity=config.vocab_size,
             local_hbm_for_values=0,

@@ -147,7 +147,7 @@ class HSTUGpuKVCacheManager:
             start_pos = user_start_pos[idx].item()
             new_history_length = new_history_lengths[idx].item()
             self.impl.add_sequence_with_eviction(
-                user_id, start_pos, new_history_length, 1, user_ids_set, None
+                user_id, start_pos, new_history_length, 1, None, user_ids_set
             )
 
     def evict(self, user_ids: torch.Tensor):
