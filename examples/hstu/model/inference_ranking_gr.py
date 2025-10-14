@@ -227,9 +227,16 @@ class InferenceRankingGR(torch.nn.Module):
         dynamic_tables = (
             self._embedding_collection._dynamic_embedding_collection._embedding_tables
         )
-        for idx, table_name in enumerate(dynamic_tables.table_names):
-            dynamic_tables.load(
-                embedding_table_dir, optim=False, table_names=[table_name]
+
+        try:
+            for idx, table_name in enumerate(dynamic_tables.table_names):
+                dynamic_tables.load(
+                    embedding_table_dir, optim=False, table_names=[table_name]
+                )
+        except ValueError as e:
+            warnings.warn(
+                f"FAILED TO LOAD dynamic embedding tables failed due to ValueError:\n\t{e}\n\n"
+                "Please check if the checkpoint is version 1. The loading of this old version is disabled."
             )
 
         model_state_dict_path = os.path.join(
@@ -297,6 +304,7 @@ class InferenceRankingGR(torch.nn.Module):
         unloaded_modules = super().load_state_dict(new_state_dict, *args, **kwargs)
         for hstu_layer in self._hstu_block._attention_layers:
             hstu_layer._linear_uvqk_weight.copy_(hstu_layer._linear_uvqk.weight.T)
+            hstu_layer._linear_proj_weight.copy_(hstu_layer._linear_proj.weight.T)
 
         assert unloaded_modules.missing_keys == [
             "_embedding_collection._dynamic_embedding_collection._embedding_tables._empty_tensor"
