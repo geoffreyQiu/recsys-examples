@@ -638,7 +638,7 @@ def _hstu_attention_maybe_from_cache(
         masked_qk_attn = qk_attn
     masked_qk_attn = masked_qk_attn * alpha
     masked_qk_attn = F.silu(masked_qk_attn)
-    masked_qk_attn = masked_qk_attn / seq_len_q
+    masked_qk_attn = masked_qk_attn / seqlen_q
     if invalid_attn_mask is not None:
         if invalid_attn_mask.ndim == 2:
             invalid_attn_mask = invalid_attn_mask.unsqueeze(0).unsqueeze(0)
@@ -2031,7 +2031,7 @@ def _hstu_attention_maybe_from_cache_fp8(
         attn_output = unpad_input_delta_q(attn_output, q_offsets, k_offsets, B, n_k)
     else:
         attn_output = unpad_input(attn_output, q_offsets)
-    attn_output = attn_output.reshape(-1, num_heads, linear_dim) / seqlen_q
+    attn_output = attn_output.reshape(-1, num_heads, linear_dim) / ori_n_q
 
     return attn_output.to(dtype_out)
 
@@ -2389,7 +2389,7 @@ def _bwd_reference_fp8(
             is_qdo_offset=True,
         ).permute(0, 2, 1, 3)
 
-    dv = unpad_input(dv, k_offsets) / seqlen_q
+    dv = unpad_input(dv, k_offsets) / ori_n_q
 
     if quant_mode == 0:
         padded_do = padded_do.contiguous()
@@ -2460,7 +2460,7 @@ def _bwd_reference_fp8(
     if invalid_attn_mask is not None:
         dp = dp * invalid_attn_mask.type(dp.dtype)
 
-    drab = dp / seqlen_q * alpha
+    drab = dp / ori_n_q * alpha
     drab = dsilu(drab, qk_attn)
     drab = drab[:, :, :seqlen_k, :seqlen_k]
     if rab is not None and rab.shape[1] == 1:
@@ -2562,9 +2562,9 @@ def _bwd_reference_fp8(
         ).permute(0, 2, 1, 3)
 
     if is_delta_q:
-        dq = unpad_input_delta_q(dq, q_offsets, k_offsets, B, n_k) / seqlen_q * alpha
+        dq = unpad_input_delta_q(dq, q_offsets, k_offsets, B, n_k) / ori_n_q * alpha
     else:
-        dq = unpad_input(dq, q_offsets) / seqlen_q * alpha
+        dq = unpad_input(dq, q_offsets) / ori_n_q * alpha
 
     if quant_mode == 0:
         dp = dp.permute(0, 2, 1).contiguous()
@@ -2661,7 +2661,7 @@ def _bwd_reference_fp8(
             mode=quant_mode,
             is_qdo_offset=True,
         ).permute(0, 2, 1, 3)
-    dk = unpad_input(dk, k_offsets) / seqlen_q * alpha
+    dk = unpad_input(dk, k_offsets) / ori_n_q * alpha
 
     return (
         dq.view(-1, num_heads, attention_dim),
