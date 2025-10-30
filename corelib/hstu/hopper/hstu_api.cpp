@@ -39,6 +39,7 @@ void set_params_fprop(Hstu_fwd_params &params,
                       const size_t b,
                       const size_t seqlen_q,
                       const size_t seqlen_k,
+                      const size_t scaling_seqlen,
                       const size_t target_group_size,
                       const size_t seqlen_q_rounded,
                       const size_t seqlen_k_rounded,
@@ -185,6 +186,7 @@ void set_params_fprop(Hstu_fwd_params &params,
   params.seqlen_k = seqlen_k;
   params.seqlen_q_rounded = seqlen_q_rounded;
   params.seqlen_k_rounded = seqlen_k_rounded;
+  params.scaling_seqlen = scaling_seqlen;
   params.d = d;
   params.alpha = alpha;
   // 1: 1xDIM&128x1 quantization, 2: per-block quantization, 3: per-head quantization, 4: per-batch quantization, 5: per-tensor quantization.
@@ -243,6 +245,7 @@ void set_params_dgrad(Hstu_bwd_params &params,
                       const size_t b,
                       const size_t seqlen_q,
                       const size_t seqlen_k,
+                      const size_t scaling_seqlen,
                       const size_t target_group_size,
                       const size_t seqlen_q_rounded,
                       const size_t seqlen_k_rounded,
@@ -288,7 +291,7 @@ void set_params_dgrad(Hstu_bwd_params &params,
                       int window_size_right,
                       bool deterministic) {
 
-  set_params_fprop(params, b, seqlen_q, seqlen_k, target_group_size, seqlen_q_rounded,
+  set_params_fprop(params, b, seqlen_q, seqlen_k, scaling_seqlen, target_group_size, seqlen_q_rounded,
                     seqlen_k_rounded, h, h_k, h_rab, d, alpha, quant_mode, q, k, v,
                     q_descale, k_descale, v_descale, rab,
                     /*out=*/torch::Tensor(),
@@ -480,6 +483,7 @@ hstu_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_
                const at::Tensor &cu_seqlens_k,  // b+1
                const int max_seqlen_q,
                const int max_seqlen_k,
+               const int scaling_seqlen,
                std::optional<const at::Tensor> &num_contexts,  // b
                std::optional<const at::Tensor> &num_targets,  // b
                const int target_group_size,
@@ -634,7 +638,9 @@ hstu_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_
   Hstu_fwd_params params;
   set_params_fprop(params,
                     batch_size,
-                    max_seqlen_q, max_seqlen_k, target_group_size,
+                    max_seqlen_q, max_seqlen_k,
+                    scaling_seqlen,
+                    target_group_size,
                     seqlen_q_rounded, seqlen_k_rounded,
                     num_heads, num_heads_k, num_heads_rab,
                     head_size, alpha, quant_mode,
@@ -793,6 +799,7 @@ std::vector<at::Tensor> hstu_varlen_bwd(
     const at::Tensor &cu_seqlens_k,  // b+1
     const int max_seqlen_q,
     const int max_seqlen_k,
+    const int scaling_seqlen,
     std::optional<const at::Tensor> &num_contexts,  // b
     std::optional<const at::Tensor> &num_targets,  // b
     const int target_group_size,
@@ -988,7 +995,9 @@ std::vector<at::Tensor> hstu_varlen_bwd(
 
   set_params_dgrad(params,
                     batch_size,
-                    max_seqlen_q, max_seqlen_k, target_group_size,
+                    max_seqlen_q, max_seqlen_k,
+                    scaling_seqlen,
+                    target_group_size,
                     seqlen_q_rounded, seqlen_k_rounded,
                     num_heads, num_heads_k, num_heads_rab,
                     head_size, alpha, quant_mode,

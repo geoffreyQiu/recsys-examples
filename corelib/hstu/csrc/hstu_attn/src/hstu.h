@@ -105,6 +105,7 @@ struct Hstu_fwd_params : public Hstu_params {
 
   // The dimensions.
   int b, seqlen_q, seqlen_k, d, seqlen_q_rounded, seqlen_k_rounded;
+  int scaling_seqlen;
   float alpha;
 
   int target_group_size;

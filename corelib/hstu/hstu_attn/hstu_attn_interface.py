@@ -31,6 +31,7 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
+        scaling_seqlen,
         num_contexts,
         num_targets,
         target_group_size,
@@ -59,6 +60,7 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
                 cu_seqlens_k,
                 max_seqlen_q,
                 max_seqlen_k,
+                scaling_seqlen,
                 num_contexts,
                 num_targets,
                 target_group_size,
@@ -87,6 +89,7 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
         )
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
+        ctx.scaling_seqlen = scaling_seqlen
         ctx.target_group_size = target_group_size
         ctx.num_heads = num_heads
         ctx.head_dim = head_dim
@@ -113,6 +116,7 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
         num_heads, head_dim = (ctx.num_heads, ctx.head_dim)
         max_seqlen_q = ctx.max_seqlen_q
         max_seqlen_k = ctx.max_seqlen_k
+        scaling_seqlen = ctx.scaling_seqlen
         target_group_size = ctx.target_group_size
         window_size_left = ctx.window_size_left
         window_size_right = ctx.window_size_right
@@ -132,6 +136,7 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
                 cu_seqlens_k,
                 max_seqlen_q,
                 max_seqlen_k,
+                scaling_seqlen,
                 num_contexts,
                 num_targets,
                 target_group_size,
@@ -156,6 +161,7 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
             dq,
             dk,
             dv,
+            None,
             None,
             None,
             None,
@@ -197,6 +203,7 @@ def hstu_attn_varlen_func(
     last_page_lens=None,
     cu_seqlens_t=None,
     func=None,
+    scaling_seqlen=-1,
 ):
     """
     Arguments:
@@ -220,6 +227,7 @@ def hstu_attn_varlen_func(
         page_offsets: (batch_size + 1,). The cumulative sequence lengths of the page_ptr in the batch, used to index into kv_cache.
         page_ids: (page_offsets[-1],). The ids of the pages in the batch.
         last_page_lens: (batch_size,). The lengths of the last pages in the batch.
+        scaling_seqlen: int. The sequence length to scale the attention output.
     Return:
         out: (total, nheads, headdim).
     """
@@ -243,6 +251,8 @@ def hstu_attn_varlen_func(
         raise ValueError(
             "AssertError: seq_len_q >= seq_len_k, this is undefined behavior"
         )
+    if scaling_seqlen == -1:
+        scaling_seqlen = max_seqlen_q
 
     return HstuAttnVarlenFunc.apply(
         q,
@@ -252,6 +262,7 @@ def hstu_attn_varlen_func(
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
+        scaling_seqlen,
         num_contexts,
         num_targets,
         target_group_size,
@@ -277,6 +288,7 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
+        scaling_seqlen,
         num_contexts,
         num_targets,
         target_group_size,
@@ -298,6 +310,7 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
                 cu_seqlens_k,
                 max_seqlen_q,
                 max_seqlen_k,
+                scaling_seqlen,
                 num_contexts,
                 num_targets,
                 target_group_size,
@@ -328,6 +341,7 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
         )
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
+        ctx.scaling_seqlen = scaling_seqlen
         ctx.target_group_size = target_group_size
         ctx.num_heads = num_heads
         ctx.head_dim = head_dim
@@ -354,6 +368,7 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
         num_heads, head_dim = (ctx.num_heads, ctx.head_dim)
         max_seqlen_q = ctx.max_seqlen_q
         max_seqlen_k = ctx.max_seqlen_k
+        scaling_seqlen = ctx.scaling_seqlen
         target_group_size = ctx.target_group_size
         window_size_left = ctx.window_size_left
         window_size_right = ctx.window_size_right
@@ -375,6 +390,7 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
                 cu_seqlens_k,
                 max_seqlen_q,
                 max_seqlen_k,
+                scaling_seqlen,
                 num_contexts,
                 num_targets,
                 target_group_size,
@@ -406,6 +422,7 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
             None,
             None,
             None,
+            None,
             dRab if ctx.has_drab else None,
             None,
             None,
@@ -426,6 +443,7 @@ def hstu_attn_qkvpacked_func(
     rab=None,
     has_drab=False,
     func=None,
+    scaling_seqlen=-1,
 ):
     """
     Arguments:
@@ -443,6 +461,7 @@ def hstu_attn_qkvpacked_func(
         alpha: float. Scaling factor between add rab and silu.
         rab: (batch_size, max_seqlen_k, max_seqlen_k). Random access bias for the key.
         has_drab: bool. Whether to apply random access bias for the key.
+        scaling_seqlen: int. The sequence length to scale the attention output.
     Return:
         out: (total, nheads, headdim).
     """
@@ -466,6 +485,8 @@ def hstu_attn_qkvpacked_func(
         raise ValueError(
             "AssertError: seq_len_q >= seq_len_k, this is undefined behavior"
         )
+    if scaling_seqlen == -1:
+        scaling_seqlen = max_seqlen_q
 
     return HstuAttnQKVPackedFunc.apply(
         qkv,
@@ -473,6 +494,7 @@ def hstu_attn_qkvpacked_func(
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
+        scaling_seqlen,
         num_contexts,
         num_targets,
         target_group_size,

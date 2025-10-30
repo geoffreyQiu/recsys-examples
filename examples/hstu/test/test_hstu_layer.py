@@ -50,6 +50,7 @@ from test_utils import init_fused_weights_from_debug
 @pytest.mark.parametrize("residual", [False, True])
 @pytest.mark.parametrize("input_sparsity", [0.75])
 @pytest.mark.parametrize("async_wgrad", [True, False])
+@pytest.mark.parametrize("scaling_seqlen", [-1, 128, 512])
 def test_fused_hstu_layer(
     dtype: torch.dtype,
     batchsize: int,
@@ -66,6 +67,7 @@ def test_fused_hstu_layer(
     residual: bool,
     input_sparsity: float,
     async_wgrad: bool,
+    scaling_seqlen: int,
 ):
     init.initialize_distributed()
     init.set_random_seed(1234)
@@ -121,6 +123,8 @@ def test_fused_hstu_layer(
     lengths = torch.randint(
         low=1, high=max_seqlen + 1, size=(batchsize,), device=device, dtype=torch.int
     )
+    if scaling_seqlen == -1:
+        scaling_seqlen = max_seqlen
 
     seq_offsets = length_to_complete_offsets(lengths)
 
@@ -187,6 +191,7 @@ def test_fused_hstu_layer(
         "contextual_seqlen_offsets": length_to_complete_offsets(num_contextuals)
         if num_contextuals is not None
         else None,
+        "scaling_seqlen": scaling_seqlen,
     }
     jd = JaggedData(values=input, **ctor_nograd_dict)
     ref_jd = JaggedData(values=ref_input, **ctor_nograd_dict)

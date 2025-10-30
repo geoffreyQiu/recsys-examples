@@ -158,6 +158,8 @@ class NetworkArgs:
     item_embedding_dim: int = -1
     contextual_embedding_dim: int = -1
 
+    scaling_seqlen: int = -1
+
     def __post_init__(self):
         assert self.dtype_str in [
             "bfloat16",

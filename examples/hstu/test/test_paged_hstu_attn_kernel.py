@@ -86,6 +86,7 @@ def _hstu_attention_maybe_from_cache(
     linear_dim: int,
     seqlen_q: int,
     seqlen_k: int,
+    scaling_seqlen: int,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -136,7 +137,7 @@ def _hstu_attention_maybe_from_cache(
         masked_qk_attn = qk_attn
     masked_qk_attn = masked_qk_attn * alpha
     masked_qk_attn = F.silu(masked_qk_attn)
-    masked_qk_attn = masked_qk_attn / seqlen_q
+    masked_qk_attn = masked_qk_attn / scaling_seqlen
     if invalid_attn_mask is not None:
         if invalid_attn_mask.ndim == 2:
             invalid_attn_mask = invalid_attn_mask.unsqueeze(0).unsqueeze(0)
@@ -172,6 +173,7 @@ def _hstu_paged_kv_attention(
     linear_dim: int,
     seqlen_q: int,
     seqlen_k: int,
+    scaling_seqlen: int,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -230,6 +232,7 @@ def _hstu_paged_kv_attention(
         linear_dim=linear_dim,
         seqlen_q=seqlen_q,
         seqlen_k=seqlen_k,
+        scaling_seqlen=scaling_seqlen,
         q=q,
         k=k_con,
         v=v_con,
@@ -351,6 +354,7 @@ def setup_kvcache_testcase(
 )
 @pytest.mark.parametrize("num_heads", [4])
 @pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("scaling_seqlen", [-1, 1000, 2048])
 def test_paged_hstu_attn_kernel(
     batchsize,
     dtype,
@@ -359,9 +363,12 @@ def test_paged_hstu_attn_kernel(
     num_heads,
     head_dim,
     max_contextual_seqlen,
+    scaling_seqlen,
 ):
     device = torch.cuda.current_device()
     global_max_seqlen = 4096
+    if scaling_seqlen == -1:
+        scaling_seqlen = global_max_seqlen
 
     kvcache_page_size = 32
 
@@ -434,6 +441,7 @@ def test_paged_hstu_attn_kernel(
                 kv_raw_metadata[2], dtype=torch.int32, device=device
             ),
             cu_seqlens_t=num_candidates_offsets.cuda(),
+            scaling_seqlen=scaling_seqlen,
         )
         torch.cuda.synchronize()
 
@@ -472,6 +480,7 @@ def test_paged_hstu_attn_kernel(
             linear_dim=head_dim,
             seqlen_q=global_max_seqlen,
             seqlen_k=global_max_seqlen,
+            scaling_seqlen=scaling_seqlen,
             q=query,
             k=key,
             v=value,
@@ -499,6 +508,7 @@ def test_paged_hstu_attn_kernel(
             linear_dim=head_dim,
             seqlen_q=global_max_seqlen,
             seqlen_k=global_max_seqlen,
+            scaling_seqlen=scaling_seqlen,
             q=query,
             k=key,
             v=value,

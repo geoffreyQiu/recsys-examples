@@ -309,6 +309,7 @@ class HSTULayer(MegatronModule):
                 num_contextuals=jd.contextual_seqlen,
                 num_candidates=jd.num_candidates,
                 max_seqlen=jd.max_seqlen,
+                scaling_seqlen=jd.scaling_seqlen,
                 target_group_size=self._target_group_size,
             )
             if self._debug_check_tp_equal:
@@ -438,4 +439,5 @@ class HSTULayer(MegatronModule):
             contextual_seqlen=jd.contextual_seqlen,
             contextual_seqlen_offsets=jd.contextual_seqlen_offsets,
             has_interleaved_action=jd.has_interleaved_action,
+            scaling_seqlen=jd.scaling_seqlen,
         )

@@ -286,7 +286,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
             value,
             kv_cache_metadata.batch_indices,
             kv_cache_metadata.position,
-            jd.num_candidates_offsets,
+            jd.num_candidates_offsets[: batch_size + 1],
             kv_cache_metadata.new_history_nnz_cuda,
             num_tokens,  # kv_cache_metadata.new_history_nnz
             paged_k_cache,
@@ -304,12 +304,14 @@ class PagedHSTUInferLayer(torch.nn.Module):
             query,
             key,
             value,
-            jd.seqlen_offsets,
+            jd.seqlen_offsets[: batch_size + 1],
             kv_cache_metadata.total_history_offsets[: batch_size + 1],
             self._max_seqlen,
             self._max_seqlen,
-            num_contexts=jd.contextual_seqlen,
-            num_targets=jd.num_candidates,
+            num_contexts=jd.contextual_seqlen
+            if jd.contextual_seqlen is None
+            else jd.contextual_seqlen[:batch_size],
+            num_targets=jd.num_candidates[:batch_size],
             target_group_size=1,
             window_size=(-1, 0),
             alpha=self._alpha,
@@ -319,7 +321,8 @@ class PagedHSTUInferLayer(torch.nn.Module):
             page_offsets=kv_cache_metadata.kv_indptr,
             page_ids=kv_cache_metadata.kv_indices,
             last_page_lens=kv_cache_metadata.kv_last_page_len,
-            cu_seqlens_t=jd.num_candidates_offsets,
+            cu_seqlens_t=jd.num_candidates_offsets[: batch_size + 1],
+            scaling_seqlen=jd.scaling_seqlen,
         )
 
         jagged_attn_output = jagged_attn_output.view(
@@ -427,6 +430,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
             page_ids=kv_cache_metadata.kv_indices,
             last_page_lens=kv_cache_metadata.kv_last_page_len,
             cu_seqlens_t=jd.num_candidates_offsets[: batch_size + 1],
+            scaling_seqlen=self._max_seqlen,
         )
 
         jagged_attn_output = jagged_attn_output.view(

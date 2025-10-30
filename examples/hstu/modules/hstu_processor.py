@@ -36,6 +36,7 @@ def hstu_preprocess_embeddings(
     item_mlp: Optional[MLP] = None,
     contextual_mlp: Optional[MLP] = None,
     dtype: Optional[torch.dtype] = None,
+    scaling_seqlen: int = -1,
 ) -> JaggedData:
     """
     Preprocesses the embeddings for use in the HSTU architecture.
@@ -191,6 +192,7 @@ def hstu_preprocess_embeddings(
         if contextual_seqlen_offsets is not None
         else None,
         has_interleaved_action=batch.action_feature_name is not None,
+        scaling_seqlen=scaling_seqlen,
     )
 
 
@@ -251,6 +253,7 @@ class HSTUBlockPreprocessor(torch.nn.Module):
                 config, HSTUConfig
             ), "Training config should be HSTUConfig"
             self._dropout_ratio = config.hidden_dropout
+        self._scaling_seqlen = config.scaling_seqlen
 
     @output_nvtx_hook(nvtx_tag="HSTUBlock preprocess", hook_key_or_attr_name="values")
     def forward(
@@ -284,6 +287,7 @@ class HSTUBlockPreprocessor(torch.nn.Module):
             item_mlp=self._item_mlp,
             contextual_mlp=self._contextual_mlp,
             dtype=self._training_dtype,
+            scaling_seqlen=self._scaling_seqlen,
         )
 
         if self._positional_encoder is not None:
@@ -375,4 +379,5 @@ class HSTUBlockPostprocessor(torch.nn.Module):
             seqlen_offsets=seqlen_offsets.to(jd.seqlen_offsets.dtype),
             max_seqlen=max_seqlen,
             has_interleaved_action=False,
+            scaling_seqlen=jd.scaling_seqlen,
         )

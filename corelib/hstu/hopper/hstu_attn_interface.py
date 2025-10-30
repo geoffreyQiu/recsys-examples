@@ -299,6 +299,7 @@ def _hstu_attn_varlen_forward(
     cu_seqlens_k,
     max_seqlen_q,
     max_seqlen_k,
+    scaling_seqlen,
     num_contexts,
     num_targets,
     target_group_size,
@@ -326,6 +327,7 @@ def _hstu_attn_varlen_forward(
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
+        scaling_seqlen,
         num_contexts,
         num_targets,
         target_group_size,
@@ -362,6 +364,7 @@ def _hstu_attn_varlen_backward(
     cu_seqlens_k,
     max_seqlen_q,
     max_seqlen_k,
+    scaling_seqlen,
     num_contexts,
     num_targets,
     target_group_size,
@@ -406,6 +409,7 @@ def _hstu_attn_varlen_backward(
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
+        scaling_seqlen,
         num_contexts,
         num_targets,
         target_group_size,
@@ -443,6 +447,7 @@ class HSTUAttnVarlenFunc(torch.autograd.Function):
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
+        scaling_seqlen,
         num_contexts,
         num_targets,
         target_group_size=1,
@@ -520,6 +525,7 @@ class HSTUAttnVarlenFunc(torch.autograd.Function):
                 cu_seqlens_k,
                 max_seqlen_q,
                 max_seqlen_k,
+                scaling_seqlen,
                 num_contexts,
                 num_targets,
                 target_group_size,
@@ -542,6 +548,7 @@ class HSTUAttnVarlenFunc(torch.autograd.Function):
         )
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
+        ctx.scaling_seqlen = scaling_seqlen
         ctx.target_group_size = target_group_size
         ctx.window_size = window_size
         ctx.has_drab = has_drab
@@ -668,6 +675,7 @@ class HSTUAttnVarlenFunc(torch.autograd.Function):
                 cu_seqlens_k,
                 ctx.max_seqlen_q,
                 ctx.max_seqlen_k,
+                ctx.scaling_seqlen,
                 num_contexts,
                 num_targets,
                 ctx.target_group_size,
@@ -707,6 +715,7 @@ class HSTUAttnVarlenFunc(torch.autograd.Function):
             None,
             None,
             None,
+            None,
             drab,
             None,
             None,
@@ -731,6 +740,7 @@ def hstu_attn_varlen_func(
     has_drab=False,
     func=None,
     quant_mode=-1,
+    scaling_seqlen=-1,
 ):
     """
     Arguments:
@@ -752,6 +762,7 @@ def hstu_attn_varlen_func(
         has_drab: bool. Whether to apply random access bias for the key.
         func: (nheads, total_q + 256). Function for describe the mask shape.
         quant_mode: int. -1: no quantization, 0: cast to fp8, 1: 1xDIM&128x1 quantization, 2: per-block quantization, 3: per-head quantization, 4: per-batch quantization, 5: per-tensor quantization
+        scaling_seqlen: int. The sequence length to scale the attention output.
     Return:
         out: (total_q, nheads, headdim).
     """
@@ -775,6 +786,8 @@ def hstu_attn_varlen_func(
         raise ValueError(
             "AssertError: seq_len_q >= seq_len_k, this is undefined behavior"
         )
+    if scaling_seqlen == -1:
+        scaling_seqlen = max_seqlen_q
 
     return HSTUAttnVarlenFunc.apply(
         q,
@@ -784,6 +797,7 @@ def hstu_attn_varlen_func(
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
+        scaling_seqlen,
         num_contexts,
         num_targets,
         target_group_size,
@@ -805,6 +819,7 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
+        scaling_seqlen,
         num_contexts,
         num_targets,
         target_group_size=1,
@@ -827,6 +842,7 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
                 cu_seqlens_k,
                 max_seqlen_q,
                 max_seqlen_k,
+                scaling_seqlen,
                 num_contexts,
                 num_targets,
                 target_group_size,
@@ -841,6 +857,7 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
         )
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
+        ctx.scaling_seqlen = scaling_seqlen
         ctx.target_group_size = target_group_size
         ctx.window_size = window_size
         ctx.has_drab = has_drab
@@ -879,6 +896,7 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
                 cu_seqlens_k,
                 ctx.max_seqlen_q,
                 ctx.max_seqlen_k,
+                ctx.scaling_seqlen,
                 num_contexts,
                 num_targets,
                 ctx.target_group_size,
@@ -892,6 +910,7 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
         drab = drab[..., : ctx.max_seqlen_k] if ctx.has_drab else None
         return (
             dqkv,
+            None,
             None,
             None,
             None,
@@ -926,6 +945,7 @@ def hstu_attn_qkvpacked_func(
     has_drab=False,
     func=None,
     quant_mode=-1,
+    scaling_seqlen=-1,
 ):
     """
     Arguments:
@@ -945,6 +965,7 @@ def hstu_attn_qkvpacked_func(
         has_drab: bool. Whether to apply random access bias for the key.
         func: (nheads, total_q + 256). Function for describe the mask shape.
         quant_mode: int. -1: no quantization, 0: cast to fp8, 1: 1xDIM&128x1 quantization, 2: per-block quantization, 3: per-head quantization, 4: per-batch quantization, 5: per-tensor quantization
+        scaling_seqlen: int. The sequence length to scale the attention output.
     Return:
         out: (total, nheads, headdim).
     """
@@ -968,6 +989,8 @@ def hstu_attn_qkvpacked_func(
         raise ValueError(
             "AssertError: seq_len_q >= seq_len_k, this is undefined behavior"
         )
+    if scaling_seqlen == -1:
+        scaling_seqlen = max_seqlen_q
 
     return HstuAttnQKVPackedFunc.apply(
         qkv,
@@ -975,6 +998,7 @@ def hstu_attn_qkvpacked_func(
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
+        scaling_seqlen,
         num_contexts,
         num_targets,
         target_group_size,

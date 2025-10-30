@@ -176,11 +176,14 @@ def generate_or_copy_parameters(
     ],
 )
 @pytest.mark.parametrize(
-    "max_seqlen,max_num_candidates,max_num_contextuals",
+    "max_seqlen,max_num_candidates,max_num_contextuals,scaling_seqlen",
     [
-        (1024, 128, 6),
-        (32, 0, 0),
-        (1024, 128, 0),
+        (1024, 128, 6, -1),
+        (1024, 128, 6, 2048),
+        (32, 0, 0, -1),
+        (32, 0, 0, 1024),
+        (1024, 128, 0, -1),
+        (1024, 128, 0, 512),
     ],
 )
 @pytest.mark.parametrize("target_group_size", [2, 16, 256, 1])
@@ -199,6 +202,7 @@ def test_hstu_attn(
     is_causal,
     dtype,
     max_seqlen,
+    scaling_seqlen,
     max_num_candidates,
     max_num_contextuals,
     target_group_size,
@@ -303,6 +307,8 @@ def test_hstu_attn(
 
         return q, k, v
 
+    if scaling_seqlen == -1:
+        scaling_seqlen = max_seqlen
     for _ in range(100):
         lengths = torch.randint(
             1, max_seqlen + 1, (batchsize,), device=device, dtype=torch.int
@@ -347,6 +353,7 @@ def test_hstu_attn(
             num_candidates=num_candidates,
             num_contextuals=num_contextuals,
             max_seqlen=max_seqlen,
+            scaling_seqlen=scaling_seqlen,
             target_group_size=target_group_size,
         )
         ref_out_fp32 = ref_hstu_attn(
@@ -357,6 +364,7 @@ def test_hstu_attn(
             num_candidates=num_candidates,
             num_contextuals=num_contextuals,
             max_seqlen=max_seqlen,
+            scaling_seqlen=scaling_seqlen,
             target_group_size=target_group_size,
         )
         dout = torch.randn_like(ref_out) * 0.01
@@ -378,6 +386,7 @@ def test_hstu_attn(
             num_candidates=num_candidates,
             num_contextuals=num_contextuals,
             max_seqlen=max_seqlen,
+            scaling_seqlen=scaling_seqlen,
             target_group_size=target_group_size,
         )
         out.backward(dout)
@@ -415,6 +424,7 @@ def test_hstu_attn(
 @pytest.mark.parametrize("recompute_input_layernorm", [True, False])
 @pytest.mark.parametrize("recompute_input_silu", [True, False])
 @pytest.mark.parametrize("only_targets", [True, False])
+@pytest.mark.parametrize("scaling_seqlen", [-1, 200, 512])
 def test_fused_hstu_op(
     dtype: torch.dtype,
     batchsize: int,
@@ -436,6 +446,7 @@ def test_fused_hstu_op(
     recompute_input_layernorm: bool,
     recompute_input_silu: bool,
     only_targets: bool,
+    scaling_seqlen: int,
 ):
     init.initialize_distributed()
     init.set_random_seed(1234)
@@ -484,6 +495,8 @@ def test_fused_hstu_op(
     lengths = torch.randint(
         low=1, high=max_seqlen + 1, size=(batchsize,), device=device, dtype=torch.int
     )
+    if scaling_seqlen == -1:
+        scaling_seqlen = max_seqlen
 
     seq_offsets = length_to_complete_offsets(lengths)
 
@@ -571,6 +584,7 @@ def test_fused_hstu_op(
         "contextual_seqlen_offsets": length_to_complete_offsets(num_contextuals)
         if num_contextuals is not None
         else None,
+        "scaling_seqlen": scaling_seqlen,
     }
     jd = JaggedData(values=ref_input, **ctor_nograd_dict)
     fp32_ref_jd = JaggedData(values=fp32_ref_input, **ctor_nograd_dict)
@@ -582,6 +596,7 @@ def test_fused_hstu_op(
         input=input,
         seqlen_offsets=seq_offsets,
         max_seqlen=max_seqlen,
+        scaling_seqlen=scaling_seqlen,
         linear_uvqk_weight=linear_uvqk_weight,
         linear_uvqk_bias=linear_uvqk_bias,
         linear_proj_weight=linear_proj_weight,

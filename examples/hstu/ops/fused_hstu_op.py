@@ -65,6 +65,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
         input: torch.Tensor,  # [T, hidden_size]
         seqlen_offsets: torch.Tensor,  # [batchsize]
         max_seqlen: int,  # N
+        scaling_seqlen: int,
         linear_uvqk_weight: torch.Tensor,
         linear_uvqk_bias: torch.Tensor,
         linear_proj_weight: torch.Tensor,
@@ -137,6 +138,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
         ctx.linear_dim_per_head = linear_dim_per_head
         ctx.attention_dim_per_head = attention_dim_per_head
         ctx.causal = causal
+        ctx.scaling_seqlen = scaling_seqlen
         ctx.alpha = alpha
         ctx.training = training
         ctx.residual = residual
@@ -228,6 +230,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
 
         def _hstu_attn_triton_fwd(
             N: int,
+            scaling_seqlen: int,
             alpha: float,
             q: torch.Tensor,
             k: torch.Tensor,
@@ -254,6 +257,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
 
             jagged_attn_output = triton_hstu_attention_fwd(
                 N=N,
+                scaling_seqlen=scaling_seqlen,
                 alpha=alpha,
                 q=q,
                 k=k,
@@ -273,6 +277,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             v,
             seq_offsets_q,
             max_seqlen_q,
+            scaling_seqlen,
             num_contexts,
             num_targets,
             target_group_size,
@@ -309,6 +314,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 seq_offsets_q,
                 max_seqlen_q,
                 max_seqlen_q,
+                scaling_seqlen,
                 num_contexts,
                 num_targets,
                 target_group_size,
@@ -440,6 +446,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     v=tv,
                     seq_offsets_q=seqlen_offsets,
                     max_seqlen_q=max_seqlen,
+                    scaling_seqlen=scaling_seqlen,
                     num_contexts=num_contextuals,
                     num_targets=num_targets,
                     target_group_size=target_group_size,
@@ -454,6 +461,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 ), "target_group_size must be 1 when kernel backend is triton"
                 attn_output = _hstu_attn_triton_fwd(
                     N=max_seqlen,
+                    scaling_seqlen=scaling_seqlen,
                     alpha=ctx.alpha,
                     q=tq,
                     k=tk,
@@ -503,6 +511,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
         grad_output,
     ) -> Tuple[
         torch.Tensor,
+        None,
         None,
         None,
         torch.Tensor,
@@ -594,6 +603,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             v: torch.Tensor,
             seq_offsets_q: torch.Tensor,
             max_seqlen_q: int,
+            scaling_seqlen: int,
             num_contexts: Optional[torch.Tensor],  # b
             num_targets: Optional[torch.Tensor],  # b
             target_group_size: int,
@@ -619,6 +629,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     seq_offsets_q,
                     max_seqlen_q,
                     max_seqlen_q,
+                    scaling_seqlen,
                     num_contexts,
                     num_targets,
                     target_group_size,
@@ -647,6 +658,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     seq_offsets_q,
                     max_seqlen_q,
                     max_seqlen_q,
+                    scaling_seqlen,
                     num_contexts,
                     num_targets,
                     target_group_size,
@@ -673,6 +685,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             seq_offsets: torch.Tensor,
             num_targets: Optional[torch.Tensor],
             N: int,
+            scaling_seqlen: int,
             alpha: float,
             causal: float,
             contextual_seq_len: int,
@@ -692,6 +705,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 seq_offsets=seq_offsets,
                 num_targets=num_targets,
                 N=N,
+                scaling_seqlen=scaling_seqlen,
                 alpha=alpha,
                 max_attn_len=0,
                 causal=causal,
@@ -829,6 +843,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     v=saved_tensor_map["v"],
                     seq_offsets_q=saved_tensor_map["seq_offsets_q"],
                     max_seqlen_q=ctx.max_seqlen_q,
+                    scaling_seqlen=ctx.scaling_seqlen,
                     num_contexts=saved_tensor_map["num_contexts"],
                     num_targets=saved_tensor_map["num_targets"],
                     target_group_size=ctx.target_group_size,
@@ -851,6 +866,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     seq_offsets=saved_tensor_map["seq_offsets"],
                     num_targets=saved_tensor_map["num_targets"],
                     N=ctx.N,  # => max_seqlen_q
+                    scaling_seqlen=ctx.scaling_seqlen,
                     alpha=ctx.alpha,
                     causal=ctx.causal,
                     contextual_seq_len=ctx.contextual_seq_len,  # saved_tensor_map["num_contexts"] == None,
@@ -909,6 +925,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             grad_input,
             None,
             None,
+            None,
             grad_linear_uqkv_weight,
             grad_linear_uqkv_bias,
             grad_linear_proj_weight,
@@ -941,6 +958,7 @@ def fused_hstu_op(
     input: torch.Tensor,  # [T, hidden_size]
     seqlen_offsets: torch.Tensor,  # [batchsize]
     max_seqlen: int,  # N
+    scaling_seqlen: int,
     linear_uvqk_weight: torch.Tensor,
     linear_uvqk_bias: torch.Tensor,
     linear_proj_weight: torch.Tensor,
@@ -975,6 +993,7 @@ def fused_hstu_op(
         input,
         seqlen_offsets,
         max_seqlen,
+        scaling_seqlen,
         linear_uvqk_weight,
         linear_uvqk_bias,
         linear_proj_weight,

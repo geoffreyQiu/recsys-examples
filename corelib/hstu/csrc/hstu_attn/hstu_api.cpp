@@ -42,6 +42,7 @@ void set_params_fprop(Hstu_fwd_params* params,
                       const size_t b,
                       const size_t seqlen_q,
                       const size_t seqlen_k,
+                      const size_t scaling_seqlen,
                       const size_t target_group_size,
                       const size_t seqlen_q_rounded,
                       const size_t seqlen_k_rounded,
@@ -133,6 +134,7 @@ void set_params_fprop(Hstu_fwd_params* params,
   params->seqlen_k = seqlen_k;
   params->seqlen_q_rounded = seqlen_q_rounded;
   params->seqlen_k_rounded = seqlen_k_rounded;
+  params->scaling_seqlen = scaling_seqlen;
   params->d = d;
   params->alpha = alpha;
   // Set the masks.
@@ -203,6 +205,7 @@ void set_params_dgrad(Hstu_bwd_params* params,
                       const size_t b,
                       const size_t seqlen_q,
                       const size_t seqlen_k,
+                      const size_t scaling_seqlen,
                       const size_t target_group_size,
                       const size_t seqlen_q_rounded,
                       const size_t seqlen_k_rounded,
@@ -233,7 +236,7 @@ void set_params_dgrad(Hstu_bwd_params* params,
                       bool has_rab,
                       bool has_drab) {
   *params = {};
-  set_params_fprop(params, b, seqlen_q, seqlen_k, target_group_size, seqlen_q_rounded,
+  set_params_fprop(params, b, seqlen_q, seqlen_k, scaling_seqlen, target_group_size, seqlen_q_rounded,
                    seqlen_k_rounded, h, h_k, h_rab, d, alpha, q, k, v, rab, at::Tensor(),
                    /*out=*/torch::Tensor(),
                    num_contexts_d, cu_seqlens_q_d, cu_seqlens_k_d,
@@ -337,6 +340,7 @@ std::vector<at::Tensor> hstu_varlen_fwd(
     const at::Tensor& cu_seqlens_k,  // b+1
     const int max_seqlen_q,
     const int max_seqlen_k,
+    const int scaling_seqlen,
     std::optional<const at::Tensor>& num_contexts,  // b
     std::optional<const at::Tensor>& num_targets,  // b
     const int target_group_size,
@@ -431,6 +435,7 @@ std::vector<at::Tensor> hstu_varlen_fwd(
                    batch_size,               //
                    max_seqlen_q,             //
                    max_seqlen_k,             //
+                   scaling_seqlen,           //
                    target_group_size,        //
                    seqlen_q_rounded,         //
                    seqlen_k_rounded,         //
@@ -527,6 +532,7 @@ std::vector<at::Tensor> hstu_varlen_bwd(
     const at::Tensor& cu_seqlens_k,  // b+1
     const int max_seqlen_q,
     const int max_seqlen_k,
+    const int scaling_seqlen,
     std::optional<const at::Tensor>& num_contexts,  // b
     std::optional<const at::Tensor>& num_targets,  // b
     const int target_group_size,
@@ -663,6 +669,7 @@ std::vector<at::Tensor> hstu_varlen_bwd(
                    batch_size,               //
                    max_seqlen_q,             //
                    max_seqlen_k,             //
+                   scaling_seqlen,           //
                    target_group_size,        //
                    seqlen_q_rounded,         //
                    seqlen_k_rounded,         //

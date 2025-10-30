@@ -180,6 +180,7 @@ def get_inference_hstu_model(
         dtype=inference_dtype,
         position_encoding_config=position_encoding_config,
         contextual_max_seqlen=num_contextual_features,
+        scaling_seqlen=network_args.scaling_seqlen,
     )
 
     kvcache_args = {
@@ -348,7 +349,8 @@ def run_ranking_gr_simulate(
 
 
 def run_ranking_gr_evaluate(
-    checkpoint_dir: str, disable_contextual_features: bool = False
+    checkpoint_dir: str,
+    disable_contextual_features: bool = False,
 ):
     dataset_args, emb_configs = get_inference_dataset_and_embedding_configs(
         disable_contextual_features
@@ -469,7 +471,9 @@ if __name__ == "__main__":
             print("disable_auc is ignored in Eval mode.")
         if args.disable_context:
             print("disable_context is ignored in Eval mode.")
-        run_ranking_gr_evaluate(checkpoint_dir=args.checkpoint_dir)
+        run_ranking_gr_evaluate(
+            checkpoint_dir=args.checkpoint_dir,
+        )
     elif args.mode == RunningMode.SIMULATE:
         run_ranking_gr_simulate(
             checkpoint_dir=args.checkpoint_dir,

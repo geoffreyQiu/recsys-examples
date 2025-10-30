@@ -661,7 +661,7 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
 
   // scale acc_o
   for (int i = 0; i < size(acc_o); ++i) {
-    acc_o(i) /= params.seqlen_q;
+    acc_o(i) /= params.scaling_seqlen;
   }
 
   // Epilogue

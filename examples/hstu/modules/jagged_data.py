@@ -36,6 +36,7 @@ class JaggedData:
         contextual_seqlen (Optional[torch.Tensor]): The sequence lengths tensor for contextual features. Defaults to None.
         contextual_seqlen_offsets (Optional[torch.Tensor]): The sequence length offsets tensor for contextual features. Defaults to None.
         has_interleaved_action (bool): Whether action embeddings are interleaved with item embeddings. Defaults to False.
+        scaling_seqlen (int): The sequence length to scale attention output. Defaults to -1 (max_seqlen will be used).
 
     """
 
@@ -53,6 +54,7 @@ class JaggedData:
     contextual_seqlen_offsets: Optional[torch.Tensor] = None
 
     has_interleaved_action: bool = False
+    scaling_seqlen: int = -1
 
     def __post_init__(self):
         if self.max_num_candidates == 0:
@@ -70,6 +72,7 @@ class JaggedData:
         num_candidates: Optional[torch.Tensor] = None,
         contextual_seqlen: Optional[torch.Tensor] = None,
         has_interleaved_action: bool = False,
+        scaling_seqlen: int = -1,
         device,
         dtype,
     ) -> "JaggedData":
@@ -82,6 +85,7 @@ class JaggedData:
             num_candidates (Optional[torch.Tensor], optional): Tensor containing the number of candidates for each sequence. Defaults to None.
             contextual_seqlen (Optional[torch.Tensor], optional): The sequence lengths tensor for contextual features. Defaults to None.
             has_interleaved_action (bool, optional): Whether action embeddings are interleaved with item embeddings. Defaults to False.
+            scaling_seqlen (int, optional): The sequence length to scale attention output. Defaults to -1 (max_seqlen will be used).
             device: The device on which to generate the random data.
             dtype (torch.dtype): The data type of the values tensor.
 
@@ -128,6 +132,7 @@ class JaggedData:
             contextual_seqlen=contextual_seqlen,
             contextual_seqlen_offsets=contextual_seqlen_offsets,
             has_interleaved_action=has_interleaved_action,
+            scaling_seqlen=scaling_seqlen,
         )
 
     def __eq__(self, other):
@@ -153,6 +158,7 @@ class JaggedData:
             self.contextual_seqlen_offsets == other.contextual_seqlen_offsets
         )
         assert self.has_interleaved_action == other.has_interleaved_action
+        assert self.scaling_seqlen == other.scaling_seqlen
 
     def __repr__(self):
         """
@@ -173,6 +179,7 @@ class JaggedData:
             "contextual_seqlen": self.contextual_seqlen,
             "contextual_seqlen_offsets": self.contextual_seqlen_offsets,
             "has_interleaved_action": self.has_interleaved_action,
+            "scaling_seqlen": self.scaling_seqlen,
         }
         str_rep = pprint.pformat(viz_dict)
         return f"JaggedData {str_rep}"
@@ -233,4 +240,5 @@ class JaggedData:
             if self.contextual_seqlen_offsets is not None
             else self.contextual_seqlen_offsets,
             has_interleaved_action=self.has_interleaved_action,
+            scaling_seqlen=self.scaling_seqlen,
         )
