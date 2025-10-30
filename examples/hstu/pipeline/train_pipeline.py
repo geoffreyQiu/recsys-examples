@@ -325,7 +325,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         with record_function("## backward ##"):
             torch.sum(losses, dim=0).backward()
 
-    def progress(self, dataloader_iter: Iterator[In]) -> Out:
+    def progress(self, dataloader_iter: Iterator[In], scaling_seqlen: int) -> Out:
         """
         For TrainPipelineSparseDist, we assume the max pipelined batches == 3 (capacity):
             batches[0]: current batch, for emb_lookup, output_dist, and fwd/bwd/opt (expecting input_dist)
@@ -365,7 +365,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
 
         # forward
         with record_function("## forward ##"):
-            losses, output = self._model_fwd(self.batches[0])
+            losses, output = self._model_fwd(self.batches[0], scaling_seqlen)
 
         if len(self.batches) >= 2:
             # invoke data (values, lengths, etc.) all_to_all comms (second part of input_dist)
@@ -660,7 +660,7 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         self._batch_ip1 = self._copy_batch_to_gpu(dataloader_iter)
         self._start_sparse_data_dist(self._batch_ip1)
 
-    def progress(self, dataloader_iter: Iterator[In]) -> Out:
+    def progress(self, dataloader_iter: Iterator[In], scaling_seqlen: int) -> Out:
         self._fill_pipeline(dataloader_iter)
 
         if self._model.training:
@@ -752,7 +752,7 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             custom_model_fwd,
         )
 
-    def progress(self, dataloader_iter: Iterator[In]) -> Out:
+    def progress(self, dataloader_iter: Iterator[In], scaling_seqlen: int) -> Out:
         """
         For TrainPipelineSparseDist, we assume the max pipelined batches == 3 (capacity):
             batches[0]: current batch, for emb_lookup, output_dist, and fwd/bwd/opt (expecting input_dist)
@@ -797,7 +797,7 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
 
         # forward
         with nvtx.annotate("## forward ##"):
-            losses, output = self._model_fwd(self.batches[0])
+            losses, output = self._model_fwd(self.batches[0], scaling_seqlen)
         with nvtx.annotate("## loss postprocess ##"):
             collective_assert(not torch.isnan(losses).any(), "loss has nan value")
             local_tokens = torch.tensor(losses.size(0), device=self._device).float()
@@ -854,7 +854,7 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
             custom_model_fwd,
         )
 
-    def progress(self, dataloader_iter: Iterator[In]) -> Tuple[torch.Tensor, Out]:
+    def progress(self, dataloader_iter: Iterator[In], scaling_seqlen: int) -> Tuple[torch.Tensor, Out]:
         self._fill_pipeline(dataloader_iter)
 
         if self._model.training:
@@ -873,7 +873,7 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
         # forward
         reporting_loss = None
         with nvtx.annotate("## forward ##"):
-            losses, output = self._model_fwd(self._batch_i)
+            losses, output = self._model_fwd(self._batch_i, scaling_seqlen)
         with nvtx.annotate("## loss postprocess ##"):
             collective_assert(not torch.isnan(losses).any(), "loss has nan value")
             local_tokens = torch.tensor(losses.size(0), device=self._device).float()

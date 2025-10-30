@@ -224,6 +224,7 @@ struct CollectiveMainloopFwd {
     const int window_size_left;
     const int window_size_right;
     const int target_group_size;
+    const int scaling_seqlen;
     const float alpha;
     int const* cu_seqlens_vt_descale;
     int const* cu_seqlens_q_block_descale;
@@ -260,6 +261,7 @@ struct CollectiveMainloopFwd {
     const int window_size_left;
     const int window_size_right;
     const int target_group_size;
+    const int scaling_seqlen;
     const float alpha;
     int const* cu_seqlens_vt_descale;
     int const* cu_seqlens_q_block_descale;
@@ -305,7 +307,7 @@ struct CollectiveMainloopFwd {
             args.num_batch,
             args.descale_q_ptr, args.descale_k_ptr, args.descale_v_ptr, args.descale_vt_ptr,
             args.descale_q_head_stride, args.descale_k_head_stride, args.descale_v_head_stride, args.descale_vt_head_stride, args.descale_vt_row_stride,
-            args.func_ptr, args.func_ids_stride, args.window_size_left, args.window_size_right, args.target_group_size, args.alpha,
+            args.func_ptr, args.func_ids_stride, args.window_size_left, args.window_size_right, args.target_group_size, args.scaling_seqlen, args.alpha,
             args.cu_seqlens_vt_descale, args.cu_seqlens_q_block_descale, args.cu_seqlens_kv_block_descale, args.q_block_descale_head_stride, args.kv_block_descale_head_stride};
   }
 
@@ -776,7 +778,7 @@ struct CollectiveMainloopFwd {
     int const actual_seqlen_h = Is_target ? seqlen_traits_k.actual_seq_len_h : actual_seqlen_k;
     int const actual_seqlen_c = Is_context ? seqlen_traits_k.actual_seq_len_c : 0;
     int const actual_seqlen_offset = actual_seqlen_k - actual_seqlen_q;
-    int const max_seq_len_q = seqlen_traits_q.max_seq_len;
+    int const scaling_seq_len = mainloop_params.scaling_seqlen;
 
     // arbitrary func
     Tensor mMaxFunc = make_tensor(make_gmem_ptr(mainloop_params.func_ptr + seqlen_traits_q.offset),
@@ -1050,7 +1052,7 @@ struct CollectiveMainloopFwd {
       cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<int>(FwdNamedBarriers::QueryEmpty));
     }
     for (int i = 0; i < size(tOrO); ++i) {
-      tOrO(i) /= max_seq_len_q;
+      tOrO(i) /= scaling_seq_len;
     }
     return;
   }
@@ -1091,7 +1093,7 @@ struct CollectiveMainloopFwd {
     int const actual_seqlen_h = Is_target ? seqlen_traits_k.actual_seq_len_h : actual_seqlen_k;
     int const actual_seqlen_c = Is_context ? seqlen_traits_k.actual_seq_len_c : 0;
     int const actual_seqlen_offset = actual_seqlen_k - actual_seqlen_q;
-    int const max_seq_len_q = seqlen_traits_q.max_seq_len;
+    int const scaling_seq_len = mainloop_params.scaling_seqlen;
 
     Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQ{});
     Tensor sK = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutK{});
@@ -1465,7 +1467,7 @@ struct CollectiveMainloopFwd {
     }
     cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarpGroup, static_cast<int>(FwdNamedBarriers::QueryEmpty));
     for (int i = 0; i < size(tOrO); ++i) {
-      tOrO(i) /= max_seq_len_q;
+      tOrO(i) /= scaling_seq_len;
     }
     return;
   }

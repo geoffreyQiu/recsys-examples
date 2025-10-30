@@ -104,6 +104,7 @@ public:
     typename Seqlen_traits::LayoutT layout_dQ;
     const int total_q;
     const int seqlen_q;
+    const int scaling_seqlen;
     const float alpha;
     const int* cu_seqlens_q;
     const int* num_targets;
@@ -118,6 +119,7 @@ public:
     typename Seqlen_traits::LayoutT layout_dQ;
     const int total_q;
     const int seqlen_q;
+    const int scaling_seqlen;
     const float alpha;
     const int* cu_seqlens_q;
     const int* num_targets;
@@ -142,6 +144,7 @@ public:
         args.layout_dQ,
         args.total_q,
         args.seqlen_q,
+        args.scaling_seqlen,
         args.alpha,
         args.cu_seqlens_q,
         args.num_targets,
@@ -170,7 +173,7 @@ public:
       Seqlen_traits seqlen_traits_q(
           params.total_q, params.seqlen_q, params.cu_seqlens_q, params.num_targets, params.num_contexts);
       seqlen_traits_q.init(bidb);
-      int const max_seq_len_q = seqlen_traits_q.max_seq_len;
+      int const scaling_seq_len = params.scaling_seqlen;
       int const seqlen = seqlen_traits_q.actual_seq_len;
       if (m_block * kBlockM >= seqlen) { return; }
 
@@ -209,7 +212,7 @@ public:
     if constexpr (!Ktraits::Has_drab) {
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size(tdQrdQaccum); ++i) {
-            tdQrdQaccum(i) /= max_seq_len_q;
+            tdQrdQaccum(i) /= scaling_seq_len;
             tdQrdQaccum(i) *= params.alpha;
         }
     }

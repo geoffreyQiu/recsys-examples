@@ -121,12 +121,13 @@ class FusedHSTULayer(MegatronModule):
         )
 
     @output_nvtx_hook(nvtx_tag="FusedHSTULayer")
-    def forward(self, jd: JaggedData) -> JaggedData:
+    def forward(self, jd: JaggedData, scaling_seqlen: int) -> JaggedData:
         input = jd.values
         output = fused_hstu_op(
             input=input,
             seqlen_offsets=jd.seqlen_offsets,
             max_seqlen=jd.max_seqlen,
+            scaling_seqlen=scaling_seqlen,
             # linear weights and biases
             linear_uvqk_weight=self._linear_uvqk_weight,
             linear_uvqk_bias=self._linear_uvqk_bias,

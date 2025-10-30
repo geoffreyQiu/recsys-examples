@@ -50,10 +50,12 @@ from test_utils import init_fused_weights_from_debug
 @pytest.mark.parametrize("residual", [False, True])
 @pytest.mark.parametrize("input_sparsity", [0.75])
 @pytest.mark.parametrize("async_wgrad", [True, False])
+@pytest.mark.parametrize("scaling_seqlen", [-1, 128, 512])
 def test_fused_hstu_layer(
     dtype: torch.dtype,
     batchsize: int,
     max_history_seqlen: int,  # N
+
     max_num_targets: int,
     max_num_contextuals: int,
     num_heads: int,
@@ -66,6 +68,7 @@ def test_fused_hstu_layer(
     residual: bool,
     input_sparsity: float,
     async_wgrad: bool,
+    scaling_seqlen: int,
 ):
     init.initialize_distributed()
     init.set_random_seed(1234)
@@ -121,6 +124,8 @@ def test_fused_hstu_layer(
     lengths = torch.randint(
         low=1, high=max_seqlen + 1, size=(batchsize,), device=device, dtype=torch.int
     )
+    if scaling_seqlen == -1:
+        scaling_seqlen = max_seqlen
 
     seq_offsets = length_to_complete_offsets(lengths)
 
@@ -192,9 +197,9 @@ def test_fused_hstu_layer(
     ref_jd = JaggedData(values=ref_input, **ctor_nograd_dict)
     fp32_ref_jd = JaggedData(values=fp32_ref_input, **ctor_nograd_dict)
 
-    out_native = ref_hstu_layer(ref_jd).values
-    out_fused = fused_hstu_layer(jd).values
-    fp32_ref_out_native = fp32_ref_hstu_layer(fp32_ref_jd).values
+    out_native = ref_hstu_layer(ref_jd, scaling_seqlen).values
+    out_fused = fused_hstu_layer(jd, scaling_seqlen).values
+    fp32_ref_out_native = fp32_ref_hstu_layer(fp32_ref_jd, scaling_seqlen).values
 
     assert_hstu_close(out_fused, out_native, fp32_ref_out_native, fwd=True)
 

@@ -149,6 +149,7 @@ def _pad_qkv(
 @torch.fx.wrap
 def pytorch_hstu_mha(
     max_seq_len: int,
+    scaling_seqlen: int,
     alpha: float,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -171,7 +172,7 @@ def pytorch_hstu_mha(
         q, k, v, seq_offsets, max_seq_len
     )  # [B, H, N, D) and [B, H, N, V]
     qk_attn = torch.einsum("bhxa,bhya->bhxy", q, k) * alpha
-    qk_attn = F.silu(qk_attn) / max_seq_len
+    qk_attn = F.silu(qk_attn) / scaling_seqlen
     valid_attn_mask = _get_valid_attn_mask(
       device=q.device,
       causal=causal,
@@ -225,6 +226,7 @@ def _get_delta_valid_attn_mask(
 @torch.fx.wrap
 def pytorch_cached_hstu_mha(
     N: int,
+    scaling_seqlen: int,
     alpha: float,
     delta_q: torch.Tensor,
     k: torch.Tensor,
@@ -262,7 +264,7 @@ def pytorch_cached_hstu_mha(
     qk_attn = torch.einsum("bhxa,bhya->bhxy", delta_q, full_k) * alpha
     if attn_bias is not None:
         qk_attn = qk_attn + attn_bias
-    qk_attn = F.silu(qk_attn) / N
+    qk_attn = F.silu(qk_attn) / scaling_seqlen
     valid_attn_mask = _get_delta_valid_attn_mask(
         max_seq_len=N,
         delta_x_offsets=delta_x_offsets,

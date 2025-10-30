@@ -227,6 +227,7 @@ def reference_hstu_layer(
     host_kv_offsets: torch.Tensor,
     gpu_kv_data: torch.Tensor,
     gpu_kv_offsets: torch.Tensor,
+    scaling_seqlen: int,
     use_fp32: bool,
 ):
     def get_causal_mask(kv_seqlen_offsets):
@@ -305,6 +306,7 @@ def reference_hstu_layer(
         linear_dim=paged_hstu_layer._linear_dim_per_head,
         seqlen_q=4096,
         seqlen_k=4096,
+        scaling_seqlen=scaling_seqlen if scaling_seqlen != -1 else 4096,
         q=query,
         k=k_con,
         v=v_con,
@@ -616,6 +618,7 @@ class TestModule:
         jd: JaggedData,
         kvcache_metadata: KVCacheMetadata,
         host_kv_data: torch.Tensor,
+        scaling_seqlen: int,
         use_cudagraph: bool,
     ):
         self.onboard(host_kv_data, host_kv_data.shape[1], kvcache_metadata)
@@ -627,6 +630,7 @@ class TestModule:
             hidden_states,
             jd,
             kvcache_metadata,
+            scaling_seqlen,
             use_cudagraph=use_cudagraph,
         )
         return output
@@ -639,6 +643,7 @@ class TestModule:
         host_kv_offsets: torch.Tensor,
         gpu_kv_data: torch.Tensor,
         gpu_kv_offsets: torch.Tensor,
+        scaling_seqlen: int,
         use_fp32: bool,
     ):
         hidden_data = hidden_states
@@ -653,6 +658,7 @@ class TestModule:
                 host_kv_offsets,
                 gpu_kv_data[layer_idx],
                 gpu_kv_offsets,
+                scaling_seqlen,
                 use_fp32,
             )
         if use_fp32:
@@ -664,6 +670,7 @@ class TestModule:
         batchsize,
         max_seqlen,
         max_num_candidates,
+        scaling_seqlen,
         max_gpu_kv_length,
         using_cudagraph,
     ):
@@ -703,6 +710,7 @@ class TestModule:
             self.static_jagged_metadata,
             self.static_kvcache_metadata,
             host_kv_data,
+            scaling_seqlen,
             use_cudagraph=True,
         )
         torch.cuda.synchronize()
@@ -714,6 +722,7 @@ class TestModule:
             jagged_metadata,
             self.static_kvcache_metadata,
             host_kv_data,
+            scaling_seqlen,
             use_cudagraph=False,
         )
         torch.cuda.synchronize()
@@ -725,6 +734,7 @@ class TestModule:
             host_kv_offsets,
             gpu_kv_data,
             gpu_kv_offsets,
+            scaling_seqlen,
             use_fp32=False,
         )
         torch.cuda.synchronize()
@@ -736,6 +746,7 @@ class TestModule:
             host_kv_offsets,
             gpu_kv_data,
             gpu_kv_offsets,
+            scaling_seqlen,
             use_fp32=True,
         )
         torch.cuda.synchronize()
@@ -754,9 +765,10 @@ def test_kvcache_onload_with_predict(using_cudagraph):
         (512, 128),
         (1024, 256),
     ]
+    scaling_case = [-1, 1024]
     max_gpu_kv_length_case = [512]
 
-    test_cases = [batchsize_case, length_case, max_gpu_kv_length_case]
+    test_cases = [batchsize_case, length_case, scaling_case, max_gpu_kv_length_case]
 
     with torch.inference_mode():
         # Use a module for tests to share cudagraph
@@ -766,12 +778,14 @@ def test_kvcache_onload_with_predict(using_cudagraph):
         for (
             batchsize,
             (max_seqlen, max_num_candidates),
+            scaling_seqlen,
             max_gpu_kv_length,
         ) in itertools.product(*test_cases):
             test_module.run_test(
                 batchsize,
                 max_seqlen,
                 max_num_candidates,
+                scaling_seqlen,
                 max_gpu_kv_length,
                 using_cudagraph,
             )

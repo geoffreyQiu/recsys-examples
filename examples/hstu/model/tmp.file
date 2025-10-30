@@ -1,0 +1,1 @@
+os environ NO_KVCACHE=1

@@ -262,7 +262,7 @@ class HSTULayer(MegatronModule):
         return user, value, query, key
 
     @output_nvtx_hook(nvtx_tag="HSTULayer", hook_key_or_attr_name="values")
-    def forward(self, jd: JaggedData) -> JaggedData:
+    def forward(self, jd: JaggedData, scaling_seqlen: int) -> JaggedData:
         """
         Forward pass of the HSTULayer
 
@@ -309,6 +309,7 @@ class HSTULayer(MegatronModule):
                 num_contextuals=jd.contextual_seqlen,
                 num_candidates=jd.num_candidates,
                 max_seqlen=jd.max_seqlen,
+                scaling_seqlen=scaling_seqlen,
                 target_group_size=self._target_group_size,
             )
             if self._debug_check_tp_equal:

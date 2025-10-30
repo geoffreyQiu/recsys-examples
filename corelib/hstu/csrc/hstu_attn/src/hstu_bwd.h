@@ -690,7 +690,7 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
     silu_bwd(acc_s, acc_s_silu);
 
     for (int i = 0; i < size(acc_s_silu); ++i) {
-      acc_s_silu(i) /= params.seqlen_q;
+      acc_s_silu(i) /= params.scaling_seqlen;
     }
 
     if (Has_rab && (!Is_last_step)) {
@@ -722,7 +722,7 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
         smem_thr_copy_KV);
 
     for (int i = 0; i < size(acc_dp); ++i) {
-      acc_dp(i) /= params.seqlen_q;
+      acc_dp(i) /= params.scaling_seqlen;
     }
     dsilu_bwd(acc_dp, acc_s);
     for (int i = 0; i < size(acc_dp); ++i) {

@@ -68,13 +68,14 @@ class HSTUBlockInference(torch.nn.Module):
         hidden_states: torch.Tensor,
         jd: JaggedData,
         kv_cache_metadata,
+        scaling_seqlen: int,
         use_cudagraph: bool = True,
     ) -> torch.Tensor:
-        if self._hstu_graph is None or not use_cudagraph:
+        if self._hstu_graph is None or not use_cudagraph or scaling_seqlen != -1:
             hidden_data = hidden_states
             for hstu_layer in self._attention_layers:
                 hidden_data = hstu_layer.forward_naive(
-                    batch_size, num_tokens, hidden_data, jd, kv_cache_metadata
+                    batch_size, num_tokens, hidden_data, jd, kv_cache_metadata, scaling_seqlen
                 )
             return hidden_data
         else:

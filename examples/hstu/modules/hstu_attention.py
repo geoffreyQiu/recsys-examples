@@ -34,6 +34,7 @@ class HSTUAttention(torch.nn.Module):
         tv: torch.Tensor,  # (T, d)
         offsets: torch.Tensor,  # (batch_size + 1,)
         max_seqlen: int,
+        scaling_seqlen: int,
         target_group_size: int = 1,  # target <=> candidates
         num_candidates: Optional[torch.Tensor] = None,
         num_contextuals: Optional[Union[int, torch.Tensor]] = None,
@@ -86,6 +87,7 @@ class TorchHSTUAttention(HSTUAttention):
         tv: torch.Tensor,  # (T, d)
         offsets: torch.Tensor,  # (batch_size + 1,)
         max_seqlen: int,
+        scaling_seqlen: int,
         target_group_size: int = 1,  # target == candidates
         num_candidates: Optional[torch.Tensor] = None,
         num_contextuals: Optional[Union[int, torch.Tensor]] = None,
@@ -99,6 +101,7 @@ class TorchHSTUAttention(HSTUAttention):
             tv (torch.Tensor): Value tensor of shape (T, d), where T is the total sequence length across all batches and d is the dimensionality of the value.
             offsets (torch.Tensor): Offsets tensor of shape (batch_size, 1), indicating the start position of each sequence in the batch.
             max_seqlen (int): The maximum sequence length across all batches.
+            scaling_seqlen (int): The sequence length to scale the attention output.
             target_group_size (int): The size of the sub-candidate group where causal attention is applied only within a sub-group (usually in the case of ranking). Defaults to 1.
             num_candidates (torch.Tensor): Tensor containing the number of candidates for each sequence.
             num_contextuals (int | torch.Tensor | None): The number of contextuals for each sequence, could be a single integer or a tensor of shape (batch_size,) when different sequences have different number of contextuals.
@@ -119,6 +122,7 @@ class TorchHSTUAttention(HSTUAttention):
 
         return pytorch_hstu_mha(
             max_seq_len=max_seqlen,
+            scaling_seqlen=scaling_seqlen,
             alpha=1.0 / (self.attention_dim**0.5),
             q=tq.view(-1, self.num_heads, self.attention_dim),
             k=tk.view(-1, self.num_heads, self.attention_dim),
@@ -164,6 +168,7 @@ class TritonHSTUAttention(HSTUAttention):
         tv: torch.Tensor,  # (T, d)
         offsets: torch.Tensor,  # (batch_size + 1,)
         max_seqlen: int,
+        scaling_seqlen: int,
         target_group_size: int = 1,  # target == candidates
         num_candidates: Optional[torch.Tensor] = None,
         num_contextuals: Optional[Union[int, torch.Tensor]] = None,
@@ -177,6 +182,7 @@ class TritonHSTUAttention(HSTUAttention):
             tv (torch.Tensor): Value tensor of shape (T, d), where T is the total sequence length across all batches and d is the dimensionality of the value.
             offsets (torch.Tensor): Offsets tensor of shape (batch_size + 1,), indicating the start position of each sequence in the batch, with a terminal offset at the end.
             max_seqlen (int): The maximum sequence length across all batches.
+            scaling_seqlen (int): The sequence length to scale the attention output.
             target_group_size (int): The size of the sub-candidate group where causal attention is applied only within a sub-group (usually in the case of ranking). Defaults to 1.
             num_candidates (torch.Tensor): Tensor containing the number of candidates for each sequence.
             num_contextuals (int | torch.Tensor | None): The number of contextuals for each sequence, could be a single integer or a tensor of shape (batch_size,) when different sequences have different number of contextuals.
@@ -197,6 +203,7 @@ class TritonHSTUAttention(HSTUAttention):
         ), "num_contextuals must be an integer in TritonHSTUAttention"
         return triton_hstu_mha(
             N=max_seqlen,
+            scaling_seqlen=scaling_seqlen,
             alpha=1.0 / (self.attention_dim**0.5),
             q=tq.view(-1, self.num_heads, self.attention_dim),
             k=tk.view(-1, self.num_heads, self.attention_dim),
@@ -247,6 +254,7 @@ class FusedHSTUAttention(HSTUAttention):
         tv: torch.Tensor,  # (T, d)
         offsets: torch.Tensor,  # (batch_size, 1)
         max_seqlen: int,
+        scaling_seqlen: int,
         target_group_size: int = 1,  # target == candidates
         num_candidates: Optional[torch.Tensor] = None,
         num_contextuals: Optional[Union[int, torch.Tensor]] = None,
@@ -290,6 +298,7 @@ class FusedHSTUAttention(HSTUAttention):
             cu_seqlens_k=offsets.to(torch.int32),
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
+            scaling_seqlen=scaling_seqlen,
             num_contexts=num_contextuals,
             num_targets=num_candidates.to(torch.int32)
             if isinstance(num_candidates, torch.Tensor)
@@ -340,6 +349,7 @@ class FusedHSTUAttentionHopper(HSTUAttention):
         tv: torch.Tensor,  # (T, d)
         offsets: torch.Tensor,  # (batch_size + 1,)
         max_seqlen: int,
+        scaling_seqlen: int,
         target_group_size: int = 1,  # target == candidates
         num_candidates: Optional[torch.Tensor] = None,
         num_contextuals: Optional[Union[int, torch.Tensor]] = None,
@@ -382,6 +392,7 @@ class FusedHSTUAttentionHopper(HSTUAttention):
             cu_seqlens_k=offsets.to(torch.int32),
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
+            scaling_seqlen=scaling_seqlen,
             num_contexts=num_contextuals,
             num_targets=num_candidates.to(torch.int32)
             if isinstance(num_candidates, torch.Tensor)
