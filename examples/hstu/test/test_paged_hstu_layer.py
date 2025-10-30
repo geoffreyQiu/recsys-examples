@@ -345,6 +345,7 @@ def generate_test_input_data(
     kvcache_table: List[torch.Tensor],
     kvcache_table_reserve_idx: int,
     dtype: torch.dtype,
+    scaling_seqlen: int,
 ):
     device = torch.cuda.current_device()
 
@@ -478,6 +479,7 @@ def generate_test_input_data(
         contextual_seqlen=None,
         contextual_seqlen_offsets=None,
         has_interleaved_action=True,
+        scaling_seqlen=scaling_seqlen,
     )
 
     kvcache_metadata = KVCacheMetadata(
@@ -618,7 +620,6 @@ class TestModule:
         jd: JaggedData,
         kvcache_metadata: KVCacheMetadata,
         host_kv_data: torch.Tensor,
-        scaling_seqlen: int,
         use_cudagraph: bool,
     ):
         self.onboard(host_kv_data, host_kv_data.shape[1], kvcache_metadata)
@@ -630,7 +631,6 @@ class TestModule:
             hidden_states,
             jd,
             kvcache_metadata,
-            scaling_seqlen,
             use_cudagraph=use_cudagraph,
         )
         return output
@@ -698,6 +698,7 @@ class TestModule:
             self.kvcache_tables,
             self.kvcache_config.blocks_in_primary_pool,
             self.dtype,
+            scaling_seqlen,
         )
 
         kvcache_metadata.total_history_offsets += jagged_metadata.num_candidates_offsets
@@ -710,7 +711,6 @@ class TestModule:
             self.static_jagged_metadata,
             self.static_kvcache_metadata,
             host_kv_data,
-            scaling_seqlen,
             use_cudagraph=True,
         )
         torch.cuda.synchronize()
@@ -722,7 +722,6 @@ class TestModule:
             jagged_metadata,
             self.static_kvcache_metadata,
             host_kv_data,
-            scaling_seqlen,
             use_cudagraph=False,
         )
         torch.cuda.synchronize()
