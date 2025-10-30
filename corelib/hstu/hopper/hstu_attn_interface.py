@@ -731,7 +731,6 @@ def hstu_attn_varlen_func(
     cu_seqlens_k,
     max_seqlen_q,
     max_seqlen_k,
-    scaling_seqlen,
     num_contexts=None,
     num_targets=None,
     target_group_size=1,
@@ -741,6 +740,7 @@ def hstu_attn_varlen_func(
     has_drab=False,
     func=None,
     quant_mode=-1,
+    scaling_seqlen=-1,
 ):
     """
     Arguments:
@@ -753,7 +753,6 @@ def hstu_attn_varlen_func(
            of the sequences in the batch, used to index into kv.
         max_seqlen_q: int. Maximum query sequence length in the batch.
         max_seqlen_k: int. Maximum key sequence length in the batch.
-        scaling_seqlen: int. The sequence length to scale the attention output.
         num_contexts: (batch_size,). Number of context tokens in each batch.
         num_targets: (batch_size,). Number of target tokens in each batch.
         target_group_size: int. Number of target tokens in each group.
@@ -763,6 +762,7 @@ def hstu_attn_varlen_func(
         has_drab: bool. Whether to apply random access bias for the key.
         func: (nheads, total_q + 256). Function for describe the mask shape.
         quant_mode: int. -1: no quantization, 0: cast to fp8, 1: 1xDIM&128x1 quantization, 2: per-block quantization, 3: per-head quantization, 4: per-batch quantization, 5: per-tensor quantization
+        scaling_seqlen: int. The sequence length to scale the attention output.
     Return:
         out: (total_q, nheads, headdim).
     """
@@ -786,6 +786,8 @@ def hstu_attn_varlen_func(
         raise ValueError(
             "AssertError: seq_len_q >= seq_len_k, this is undefined behavior"
         )
+    if scaling_seqlen == -1:
+        scaling_seqlen = max_seqlen_q
 
     return HSTUAttnVarlenFunc.apply(
         q,
@@ -934,7 +936,6 @@ def hstu_attn_qkvpacked_func(
     cu_seqlens_k,
     max_seqlen_q,
     max_seqlen_k,
-    scaling_seqlen,
     num_contexts=None,
     num_targets=None,
     target_group_size=1,
@@ -944,6 +945,7 @@ def hstu_attn_qkvpacked_func(
     has_drab=False,
     func=None,
     quant_mode=-1,
+    scaling_seqlen=-1,
 ):
     """
     Arguments:
@@ -954,7 +956,6 @@ def hstu_attn_qkvpacked_func(
            of the sequences in the batch, used to index into kv.
         max_seqlen_q: int. Maximum query sequence length in the batch.
         max_seqlen_k: int. Maximum key sequence length in the batch.
-        scaling_seqlen: int. The sequence length to scale the attention output.
         num_contexts: (batch_size,). Number of context tokens in each batch.
         num_targets: (batch_size,). Number of target tokens in each batch.
         target_group_size: int. Number of target tokens in each group.
@@ -964,6 +965,7 @@ def hstu_attn_qkvpacked_func(
         has_drab: bool. Whether to apply random access bias for the key.
         func: (nheads, total_q + 256). Function for describe the mask shape.
         quant_mode: int. -1: no quantization, 0: cast to fp8, 1: 1xDIM&128x1 quantization, 2: per-block quantization, 3: per-head quantization, 4: per-batch quantization, 5: per-tensor quantization
+        scaling_seqlen: int. The sequence length to scale the attention output.
     Return:
         out: (total, nheads, headdim).
     """
@@ -987,6 +989,8 @@ def hstu_attn_qkvpacked_func(
         raise ValueError(
             "AssertError: seq_len_q >= seq_len_k, this is undefined behavior"
         )
+    if scaling_seqlen == -1:
+        scaling_seqlen = max_seqlen_q
 
     return HstuAttnQKVPackedFunc.apply(
         qkv,

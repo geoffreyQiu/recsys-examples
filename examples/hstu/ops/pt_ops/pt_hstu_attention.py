@@ -149,7 +149,6 @@ def _pad_qkv(
 @torch.fx.wrap
 def pytorch_hstu_mha(
     max_seq_len: int,
-    scaling_seqlen: int,
     alpha: float,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -162,9 +161,12 @@ def pytorch_hstu_mha(
     num_contextuals: Optional[Union[int, torch.Tensor]] = None,
     max_attn_len: Optional[int] = None,
     target_group_size: int = 1,
+    scaling_seqlen: int = -1,
 ) -> torch.Tensor:
     if num_contextuals is None:
       num_contextuals = 0
+    if scaling_seqlen == -1:
+        scaling_seqlen = max_seq_len
 
     L, H, _ = q.shape
     V = v.shape[2]

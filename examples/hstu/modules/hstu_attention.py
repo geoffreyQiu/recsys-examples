@@ -87,7 +87,7 @@ class TorchHSTUAttention(HSTUAttention):
         tv: torch.Tensor,  # (T, d)
         offsets: torch.Tensor,  # (batch_size + 1,)
         max_seqlen: int,
-        scaling_seqlen: int,
+        scaling_seqlen: int = -1,
         target_group_size: int = 1,  # target == candidates
         num_candidates: Optional[torch.Tensor] = None,
         num_contextuals: Optional[Union[int, torch.Tensor]] = None,
@@ -122,7 +122,6 @@ class TorchHSTUAttention(HSTUAttention):
 
         return pytorch_hstu_mha(
             max_seq_len=max_seqlen,
-            scaling_seqlen=scaling_seqlen,
             alpha=1.0 / (self.attention_dim**0.5),
             q=tq.view(-1, self.num_heads, self.attention_dim),
             k=tk.view(-1, self.num_heads, self.attention_dim),
@@ -134,6 +133,7 @@ class TorchHSTUAttention(HSTUAttention):
             dropout_pr=0.0,
             training=self.training,
             target_group_size=target_group_size,
+            scaling_seqlen=scaling_seqlen,
         ).view(-1, self.num_heads * self.linear_dim)
 
 
@@ -168,7 +168,7 @@ class TritonHSTUAttention(HSTUAttention):
         tv: torch.Tensor,  # (T, d)
         offsets: torch.Tensor,  # (batch_size + 1,)
         max_seqlen: int,
-        scaling_seqlen: int,
+        scaling_seqlen: int = -1,
         target_group_size: int = 1,  # target == candidates
         num_candidates: Optional[torch.Tensor] = None,
         num_contextuals: Optional[Union[int, torch.Tensor]] = None,
@@ -203,7 +203,6 @@ class TritonHSTUAttention(HSTUAttention):
         ), "num_contextuals must be an integer in TritonHSTUAttention"
         return triton_hstu_mha(
             N=max_seqlen,
-            scaling_seqlen=scaling_seqlen,
             alpha=1.0 / (self.attention_dim**0.5),
             q=tq.view(-1, self.num_heads, self.attention_dim),
             k=tk.view(-1, self.num_heads, self.attention_dim),
@@ -212,6 +211,7 @@ class TritonHSTUAttention(HSTUAttention):
             num_targets=num_candidates,
             causal=self.is_causal,
             contextual_seq_len=num_contextuals,
+            scaling_seqlen=scaling_seqlen,
         ).view(-1, self.num_heads * self.linear_dim)
 
 
@@ -254,7 +254,7 @@ class FusedHSTUAttention(HSTUAttention):
         tv: torch.Tensor,  # (T, d)
         offsets: torch.Tensor,  # (batch_size, 1)
         max_seqlen: int,
-        scaling_seqlen: int,
+        scaling_seqlen: int = -1,
         target_group_size: int = 1,  # target == candidates
         num_candidates: Optional[torch.Tensor] = None,
         num_contextuals: Optional[Union[int, torch.Tensor]] = None,
@@ -298,7 +298,6 @@ class FusedHSTUAttention(HSTUAttention):
             cu_seqlens_k=offsets.to(torch.int32),
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
-            scaling_seqlen=scaling_seqlen,
             num_contexts=num_contextuals,
             num_targets=num_candidates.to(torch.int32)
             if isinstance(num_candidates, torch.Tensor)
@@ -307,6 +306,7 @@ class FusedHSTUAttention(HSTUAttention):
             window_size=(-1, 0) if self.is_causal else (-1, -1),
             rab=None,
             alpha=1.0 / (self.attention_dim**0.5),
+            scaling_seqlen=scaling_seqlen,
         ).view(-1, self.num_heads * self.linear_dim)
 
 
@@ -349,7 +349,7 @@ class FusedHSTUAttentionHopper(HSTUAttention):
         tv: torch.Tensor,  # (T, d)
         offsets: torch.Tensor,  # (batch_size + 1,)
         max_seqlen: int,
-        scaling_seqlen: int,
+        scaling_seqlen: int = -1,
         target_group_size: int = 1,  # target == candidates
         num_candidates: Optional[torch.Tensor] = None,
         num_contextuals: Optional[Union[int, torch.Tensor]] = None,
@@ -392,7 +392,6 @@ class FusedHSTUAttentionHopper(HSTUAttention):
             cu_seqlens_k=offsets.to(torch.int32),
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
-            scaling_seqlen=scaling_seqlen,
             num_contexts=num_contextuals,
             num_targets=num_candidates.to(torch.int32)
             if isinstance(num_candidates, torch.Tensor)
@@ -401,6 +400,7 @@ class FusedHSTUAttentionHopper(HSTUAttention):
             window_size=(-1, 0) if self.is_causal else (-1, -1),
             rab=None,
             alpha=1.0 / (self.attention_dim**0.5),
+            scaling_seqlen=scaling_seqlen,
         ).view(-1, self.num_heads * self.linear_dim)
 
 

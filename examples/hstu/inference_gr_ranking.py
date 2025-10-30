@@ -227,6 +227,7 @@ def run_ranking_gr_simulate(
     checkpoint_dir: str,
     check_auc: bool = False,
     disable_contextual_features: bool = False,
+    scaling_seqlen: int = -1,
 ):
     dataset_args, emb_configs = get_inference_dataset_and_embedding_configs(
         disable_contextual_features
@@ -320,6 +321,7 @@ def run_ranking_gr_simulate(
                         batch_0,
                         uids[non_contextual_mask].int(),
                         new_cache_start_pos[non_contextual_mask],
+                        scaling_seqlen,
                     )
                     eval_module(logits, batch_0.labels)
 
@@ -348,7 +350,9 @@ def run_ranking_gr_simulate(
 
 
 def run_ranking_gr_evaluate(
-    checkpoint_dir: str, disable_contextual_features: bool = False
+    checkpoint_dir: str,
+    disable_contextual_features: bool = False,
+    scaling_seqlen: int = -1,
 ):
     dataset_args, emb_configs = get_inference_dataset_and_embedding_configs(
         disable_contextual_features
@@ -439,7 +443,7 @@ def run_ranking_gr_evaluate(
                 if user_ids.shape[0] != batch.batch_size:
                     batch = strip_padding_batch(batch, user_ids.shape[0])
 
-                logits = model.forward(batch, user_ids, seq_startpos)
+                logits = model.forward(batch, user_ids, seq_startpos, scaling_seqlen)
                 eval_module(logits, batch.labels)
             except StopIteration:
                 break
@@ -460,6 +464,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--disable_auc", action="store_true")
     parser.add_argument("--disable_context", action="store_true")
+    parser.add_argument("--scaling_seqlen", type=int, required=False)
 
     args = parser.parse_args()
     gin.parse_config_file(args.gin_config_file)
@@ -469,10 +474,14 @@ if __name__ == "__main__":
             print("disable_auc is ignored in Eval mode.")
         if args.disable_context:
             print("disable_context is ignored in Eval mode.")
-        run_ranking_gr_evaluate(checkpoint_dir=args.checkpoint_dir)
+        run_ranking_gr_evaluate(
+            checkpoint_dir=args.checkpoint_dir,
+            scaling_seqlen=args.scaling_seqlen,
+        )
     elif args.mode == RunningMode.SIMULATE:
         run_ranking_gr_simulate(
             checkpoint_dir=args.checkpoint_dir,
             check_auc=not args.disable_auc,
             disable_contextual_features=args.disable_context,
+            scaling_seqlen=args.scaling_seqlen,
         )

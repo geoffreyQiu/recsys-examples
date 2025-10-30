@@ -190,7 +190,6 @@ def hstu_attn_varlen_func(
     cu_seqlens_k,
     max_seqlen_q,
     max_seqlen_k,
-    scaling_seqlen,
     num_contexts=None,
     num_targets=None,
     target_group_size=1,
@@ -204,6 +203,7 @@ def hstu_attn_varlen_func(
     last_page_lens=None,
     cu_seqlens_t=None,
     func=None,
+    scaling_seqlen=-1,
 ):
     """
     Arguments:
@@ -216,7 +216,6 @@ def hstu_attn_varlen_func(
            of the sequences in the batch, used to index into kv.
         max_seqlen_q: int. Maximum query sequence length in the batch.
         max_seqlen_k: int. Maximum key sequence length in the batch.
-        scaling_seqlen: int. The sequence length to scale the attention output.
         num_contexts: (batch_size,). Number of context tokens in each batch.
         num_targets: (batch_size,). Number of target tokens in each batch.
         target_group_size: int. Number of target tokens in each group.
@@ -228,6 +227,7 @@ def hstu_attn_varlen_func(
         page_offsets: (batch_size + 1,). The cumulative sequence lengths of the page_ptr in the batch, used to index into kv_cache.
         page_ids: (page_offsets[-1],). The ids of the pages in the batch.
         last_page_lens: (batch_size,). The lengths of the last pages in the batch.
+        scaling_seqlen: int. The sequence length to scale the attention output.
     Return:
         out: (total, nheads, headdim).
     """
@@ -251,6 +251,8 @@ def hstu_attn_varlen_func(
         raise ValueError(
             "AssertError: seq_len_q >= seq_len_k, this is undefined behavior"
         )
+    if scaling_seqlen == -1:
+        scaling_seqlen = max_seqlen_q
 
     return HstuAttnVarlenFunc.apply(
         q,
@@ -433,7 +435,6 @@ def hstu_attn_qkvpacked_func(
     cu_seqlens_k,
     max_seqlen_q,
     max_seqlen_k,
-    scaling_seqlen,
     num_contexts=None,
     num_targets=None,
     target_group_size=1,
@@ -442,6 +443,7 @@ def hstu_attn_qkvpacked_func(
     rab=None,
     has_drab=False,
     func=None,
+    scaling_seqlen=-1,
 ):
     """
     Arguments:
@@ -452,7 +454,6 @@ def hstu_attn_qkvpacked_func(
            of the sequences in the batch, used to index into kv.
         max_seqlen_q: int. Maximum query sequence length in the batch.
         max_seqlen_k: int. Maximum key sequence length in the batch.
-        scaling_seqlen: int. The sequence length to scale the attention output.
         num_contexts: (batch_size,). Number of context tokens in each batch.
         num_targets: (batch_size,). Number of target tokens in each batch.
         target_group_size: int. Number of target tokens in each group.
@@ -460,6 +461,7 @@ def hstu_attn_qkvpacked_func(
         alpha: float. Scaling factor between add rab and silu.
         rab: (batch_size, max_seqlen_k, max_seqlen_k). Random access bias for the key.
         has_drab: bool. Whether to apply random access bias for the key.
+        scaling_seqlen: int. The sequence length to scale the attention output.
     Return:
         out: (total, nheads, headdim).
     """
@@ -483,6 +485,8 @@ def hstu_attn_qkvpacked_func(
         raise ValueError(
             "AssertError: seq_len_q >= seq_len_k, this is undefined behavior"
         )
+    if scaling_seqlen == -1:
+        scaling_seqlen = max_seqlen_q
 
     return HstuAttnQKVPackedFunc.apply(
         qkv,

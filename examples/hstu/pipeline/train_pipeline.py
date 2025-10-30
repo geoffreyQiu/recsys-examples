@@ -854,7 +854,9 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
             custom_model_fwd,
         )
 
-    def progress(self, dataloader_iter: Iterator[In], scaling_seqlen: int) -> Tuple[torch.Tensor, Out]:
+    def progress(
+        self, dataloader_iter: Iterator[In], scaling_seqlen: int
+    ) -> Tuple[torch.Tensor, Out]:
         self._fill_pipeline(dataloader_iter)
 
         if self._model.training:

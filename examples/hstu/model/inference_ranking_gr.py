@@ -470,7 +470,7 @@ class InferenceRankingGR(torch.nn.Module):
         batch: Batch,
         user_ids: torch.Tensor,
         user_start_pos: torch.Tensor,
-        scaling_seqlen: int,
+        scaling_seqlen: int = -1,
     ):
         with torch.inference_mode():
             user_start_pos_cuda = user_start_pos.to(

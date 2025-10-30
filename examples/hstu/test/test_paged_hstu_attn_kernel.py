@@ -425,7 +425,6 @@ def test_paged_hstu_attn_kernel(
             kvdata_seqlen_offsets.cuda() + num_candidates_offsets.cuda(),
             global_max_seqlen,
             global_max_seqlen,
-            scaling_seqlen,
             num_contexts=None,
             num_targets=num_candidates.cuda(),
             target_group_size=1,
@@ -442,6 +441,7 @@ def test_paged_hstu_attn_kernel(
                 kv_raw_metadata[2], dtype=torch.int32, device=device
             ),
             cu_seqlens_t=num_candidates_offsets.cuda(),
+            scaling_seqlen=scaling_seqlen,
         )
         torch.cuda.synchronize()
 

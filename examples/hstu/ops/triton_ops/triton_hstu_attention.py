@@ -965,7 +965,10 @@ def _hstu_attn_bwd_one_block(  # noqa C901
     # compute dk and dq
     dqk_trans = tl.dot(v, tl.trans(do), allow_tf32=ALLOW_TF32)
     dqk_trans = (
-        dqk_trans * sig_trans * (1 + qk_trans * (1 - sig_trans)) * (1.0 / scaling_seqlen)
+        dqk_trans
+        * sig_trans
+        * (1 + qk_trans * (1 - sig_trans))
+        * (1.0 / scaling_seqlen)
     )
     dqk_trans = tl.where(invalid_mask_trans, dqk_trans, 0)
     dqk_trans = dqk_trans.to(k.dtype)
@@ -1856,7 +1859,6 @@ def native_triton_hstu_mha(
 
 def triton_hstu_mha(
     N: int,
-    scaling_seqlen: int,
     alpha: float,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1868,11 +1870,14 @@ def triton_hstu_mha(
     contextual_seq_len: int = 0,
     sort_by_length: bool = False,
     triton_cc: bool = False,
+    scaling_seqlen: int = -1,
 ) -> torch.Tensor:
     q = switch_to_contiguous_if_needed(q)
     k = switch_to_contiguous_if_needed(k)
     v = switch_to_contiguous_if_needed(v)
     seq_offsets = seq_offsets.contiguous()
+    if scaling_seqlen == -1:
+        scaling_seqlen = N
     if triton_cc:
         return native_triton_hstu_mha(
             N,
@@ -1970,7 +1975,6 @@ def native_triton_cached_hstu_mha(
 
 def triton_cached_hstu_mha(
     N: int,
-    scaling_seqlen: int,
     alpha: float,
     delta_q: torch.Tensor,
     k: torch.Tensor,
@@ -1980,12 +1984,15 @@ def triton_cached_hstu_mha(
     num_targets: Optional[torch.Tensor] = None,
     max_attn_len: int = 0,
     triton_cc: bool = False,
+    scaling_seqlen: int = -1,
 ) -> torch.Tensor:
     seq_offsets = seq_offsets.contiguous()
     delta_x_offsets = delta_x_offsets.contiguous()
     delta_q = switch_to_contiguous_if_needed(delta_q)
     k = switch_to_contiguous_if_needed(k)
     v = switch_to_contiguous_if_needed(v)
+    if scaling_seqlen == -1:
+        scaling_seqlen = N
 
     if triton_cc:
         return native_triton_cached_hstu_mha(

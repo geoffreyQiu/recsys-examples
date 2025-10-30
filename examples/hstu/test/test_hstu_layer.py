@@ -55,7 +55,6 @@ def test_fused_hstu_layer(
     dtype: torch.dtype,
     batchsize: int,
     max_history_seqlen: int,  # N
-
     max_num_targets: int,
     max_num_contextuals: int,
     num_heads: int,

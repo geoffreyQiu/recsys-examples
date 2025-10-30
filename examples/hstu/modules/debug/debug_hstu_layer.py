@@ -262,12 +262,13 @@ class HSTULayer(MegatronModule):
         return user, value, query, key
 
     @output_nvtx_hook(nvtx_tag="HSTULayer", hook_key_or_attr_name="values")
-    def forward(self, jd: JaggedData, scaling_seqlen: int) -> JaggedData:
+    def forward(self, jd: JaggedData, scaling_seqlen: int = -1) -> JaggedData:
         """
         Forward pass of the HSTULayer
 
         Args:
             jd (JaggedData): The input jagged data
+            scaling_seqlen (int): The sequence length to scale attention output
 
         Returns:
             Tensor: The output embeddings [\*, D]

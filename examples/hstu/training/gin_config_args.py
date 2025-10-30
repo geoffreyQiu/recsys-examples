@@ -26,7 +26,7 @@ class TrainerArgs:
     train_batch_size: int
     eval_batch_size: int
 
-    scaling_seqlen: int = 1024
+    scaling_seqlen: int = -1
 
     eval_interval: int = 100
     log_interval: int = 100

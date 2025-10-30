@@ -75,7 +75,12 @@ class HSTUBlockInference(torch.nn.Module):
             hidden_data = hidden_states
             for hstu_layer in self._attention_layers:
                 hidden_data = hstu_layer.forward_naive(
-                    batch_size, num_tokens, hidden_data, jd, kv_cache_metadata, scaling_seqlen
+                    batch_size,
+                    num_tokens,
+                    hidden_data,
+                    jd,
+                    kv_cache_metadata,
+                    scaling_seqlen,
                 )
             return hidden_data
         else:
