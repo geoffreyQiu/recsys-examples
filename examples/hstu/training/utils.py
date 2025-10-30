@@ -210,6 +210,7 @@ def create_hstu_config(
         hstu_layer_type=layer_type,
         recompute_input_layernorm=network_args.recompute_input_layernorm,
         recompute_input_silu=network_args.recompute_input_silu,
+        scaling_seqlen=network_args.scaling_seqlen,
     )
 
 

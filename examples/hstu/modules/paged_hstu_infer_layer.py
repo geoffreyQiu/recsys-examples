@@ -259,7 +259,6 @@ class PagedHSTUInferLayer(torch.nn.Module):
         layer_input: torch.Tensor,
         jd: JaggedData,
         kv_cache_metadata,
-        scaling_seqlen: int,
     ) -> JaggedData:
         normed_input = F.layer_norm(
             layer_input,
@@ -279,9 +278,6 @@ class PagedHSTUInferLayer(torch.nn.Module):
         value = value.view(-1, self._num_heads, self._linear_dim_per_head)
         query = query.view(-1, self._num_heads, self._attention_dim_per_head)
         key = key.view(-1, self._num_heads, self._attention_dim_per_head)
-
-        if scaling_seqlen == -1:
-            scaling_seqlen = self._max_seqlen
 
         kv_cache_table = kv_cache_metadata.kv_cache_table[self.layer_idx]
         (paged_k_cache, paged_v_cache) = kv_cache_table.unbind(dim=1)
@@ -326,7 +322,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
             page_ids=kv_cache_metadata.kv_indices,
             last_page_lens=kv_cache_metadata.kv_last_page_len,
             cu_seqlens_t=jd.num_candidates_offsets[: batch_size + 1],
-            scaling_seqlen=scaling_seqlen,
+            scaling_seqlen=jd.scaling_seqlen,
         )
 
         jagged_attn_output = jagged_attn_output.view(

@@ -102,7 +102,7 @@ class RetrievalGR(BaseModel):
         return self
 
     def get_logit_and_labels(
-        self, batch: RetrievalBatch, scaling_seqlen: int
+        self, batch: RetrievalBatch
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Get the logits and labels for the batch.
@@ -121,7 +121,6 @@ class RetrievalGR(BaseModel):
         jagged_data, seqlen_after_preprocessor = self._hstu_block(
             embeddings=embeddings,
             batch=batch,
-            scaling_seqlen=scaling_seqlen,
         )
         pred_item_embeddings = jagged_data.values
         pred_item_max_seqlen = jagged_data.max_seqlen
@@ -164,7 +163,6 @@ class RetrievalGR(BaseModel):
     def forward(  # type: ignore[override]
         self,
         batch: RetrievalBatch,
-        scaling_seqlen: int = -1,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]]:
         """
         Perform the forward pass of the model.
@@ -183,7 +181,7 @@ class RetrievalGR(BaseModel):
             seqlen_after_preprocessor,
             supervision_item_ids,
             supervision_emb,
-        ) = self.get_logit_and_labels(batch, scaling_seqlen)
+        ) = self.get_logit_and_labels(batch)
 
         losses = self._loss_module(
             jagged_item_logit.float(), supervision_item_ids, supervision_emb.float()

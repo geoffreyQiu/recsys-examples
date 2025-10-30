@@ -129,6 +129,7 @@ class HSTUConfig(TransformerConfig):
     is_inference: bool = False
     add_uvqk_bias: bool = True
     fuse_norm_mul_dropout: bool = True
+    scaling_seqlen: int = -1
 
     def __post_init__(self):
         super().__post_init__()
@@ -156,6 +157,7 @@ def get_hstu_config(
     is_inference: bool = False,
     add_uvqk_bias: bool = True,
     fuse_norm_mul_dropout: bool = True,
+    scaling_seqlen: int = -1,
 ) -> HSTUConfig:
     """
     Create the HSTU configuration.
@@ -225,4 +227,5 @@ def get_hstu_config(
         add_uvqk_bias=add_uvqk_bias,
         is_inference=is_inference,
         fuse_norm_mul_dropout=fuse_norm_mul_dropout,
+        scaling_seqlen=scaling_seqlen,
     )

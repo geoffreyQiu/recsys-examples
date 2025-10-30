@@ -191,14 +191,15 @@ def test_fused_hstu_layer(
         "contextual_seqlen_offsets": length_to_complete_offsets(num_contextuals)
         if num_contextuals is not None
         else None,
+        "scaling_seqlen": scaling_seqlen,
     }
     jd = JaggedData(values=input, **ctor_nograd_dict)
     ref_jd = JaggedData(values=ref_input, **ctor_nograd_dict)
     fp32_ref_jd = JaggedData(values=fp32_ref_input, **ctor_nograd_dict)
 
-    out_native = ref_hstu_layer(ref_jd, scaling_seqlen).values
-    out_fused = fused_hstu_layer(jd, scaling_seqlen).values
-    fp32_ref_out_native = fp32_ref_hstu_layer(fp32_ref_jd, scaling_seqlen).values
+    out_native = ref_hstu_layer(ref_jd).values
+    out_fused = fused_hstu_layer(jd).values
+    fp32_ref_out_native = fp32_ref_hstu_layer(fp32_ref_jd).values
 
     assert_hstu_close(out_fused, out_native, fp32_ref_out_native, fwd=True)
 

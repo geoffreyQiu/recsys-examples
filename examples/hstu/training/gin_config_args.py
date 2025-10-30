@@ -26,8 +26,6 @@ class TrainerArgs:
     train_batch_size: int
     eval_batch_size: int
 
-    scaling_seqlen: int = -1
-
     eval_interval: int = 100
     log_interval: int = 100
     max_train_iters: Optional[int] = None
@@ -159,6 +157,8 @@ class NetworkArgs:
 
     item_embedding_dim: int = -1
     contextual_embedding_dim: int = -1
+
+    scaling_seqlen: int = -1
 
     def __post_init__(self):
         assert self.dtype_str in [

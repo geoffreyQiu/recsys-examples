@@ -262,13 +262,12 @@ class HSTULayer(MegatronModule):
         return user, value, query, key
 
     @output_nvtx_hook(nvtx_tag="HSTULayer", hook_key_or_attr_name="values")
-    def forward(self, jd: JaggedData, scaling_seqlen: int = -1) -> JaggedData:
+    def forward(self, jd: JaggedData) -> JaggedData:
         """
         Forward pass of the HSTULayer
 
         Args:
             jd (JaggedData): The input jagged data
-            scaling_seqlen (int): The sequence length to scale attention output
 
         Returns:
             Tensor: The output embeddings [\*, D]
@@ -310,7 +309,7 @@ class HSTULayer(MegatronModule):
                 num_contextuals=jd.contextual_seqlen,
                 num_candidates=jd.num_candidates,
                 max_seqlen=jd.max_seqlen,
-                scaling_seqlen=scaling_seqlen,
+                scaling_seqlen=jd.scaling_seqlen,
                 target_group_size=self._target_group_size,
             )
             if self._debug_check_tp_equal:
@@ -440,4 +439,5 @@ class HSTULayer(MegatronModule):
             contextual_seqlen=jd.contextual_seqlen,
             contextual_seqlen_offsets=jd.contextual_seqlen_offsets,
             has_interleaved_action=jd.has_interleaved_action,
+            scaling_seqlen=jd.scaling_seqlen,
         )

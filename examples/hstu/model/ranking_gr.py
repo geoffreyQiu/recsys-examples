@@ -97,7 +97,7 @@ class RankingGR(BaseModel):
         return self
 
     def get_logit_and_labels(
-        self, batch: RankingBatch, scaling_seqlen: int
+        self, batch: RankingBatch
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Get the logits and labels for the batch.
@@ -126,7 +126,6 @@ class RankingGR(BaseModel):
         hidden_states_jagged, seqlen_after_preprocessor = self._hstu_block(
             embeddings=embeddings,
             batch=batch,
-            scaling_seqlen=scaling_seqlen,
         )
         hidden_states = hidden_states_jagged.values
         logits = self._mlp(hidden_states)
@@ -135,7 +134,6 @@ class RankingGR(BaseModel):
     def forward(  # type: ignore[override]
         self,
         batch: RankingBatch,
-        scaling_seqlen: int = -1,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]]:
         """
         Perform the forward pass of the model.
@@ -150,7 +148,7 @@ class RankingGR(BaseModel):
             jagged_item_logit,
             seqlen_after_preprocessor,
             labels,
-        ) = self.get_logit_and_labels(batch, scaling_seqlen)
+        ) = self.get_logit_and_labels(batch)
         losses = self._loss_module(jagged_item_logit.float(), labels)
         return losses, (
             losses.detach(),

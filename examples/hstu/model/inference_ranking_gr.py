@@ -72,6 +72,7 @@ def get_jagged_metadata_buffer(max_batch_size, max_seq_len, contextual_max_seqle
         if contextual_max_seqlen > 0
         else None,
         has_interleaved_action=True,
+        scaling_seqlen=-1,
     )
 
 
@@ -100,6 +101,7 @@ def copy_jagged_metadata(dst_metadata, src_metata):
             dst_metadata.contextual_seqlen_offsets,
             src_metata.contextual_seqlen_offsets[: bs + 1],
         )
+    dst_metadata.scaling_seqlen = src_metata.scaling_seqlen
 
 
 class InferenceRankingGR(torch.nn.Module):
@@ -470,7 +472,6 @@ class InferenceRankingGR(torch.nn.Module):
         batch: Batch,
         user_ids: torch.Tensor,
         user_start_pos: torch.Tensor,
-        scaling_seqlen: int = -1,
     ):
         with torch.inference_mode():
             user_start_pos_cuda = user_start_pos.to(
@@ -504,7 +505,6 @@ class InferenceRankingGR(torch.nn.Module):
                     self._hidden_states,
                     self._jagged_metadata,
                     self._kvcache_metadata,
-                    scaling_seqlen,
                 )
                 jagged_data.values = hstu_output
             else:
@@ -518,7 +518,6 @@ class InferenceRankingGR(torch.nn.Module):
                     jagged_data.values,
                     jagged_data,
                     kvcache_metadata,
-                    scaling_seqlen,
                 )
                 jagged_data.values = hstu_output
 

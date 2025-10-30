@@ -584,12 +584,13 @@ def test_fused_hstu_op(
         "contextual_seqlen_offsets": length_to_complete_offsets(num_contextuals)
         if num_contextuals is not None
         else None,
+        "scaling_seqlen": scaling_seqlen,
     }
     jd = JaggedData(values=ref_input, **ctor_nograd_dict)
     fp32_ref_jd = JaggedData(values=fp32_ref_input, **ctor_nograd_dict)
     # Float16Module converts output tensor object to fp32!, but here we return JaggedData object
-    ref_out = ref_hstu_layer(jd, scaling_seqlen)
-    fp32_ref_out = fp32_ref_hstu_layer(fp32_ref_jd, scaling_seqlen)
+    ref_out = ref_hstu_layer(jd)
+    fp32_ref_out = fp32_ref_hstu_layer(fp32_ref_jd)
 
     out = fused_hstu_op(
         input=input,

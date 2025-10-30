@@ -53,7 +53,6 @@ class HSTUBlock(MegatronModule):
         self,
         embeddings: Dict[str, JaggedTensor],
         batch: Union[RankingBatch, RetrievalBatch],
-        scaling_seqlen: int,
     ) -> Tuple[JaggedData, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
         Forward pass of the HSTUBlock.
@@ -78,7 +77,7 @@ class HSTUBlock(MegatronModule):
             else torch.zeros_like(seqlen_after_preprocessor)
         )
         for hstu_layer in self._attention_layers:
-            jd = hstu_layer(jd, scaling_seqlen)
+            jd = hstu_layer(jd)
         return self._postprocessor(jd), (
             seqlen_after_preprocessor.detach(),
             num_contextuals_after_preprocessor.detach(),

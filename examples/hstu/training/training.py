@@ -55,7 +55,7 @@ def evaluate(
         for i in range(max_eval_iters):
             eval_iter += 1
             reporting_loss, (_, logits, labels, _) = pipeline.progress(
-                iterated_eval_loader, trainer_args.scaling_seqlen
+                iterated_eval_loader
             )
             # metric module forward
             stateful_metric_module(logits, labels)
@@ -179,7 +179,7 @@ def train_with_pipeline(
                     logits,
                     labels,
                     (ddp_seqlen, ddp_num_contextual, ddp_num_candidate),
-                ) = pipeline.progress(batched_iterator, trainer_args.scaling_seqlen)
+                ) = pipeline.progress(batched_iterator)
                 ddp_seqlens.append(ddp_seqlen.view(-1))
                 ddp_num_contextuals.append(ddp_num_contextual.view(-1))
                 ddp_num_candidates.append(ddp_num_candidate.view(-1))

@@ -5,8 +5,6 @@ TrainerArgs.eval_interval = 10
 TrainerArgs.log_interval = 10
 TrainerArgs.max_train_iters = 550
 
-TrainerArgs.scaling_seqlen = 2560
-
 DatasetArgs.dataset_name = 'kuairand-1k'
 DatasetArgs.max_sequence_length = 4096
 DatasetArgs.max_num_candidates = 100

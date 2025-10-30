@@ -176,6 +176,7 @@ class InferenceHSTUConfig:
     position_encoding_config: Optional[PositionEncodingConfig] = None
     hstu_preprocessing_config: Optional[HSTUPreprocessingConfig] = None
     contextual_max_seqlen: int = 0
+    scaling_seqlen: int = -1
 
     def __post_init__(self):
         assert self.is_causal
@@ -195,6 +196,7 @@ def get_inference_hstu_config(
     target_group_size: int = 1,
     position_encoding_config: Optional[PositionEncodingConfig] = None,
     contextual_max_seqlen: int = 0,
+    scaling_seqlen: int = -1,
 ) -> InferenceHSTUConfig:
     """
     Create the HSTU configuration.
@@ -231,6 +233,7 @@ def get_inference_hstu_config(
         target_group_size=target_group_size,
         position_encoding_config=position_encoding_config,
         contextual_max_seqlen=contextual_max_seqlen,
+        scaling_seqlen=scaling_seqlen,
     )
 
 
