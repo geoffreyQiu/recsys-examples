@@ -26,8 +26,6 @@ from configs import (
     get_kvcache_metadata_buffer,
 )
 from dataset.utils import Batch
-from modules.gpu_kv_cache_manager import HSTUGpuKVCacheManager
-from modules.host_kv_storage_manager import HSTUHostKVStorageManager
 from modules.hstu_block_inference import HSTUBlockInference
 from modules.inference_embedding import InferenceEmbedding
 from modules.jagged_data import JaggedData
@@ -134,11 +132,6 @@ class InferenceRankingGR(torch.nn.Module):
             ), "hstu layer hidden size should equal to embedding dim"
 
         self._embedding_collection = InferenceEmbedding(task_config.embedding_configs)
-
-        # self._gpu_kv_cache_manager = HSTUGpuKVCacheManager(hstu_config, kvcache_config)
-        # self._host_kv_storage_manager = HSTUHostKVStorageManager(
-        #     hstu_config, kvcache_config
-        # )
 
         self._hstu_block = HSTUBlockInference(hstu_config, kvcache_config)
         self._mlp = MLP(
