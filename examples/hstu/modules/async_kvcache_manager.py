@@ -54,14 +54,14 @@ class AsyncHSTUKVCacheManager:
             self.cache_table
         )
         self.host_kv_mgr = paged_kvcache_ops.HostKVStorageImpl(
-            self.num_layers, self.num_heads, self.head_dim, self.page_size, self.chunk_size
+            self.num_layers, self.num_heads, self.head_dim, self.page_size, self.chunk_size, self.gpu_kvcache_mgr
         )
 
         self.static_page_ids_gpu_buffer = torch.empty([self.max_batch_size * self.max_num_pages_per_seq,], dtype=torch.int32).cuda()
         self.static_offload_page_ids_gpu_buffer = torch.empty([self.max_batch_size * self.max_num_pages_per_seq,], dtype=torch.int32).cuda()
         self.static_pinned_kv_buffer = torch.empty(
             [self.num_layers, self.max_batch_size * self.max_num_pages_per_seq, 2, self.page_size, self.num_heads, self.head_dim],
-            dtype=torch.bfloat16, pin_memory=False
+            dtype=torch.bfloat16, pin_memory=True
         )
         self.static_onload_handle = paged_kvcache_ops.KVOnloadHandle(self.num_layers)
 
@@ -83,7 +83,7 @@ class AsyncHSTUKVCacheManager:
             print(origin_cached_lengths)
 
         offload_uids_buffer = torch.empty([batch_size,], dtype=torch.int64)
-        metadata_host_buffer = torch.empty([batch_size * 7 + 7,], dtype=torch.int)
+        metadata_host_buffer = torch.empty([batch_size * 7 + 7,], dtype=torch.int, pin_memory=True)
         metadata_gpu_buffer = torch.empty([batch_size * 5 + 4 + new_tokens * 2,], dtype=torch.int, device = torch.cuda.current_device())
 
         kvcache_metadata_fut = self.executor.submit(paged_kvcache_ops.prepare_kvcache, 
@@ -94,9 +94,7 @@ class AsyncHSTUKVCacheManager:
             metadata_host_buffer, metadata_gpu_buffer)
         onload_fut = self.onload_worker.submit(paged_kvcache_ops.onload_kvcache, 
             self.gpu_kvcache_mgr, self.host_kv_mgr, 
-            user_ids, 
-            [ static_pinned_kv_buffer[layer_idx] for layer_idx in range(self.num_layers) ],
-            static_onload_handle)
+            user_ids, static_onload_handle)
 
         return origin_cached_lengths, new_tokens, offload_uids_buffer, metadata_host_buffer, metadata_gpu_buffer, kvcache_metadata_fut, onload_fut
     
@@ -124,33 +122,40 @@ class AsyncHSTUKVCacheManager:
             metadata_gpu_buffer,
             static_onload_handle)
     
-    def finalize_kvcache(self, kvcache_metadata):
+    def onload_kvcache_finalize(self, user_ids):
+        paged_kvcache_ops.onload_kvcache_finalize(self.gpu_kvcache_mgr, self.host_kv_mgr, user_ids)
+
+    def offload_kvcache_init(self, kvcache_metadata):
         num_offload_pages = len(kvcache_metadata.offload_page_ids)
         if num_offload_pages == 0:
-            return
+            return None
         
-        gather_kv_gpu_buffer = torch.empty(
+        kvcache_metadata.gather_kv_gpu_buffer = torch.empty(
             [self.num_layers * num_offload_pages, 2, self.page_size, self.num_heads, self.head_dim],
             dtype = torch.bfloat16, device = torch.cuda.current_device(),
         )
-        # self.pinned_input_kvdata = torch.empty(
-        #     [self.num_layers * num_offload_pages, 2, self.page_size, self.num_heads, self.head_dim],
-        #     dtype = torch.bfloat16, pin_memory = True,
-        # )
 
-        fut = self.offload_worker.submit(paged_kvcache_ops.offload_kvcache, 
-            self.gpu_kvcache_mgr, self.host_kv_mgr,
+        paged_kvcache_ops.offload_kvcache_init(self.host_kv_mgr, num_offload_pages)
+
+    def offload_kvcache_launch(self, kvcache_metadata):
+        num_offload_pages = len(kvcache_metadata.offload_page_ids)
+        if num_offload_pages == 0:
+            return None
+        
+        kvcache_metadata.gather_kv_gpu_buffer = torch.empty(
+            [self.num_layers * num_offload_pages, 2, self.page_size, self.num_heads, self.head_dim],
+            dtype = torch.bfloat16, device = torch.cuda.current_device(),
+        )
+
+        paged_kvcache_ops.offload_kvcache_launch(
+            self.host_kv_mgr,
             kvcache_metadata.kv_offload_handle,
             kvcache_metadata.offload_user_ids,
             kvcache_metadata.offload_page_ids,
-            gather_kv_gpu_buffer,
-            # self.pinned_input_kvdata,
+            kvcache_metadata.gather_kv_gpu_buffer,
             kvcache_metadata.new_offload_startpos,
             kvcache_metadata.new_offload_lengths,
         )
-        
-        # fut.add_done_callback(offload_callback)
-
 
     def get_kvcache_metadata_from_buffer(self, 
         batch_size,

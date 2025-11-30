@@ -537,10 +537,11 @@ class InferenceRankingGR(torch.nn.Module):
     ):
         with torch.inference_mode():
             # print("[DEBUG] total_history_lengths", total_history_lengths)
+            user_ids_list = user_ids.tolist()
 
             prepare_kvcache_result = self.async_kvcache.prepare_kvcache_async(
                 batch.batch_size,
-                user_ids.tolist(),
+                user_ids_list,
                 total_history_lengths.tolist(),
                 self.async_kvcache.static_page_ids_gpu_buffer,
                 self.async_kvcache.static_offload_page_ids_gpu_buffer,
@@ -586,6 +587,8 @@ class InferenceRankingGR(torch.nn.Module):
                 metadata_gpu_buffer,
                 self.async_kvcache.static_onload_handle,
             )
+
+            self.async_kvcache.offload_kvcache_init(kvcache_metadata)
             # print("[DEBUG] kv_indices", kvcache_metadata.kv_indices)
             # print("[DEBUG] kv_indptr", kvcache_metadata.kv_indptr)
             # print("[DEBUG] kv_last_page_len", kvcache_metadata.kv_last_page_len)
@@ -631,10 +634,12 @@ class InferenceRankingGR(torch.nn.Module):
             jagged_data.values = hstu_output
 
             kvcache_metadata.kv_offload_handle.record_ready()
-            fut = self.async_kvcache.finalize_kvcache(kvcache_metadata)
+            self.async_kvcache.offload_kvcache_launch(kvcache_metadata)
 
             jagged_data = self._hstu_block._postprocessor(jagged_data)
             jagged_item_logit = self._mlp(jagged_data.values)
+
+            self.async_kvcache.onload_kvcache_finalize(user_ids_list)
 
         return jagged_item_logit
     
