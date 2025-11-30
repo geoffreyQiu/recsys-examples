@@ -36,6 +36,16 @@
 #include <unordered_map>
 #include <vector>
 
+#define cudaCheck(ans) { cudaSuccesAssert((ans), __FILE__, __LINE__); }
+inline void cudaSuccesAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess) 
+   {
+      fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+    //   if (abort) exit(code);
+   }
+}
+
 template <typename DType, typename IdType>
 cudaError_t AppendPagedKVCache(DType* k_data,
                                DType* v_data,
@@ -272,99 +282,45 @@ void gather_paged_kv_cache_all_layers(uint16_t *gather_kv_gpu_buffer,
 
 namespace kvcache {
 
-class HostKVStorageImpl
-{
+class KVOnloadHandle {
 public:
-    HostKVStorageImpl(
-        int num_layers,
-        int num_kv_heads,
-        int kv_headdim,
-        int num_tokens_per_page,
-        int64_t num_tokens_per_chunk)
-        : num_layers(num_layers)
-        , num_kv_heads(num_kv_heads)
-        , kv_headdim(kv_headdim)
-        , page_size(num_tokens_per_page)
-        , chunk_size(num_tokens_per_chunk)
-        , _uid_to_chunk_id(num_layers, std::unordered_map<int64_t, std::vector<uintptr_t>>())
-    {
-        this->chunk_numel = num_tokens_per_chunk * 2 * num_kv_heads * kv_headdim;
-        this->page_numel = 2 * page_size * num_kv_heads * kv_headdim;
-        this->per_token_numel = 2 * num_kv_heads * kv_headdim;
-    };
-
-    int64_t get_kvdata_length(int64_t user_id) {
-        auto it = _uid_to_length.find(user_id);
-        if (it ==  _uid_to_length.end()) return 0;
-        return it->second;
-    };
-
-    void append_kvdata(int64_t user_id, int64_t start_position, int64_t length, uint16_t *pinned_input_ptr, size_t gather_layer_stride) {
-        assert(length % this->chunk_size == 0);
-        if (start_position != 0) {
-            assert(_uid_to_length[user_id] == start_position);
-        }
-        else {
-            assert(_uid_to_length.find(user_id) == _uid_to_length.end());
-            for (int layer_idx = 0; layer_idx < num_layers; layer_idx++)
-                _uid_to_chunk_id[layer_idx][user_id] = std::vector<uintptr_t>();
-            _uid_to_mempool[user_id] = std::vector<uintptr_t>();
-        }
-
-        size_t num_chunks = length / chunk_size;
-        size_t num_elem = length * per_token_numel;
-        size_t kvdata_size = num_elem * sizeof(uint16_t);
-
-        std::vector<std::thread> tp;
-        for (int layer_idx = 0; layer_idx < num_layers; layer_idx++) {
-            uint16_t* src_ptr = pinned_input_ptr + layer_idx * gather_layer_stride;
-            uint16_t* dst_ptr = new uint16_t[num_elem];
-            tp.push_back(std::thread([src_ptr, dst_ptr, kvdata_size]() -> void {
-                std::memcpy(dst_ptr, src_ptr, kvdata_size);
-            }));
-            
-            for (size_t chunk_idx = 0; chunk_idx < num_chunks; chunk_idx ++) {
-                _uid_to_chunk_id[layer_idx][user_id].push_back(reinterpret_cast<uintptr_t>(dst_ptr + chunk_idx * this->chunk_numel));
-            }
-
-            _uid_to_mempool[user_id].push_back(reinterpret_cast<uintptr_t>(dst_ptr));
-        }
-        _uid_to_length[user_id] = start_position + length;
-        for (auto& t : tp) t.join();
-    };
-
-    void get_kvdata(int64_t user_id, int64_t length, int64_t layer_idx, uint16_t* pinned_output_buffer) {
-        // int64_t offloaded_length = get_kvdata_length(user_id);
-        // assert(offloaded_length >= length);
-        if (length == 0) {
-            return;
-        }
-        // assert(length % this->chunk_size == 0);
-        size_t num_chunks = length / chunk_size;
-        const size_t chunk_bytesize = this->chunk_numel * sizeof(uint16_t);
-        const auto &chunk_ptr_list = _uid_to_chunk_id[layer_idx][user_id];
-        // assert(chunk_ptr_list.size() >= num_chunks);
-        for (size_t chunk_idx = 0; chunk_idx < num_chunks; chunk_idx ++) {
-            uint16_t* src_ptr = reinterpret_cast<uint16_t*>(chunk_ptr_list[chunk_idx]);
-            std::memcpy(pinned_output_buffer + chunk_idx * this->chunk_numel, src_ptr, chunk_bytesize);
+    KVOnloadHandle(
+        int num_layers
+    ): event(std::vector<cudaEvent_t>(num_layers)) {
+        for (int layer_idx = 0; layer_idx < num_layers; layer_idx ++) {
+            cudaEventCreate(&event[layer_idx]);
         }
     };
+
+    void record(int layer_idx, cudaStream_t stream) {
+        cudaEventRecord(event[layer_idx], stream);
+    };
+
+    void wait(int layer_idx) {
+        auto stream = at::cuda::getCurrentCUDAStream();
+        cudaStreamWaitEvent(stream, event[layer_idx], 0);
+    }
+
+    void wait_all(void);
+public:
+    std::vector<cudaEvent_t> event;
+};
+
+class KVOffloadHandle {
+public:
+
+void record_ready(void) {
+        auto stream = at::cuda::getCurrentCUDAStream();
+        cudaEventCreate(&ready_event);
+        cudaEventRecord(ready_event, stream);
+    };
+
+    // void wait_ready(cudaStream_t stream) {
+    //     cudaStreamWaitEvent(stream, ready_event);
+    // };
 
 public:
-    std::vector<std::unordered_map<int64_t, std::vector<uintptr_t>>> _uid_to_chunk_id;
-    std::unordered_map<int64_t, int64_t> _uid_to_length;
-    std::unordered_map<int64_t, std::vector<uintptr_t>> _uid_to_mempool;
-
-    const int num_layers;
-    const int num_kv_heads;
-    const int kv_headdim;
-    const int page_size;
-
-    const int64_t chunk_size;
-    size_t chunk_numel;
-    size_t page_numel;
-    size_t per_token_numel;
-    size_t layer_numel;
+    cudaEvent_t ready_event;
 };
 
 class GPUKVCacheMangerImpl
@@ -381,7 +337,7 @@ public:
         int num_tokens_per_chunk,
         int max_num_sequences,
         int max_sequence_length,
-        at::Tensor cache_table)
+        at::Tensor cache_table_tensor)
      : num_layers(num_layers)
      , num_kv_heads(num_kv_heads)
      , kv_headdim(kv_headdim)
@@ -392,8 +348,11 @@ public:
      , num_tokens_per_chunk(num_tokens_per_chunk)
      , max_num_sequences(max_num_sequences)
      , max_sequence_length(max_sequence_length)
-     , cache_table(static_cast<uint16_t*>(cache_table.data_ptr()))
+     , cache_table(static_cast<uint16_t*>(cache_table_tensor.data_ptr()))
+     , device(cache_table_tensor.device())
     {
+        const c10::cuda::OptionalCUDAGuard device_guard(this->device);
+
         for (int page_id = 0; page_id < num_primary_cache_pages; page_id++)
             _empty_pages.push(page_id);
     
@@ -455,9 +414,9 @@ public:
         }
 
         std::vector<int32_t>& page_ids = _uid_to_page_id[uid];
-        for (auto pid : page_ids) {
-            // std::cout << " - " << pid << std::endl;
-        }
+        // for (auto pid : page_ids) {
+        //     // std::cout << " - " << pid << std::endl;
+        // }
         for (int i = 0; i < num_append_pages; i++) {
             page_ids.push_back(_empty_pages.front());
             _empty_pages.pop();
@@ -500,6 +459,20 @@ public:
             _uid_to_paged_cache_startpos.erase(uid);
             _uid_to_paged_cache_length.erase(uid);
         // }
+    };
+
+    void evict_all()
+    {
+        std::queue<int64_t> empty_pages;
+        std::swap(_empty_pages, empty_pages);
+        _lru_list.clear();
+        _lru_lookup_table.clear();
+        _uid_to_page_id.clear();
+        _uid_to_paged_cache_startpos.clear();
+        _uid_to_paged_cache_length.clear();
+
+        for (int page_id = 0; page_id < this->num_primary_cache_pages; page_id++)
+            _empty_pages.push(page_id);
     };
 
     void invalid(int64_t uid) {
@@ -572,56 +545,299 @@ public:
 
 public:
     uint16_t *cache_table;
+    c10::Device device;
 };
 
-class KVOnloadHandle {
+class HostKVStorageImpl
+{
 public:
-    KVOnloadHandle(
-        int num_layers
-    ): event(std::vector<cudaEvent_t>(num_layers)) {
-        for (int layer_idx = 0; layer_idx < num_layers; layer_idx ++) {
-            cudaEventCreate(&event[layer_idx]);
+    HostKVStorageImpl(
+        int num_layers,
+        int num_kv_heads,
+        int kv_headdim,
+        int num_tokens_per_page,
+        int64_t num_tokens_per_chunk,
+        GPUKVCacheMangerImpl& gpu_kvcache_mgr
+    )
+        : num_layers(num_layers)
+        , num_kv_heads(num_kv_heads)
+        , kv_headdim(kv_headdim)
+        , page_size(num_tokens_per_page)
+        , chunk_size(num_tokens_per_chunk)
+        , _uid_to_chunk_id(num_layers, std::unordered_map<int64_t, std::vector<uintptr_t>>())
+    {
+        this->chunk_numel = num_tokens_per_chunk * 2 * num_kv_heads * kv_headdim;
+        this->page_numel = 2 * page_size * num_kv_heads * kv_headdim;
+        this->per_token_numel = 2 * num_kv_heads * kv_headdim;
+
+        this->gpu_kvcache_mgr = &gpu_kvcache_mgr;
+
+        this->terminate_ = false;
+        this->busy_.store(false);
+        this->offload_worker = std::thread(&HostKVStorageImpl::offload_kvcache_worker_loop, this);
+    };
+
+    ~HostKVStorageImpl()
+    {
+        {
+            std::unique_lock<std::mutex> lock1(offload_init_mutex_);
+            std::unique_lock<std::mutex> lock2(offload_task_mutex_);
+            this->terminate_ = true;
+        }
+        offload_init_cv_.notify_all();
+        offload_task_cv_.notify_all();
+        this->offload_worker.join();
+    }
+
+    int64_t get_kvdata_length(int64_t user_id) {
+        auto it = _uid_to_length.find(user_id);
+        if (it ==  _uid_to_length.end()) return 0;
+        return it->second;
+    };
+
+    // void append_kvdata(int64_t user_id, int64_t start_position, int64_t length, uint16_t *pinned_input_ptr, size_t gather_layer_stride) {
+    //     assert(length % this->chunk_size == 0);
+    //     if (start_position != 0) {
+    //         assert(_uid_to_length[user_id] == start_position);
+    //     }
+    //     else {
+    //         assert(_uid_to_length.find(user_id) == _uid_to_length.end());
+    //         for (int layer_idx = 0; layer_idx < num_layers; layer_idx++)
+    //             _uid_to_chunk_id[layer_idx][user_id] = std::vector<uintptr_t>();
+    //         _uid_to_mempool[user_id] = std::vector<uintptr_t>();
+    //     }
+
+    //     size_t num_chunks = length / chunk_size;
+    //     size_t num_elem = length * per_token_numel;
+    //     size_t kvdata_size = num_elem * sizeof(uint16_t);
+
+    //     std::vector<std::thread> tp;
+    //     for (int layer_idx = 0; layer_idx < num_layers; layer_idx++) {
+    //         uint16_t* src_ptr = pinned_input_ptr + layer_idx * gather_layer_stride;
+    //         uint16_t* dst_ptr = new uint16_t[num_elem];
+    //         tp.push_back(std::thread([src_ptr, dst_ptr, kvdata_size]() -> void {
+    //             std::memcpy(dst_ptr, src_ptr, kvdata_size);
+    //         }));
+            
+    //         for (size_t chunk_idx = 0; chunk_idx < num_chunks; chunk_idx ++) {
+    //             _uid_to_chunk_id[layer_idx][user_id].push_back(reinterpret_cast<uintptr_t>(dst_ptr + chunk_idx * this->chunk_numel));
+    //         }
+
+    //         _uid_to_mempool[user_id].push_back(reinterpret_cast<uintptr_t>(dst_ptr));
+    //     }
+    //     _uid_to_length[user_id] = start_position + length;
+    //     for (auto& t : tp) t.join();
+    // };
+
+    void append_kvdata_v2(int64_t user_id, int64_t start_position, int64_t length, uint16_t *pinned_input_ptr, size_t gather_layer_stride) {
+        assert(length % this->chunk_size == 0);
+        if (start_position != 0) {
+            assert(_uid_to_length[user_id] == start_position);
+        }
+        else {
+            assert(_uid_to_length.find(user_id) == _uid_to_length.end());
+            for (int layer_idx = 0; layer_idx < num_layers; layer_idx++)
+                _uid_to_chunk_id[layer_idx][user_id] = std::vector<uintptr_t>();
+            _uid_to_mempool[user_id] = std::vector<uintptr_t>();
+        }
+
+        size_t num_chunks = length / chunk_size;
+        size_t num_elem = length * per_token_numel;
+        size_t kvdata_size = num_elem * sizeof(uint16_t);
+
+        for (int layer_idx = 0; layer_idx < num_layers; layer_idx++) {
+            uint16_t* src_ptr = pinned_input_ptr + layer_idx * gather_layer_stride;
+            
+            for (size_t chunk_idx = 0; chunk_idx < num_chunks; chunk_idx ++) {
+                _uid_to_chunk_id[layer_idx][user_id].push_back(reinterpret_cast<uintptr_t>(src_ptr + chunk_idx * this->chunk_numel));
+            }
+
+            _uid_to_mempool[user_id].push_back(reinterpret_cast<uintptr_t>(src_ptr));
+        }
+        _uid_to_length[user_id] = start_position + length;
+    };
+
+    void offload_kvcache_worker_loop()
+    {
+        GPUKVCacheMangerImpl& gpu_mgr = *(this->gpu_kvcache_mgr);
+        const c10::cuda::OptionalCUDAGuard device_guard(gpu_mgr.device);
+
+        while (true) {
+            
+            int num_offload_pages;
+            {
+                std::unique_lock<std::mutex> lock(offload_init_mutex_);
+                offload_init_cv_.wait(lock, [this] {
+                    return !offload_init_queue.empty() || this->terminate_;
+                });
+                if (this->terminate_) {
+                    return;
+                }
+                num_offload_pages = offload_init_queue.front();
+                offload_init_queue.pop();
+            }
+
+            // size_t num_offload_pages = offload_page_ids.numel();
+            if (num_offload_pages == 0) return;
+            size_t gather_layer_stride = num_offload_pages * gpu_mgr.page_stride;
+
+            // allocation
+            uint16_t *pinned_input_kvdata_ptr;
+            size_t pinned_bytes = gpu_mgr.num_layers * gather_layer_stride * sizeof(uint16_t);
+            pinned_input_kvdata_ptr = static_cast<uint16_t *>(aligned_alloc(sysconf(_SC_PAGESIZE), pinned_bytes));
+            
+            // lock pages
+            cudaHostRegister(pinned_input_kvdata_ptr, pinned_bytes, cudaHostRegisterPortable);
+
+            at::Tensor offload_user_ids, offload_page_ids, gather_kv_gpu_buffer, new_offload_startpos, new_offload_lengths;
+            cudaEvent_t offload_gpu_ready_event;
+            {
+                std::unique_lock<std::mutex> lock(offload_task_mutex_);
+                offload_task_cv_.wait(lock, [this] {
+                    return !offload_task_queue.empty() || this->terminate_;
+                });
+                if (this->terminate_) {
+                    return;
+                }
+
+                std::tie(
+                    offload_user_ids, offload_page_ids, gather_kv_gpu_buffer, new_offload_startpos, new_offload_lengths, offload_gpu_ready_event
+                ) = offload_task_queue.front();
+                offload_task_queue.pop();
+
+                this->busy_.store(true);
+            }
+            uint16_t *gather_kv_gpu_buffer_data_ptr = static_cast<uint16_t*>(gather_kv_gpu_buffer.data_ptr());
+
+            // std::cout << "offload kvcache start" << std::endl << std::flush;
+            cudaStreamWaitEvent(gpu_mgr.offload_stream, offload_gpu_ready_event);
+            cudaEventDestroy(offload_gpu_ready_event);
+
+
+            // gather
+            gather_paged_kv_cache_all_layers(
+                gather_kv_gpu_buffer_data_ptr,
+                gpu_mgr.get_cache_table(),
+                static_cast<int*>(offload_page_ids.data_ptr()),
+                gpu_mgr.num_layers,
+                gather_layer_stride,
+                gpu_mgr.layer_stride,
+                gpu_mgr.num_kv_heads,
+                gpu_mgr.kv_headdim,
+                gpu_mgr.num_tokens_per_page,
+                gpu_mgr.page_stride,
+                gpu_mgr.k2v_stride,
+                gpu_mgr.num_kv_heads * gpu_mgr.kv_headdim,
+                gpu_mgr.kv_headdim,
+                num_offload_pages,
+                gpu_mgr.offload_stream);
+            // release on gpu kvcache
+            // skipped
+        
+            // d2h
+            cudaMemcpyAsync(
+                pinned_input_kvdata_ptr,  // [#layers, #num_offload_page, 2, page_size, num_heads, headdim]
+                gather_kv_gpu_buffer_data_ptr, 
+                gpu_mgr.num_layers * gather_layer_stride * sizeof(uint16_t),
+                cudaMemcpyDeviceToHost, 
+                gpu_mgr.offload_stream);
+            cudaStreamSynchronize(gpu_mgr.offload_stream);
+
+            // bookkeepping int host kv storage
+            size_t page_offset = 0;
+            int* _offload_startpos = static_cast<int *>(new_offload_startpos.data_ptr());
+            int* _offload_lengths = static_cast<int *>(new_offload_lengths.data_ptr());
+
+            const int offload_batch_size = offload_user_ids.numel();
+            for (int seq_idx = 0; seq_idx < offload_batch_size; seq_idx++) {
+                int64_t uid = static_cast<int64_t*>(offload_user_ids.data_ptr())[seq_idx];
+                uint16_t *input_ptr = pinned_input_kvdata_ptr + page_offset * gpu_mgr.page_stride;
+                this->append_kvdata_v2(uid, _offload_startpos[seq_idx], _offload_lengths[seq_idx], input_ptr, gather_layer_stride);
+                gpu_mgr._uid_to_offloaded_length[uid] = _offload_startpos[seq_idx] + _offload_lengths[seq_idx];
+                page_offset += _offload_lengths[seq_idx] / gpu_mgr.num_tokens_per_page;
+            }
+
+            // unlock pages
+            cudaHostUnregister(pinned_input_kvdata_ptr);
+
+            this->busy_.store(false);
+            // std::cout << "offload kvcache end" << std::endl << std::flush;
+        }
+    }
+
+    void get_kvdata(int64_t user_id, int64_t length, int64_t layer_idx, uint16_t* pinned_output_buffer) {
+        // int64_t offloaded_length = get_kvdata_length(user_id);
+        // assert(offloaded_length >= length);
+        if (length == 0) {
+            return;
+        }
+        // assert(length % this->chunk_size == 0);
+        size_t num_chunks = length / chunk_size;
+        const size_t chunk_bytesize = this->chunk_numel * sizeof(uint16_t);
+        const auto &chunk_ptr_list = _uid_to_chunk_id[layer_idx][user_id];
+        // assert(chunk_ptr_list.size() >= num_chunks);
+        for (size_t chunk_idx = 0; chunk_idx < num_chunks; chunk_idx ++) {
+            uint16_t* src_ptr = reinterpret_cast<uint16_t*>(chunk_ptr_list[chunk_idx]);
+            std::memcpy(pinned_output_buffer + chunk_idx * this->chunk_numel, src_ptr, chunk_bytesize);
         }
     };
 
-    void record(int layer_idx, cudaStream_t stream) {
-        cudaEventRecord(event[layer_idx], stream);
+    std::vector<uint16_t*> get_kvdata_v2(int64_t user_id, int64_t length, int64_t layer_idx) {
+        // int64_t offloaded_length = get_kvdata_length(user_id);
+        // assert(offloaded_length >= length);
+
+        std::vector<uint16_t*> chunk_ptrs;
+        if (length == 0) {
+            return chunk_ptrs;
+        }
+        // assert(length % this->chunk_size == 0);
+        size_t num_chunks = length / chunk_size;
+        const size_t chunk_bytesize = this->chunk_numel * sizeof(uint16_t);
+        const auto &chunk_ptr_list = _uid_to_chunk_id[layer_idx][user_id];
+        // assert(chunk_ptr_list.size() >= num_chunks);
+        for (size_t chunk_idx = 0; chunk_idx < num_chunks; chunk_idx ++) {
+            uint16_t* src_ptr = reinterpret_cast<uint16_t*>(chunk_ptr_list[chunk_idx]);
+            chunk_ptrs.push_back(src_ptr);
+        }
+        return chunk_ptrs;
     };
 
-    void wait(int layer_idx) {
-        auto stream = at::cuda::getCurrentCUDAStream();
-        cudaStreamWaitEvent(stream, event[layer_idx], 0);
+    bool is_busy_offloading() {
+        return !offload_init_queue.empty() || !offload_task_queue.empty() || this->busy_.load();
     }
 
-    void wait_all(void);
 public:
-    std::vector<cudaEvent_t> event;
+    GPUKVCacheMangerImpl *gpu_kvcache_mgr;
+
+    std::vector<std::unordered_map<int64_t, std::vector<uintptr_t>>> _uid_to_chunk_id;
+    std::unordered_map<int64_t, int64_t> _uid_to_length;
+    std::unordered_map<int64_t, std::vector<uintptr_t>> _uid_to_mempool;
+
+    std::thread offload_worker;
+
+    std::queue<int> offload_init_queue;
+    std::mutex offload_init_mutex_;
+    std::condition_variable offload_init_cv_;
+
+    std::queue<std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, cudaEvent_t>> offload_task_queue;
+    std::mutex offload_task_mutex_;
+    std::condition_variable offload_task_cv_;
+
+    bool terminate_;
+    std::atomic<bool> busy_;
+
+    const int num_layers;
+    const int num_kv_heads;
+    const int kv_headdim;
+    const int page_size;
+
+    const int64_t chunk_size;
+    size_t chunk_numel;
+    size_t page_numel;
+    size_t per_token_numel;
+    size_t layer_numel;
 };
 
-class KVOffloadHandle {
-public:
-    KVOffloadHandle(void) {
-        cudaEventCreate(&ready_event);
-        // cudaEventCreate(&offload_event);
-    };
-
-    ~KVOffloadHandle() {
-        cudaEventDestroy(ready_event);
-    //     std::cout << "release KVOffloadHandle" << std::endl << std::flush;
-    };
-
-    void record_ready(void) {
-        auto stream = at::cuda::getCurrentCUDAStream();
-        cudaEventRecord(ready_event, stream);
-    };
-
-    void wait_ready(cudaStream_t stream) {
-        cudaStreamWaitEvent(stream, ready_event);
-    };
-
-public:
-    cudaEvent_t ready_event;
-};
 
 void prepare_kvcache(
     GPUKVCacheMangerImpl& gpu_mgr,
@@ -633,6 +849,9 @@ void prepare_kvcache(
     at::Tensor offload_uids_buffer,
     at::Tensor metadata_host_buffer,
     at::Tensor metadata_gpu_buffer) {
+
+    const c10::cuda::OptionalCUDAGuard device_guard(gpu_mgr.device);
+
     // std::cout << "prepare_kvcache start" << std::endl << std::flush;
 
     int batch_size = user_ids.size();
@@ -778,72 +997,121 @@ void onload_kvcache(
     // std::cout << "onload_kvcache end" << std::endl << std::flush;
 };
 
-void offload_kvcache(
+void onload_kvcache_v2(
     GPUKVCacheMangerImpl& gpu_mgr,
+    HostKVStorageImpl& host_mgr,
+    std::vector<int64_t>& user_ids, 
+    KVOnloadHandle& onloadhandle) {
+    const c10::cuda::OptionalCUDAGuard device_guard(gpu_mgr.device);
+
+    // std::cout << "onload_kvcache start" << std::endl << std::flush;
+    const int batch_size = user_ids.size();
+
+    std::vector<size_t> onload_length(batch_size);
+    std::vector<size_t> onload_offsets(batch_size + 1);
+    onload_offsets[0] = 0;
+    for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
+        auto uid = user_ids[seq_idx];
+        if (gpu_mgr._uid_to_paged_cache_startpos.find(uid) != gpu_mgr._uid_to_paged_cache_startpos.end())
+            onload_length[seq_idx] = gpu_mgr._uid_to_paged_cache_startpos[uid];
+        else if (gpu_mgr._uid_to_offloaded_length.find(uid) != gpu_mgr._uid_to_offloaded_length.end())
+            onload_length[seq_idx] = gpu_mgr._uid_to_offloaded_length[uid];
+        else
+            onload_length[seq_idx] = 0;
+
+        onload_offsets[seq_idx + 1] = onload_offsets[seq_idx] + onload_length[seq_idx];
+    }
+    size_t total_onload_length = onload_offsets[batch_size];
+    if (total_onload_length == 0) return;
+
+    for (int layer_idx = 0; layer_idx < gpu_mgr.num_layers; layer_idx++) {
+        uint16_t *gpu_onload_buffer = gpu_mgr.get_cache_table_by_layer(layer_idx) + gpu_mgr.num_primary_cache_pages * gpu_mgr.page_stride;
+
+        for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
+            std::vector<uint16_t *> chunk_ptrs = host_mgr.get_kvdata_v2(user_ids[seq_idx], onload_length[seq_idx], layer_idx);
+            for (int chunk_idx = 0; chunk_idx < chunk_ptrs.size() - 1; chunk_idx++) {
+                cudaHostRegister(chunk_ptrs[chunk_idx], host_mgr.chunk_numel * sizeof(uint16_t), cudaHostRegisterPortable);
+                cudaCheck(cudaMemcpyAsync(gpu_onload_buffer + onload_offsets[seq_idx] * gpu_mgr.per_token_kv_stride + chunk_idx * host_mgr.chunk_numel, 
+                    chunk_ptrs[chunk_idx], host_mgr.chunk_numel * sizeof(uint16_t), cudaMemcpyHostToDevice, gpu_mgr.onload_stream));
+            }
+            {
+                int chunk_idx = chunk_ptrs.size() - 1;
+                size_t last_chunk_numel = (onload_length[seq_idx] - chunk_idx * host_mgr.chunk_size) * host_mgr.per_token_numel;
+                cudaHostRegister(chunk_ptrs[chunk_idx], last_chunk_numel * sizeof(uint16_t), cudaHostRegisterPortable);
+                cudaCheck(cudaMemcpyAsync(gpu_onload_buffer + onload_offsets[seq_idx] * gpu_mgr.per_token_kv_stride + chunk_idx * host_mgr.chunk_numel, 
+                    chunk_ptrs[chunk_idx], last_chunk_numel * sizeof(uint16_t), cudaMemcpyHostToDevice, gpu_mgr.onload_stream));
+            }
+        }
+        onloadhandle.record(layer_idx, gpu_mgr.onload_stream);
+    }
+    // std::cout << "onload_kvcache end" << std::endl << std::flush;
+};
+
+void onload_kvcache_finalize(
+    GPUKVCacheMangerImpl& gpu_mgr,
+    HostKVStorageImpl& host_mgr,
+    std::vector<int64_t>& user_ids) {
+    const c10::cuda::OptionalCUDAGuard device_guard(gpu_mgr.device);
+
+    const int batch_size = user_ids.size();
+
+    std::vector<size_t> onload_length(batch_size);
+    size_t total_onload_length = 0;
+    for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
+        auto uid = user_ids[seq_idx];
+        if (gpu_mgr._uid_to_paged_cache_startpos.find(uid) != gpu_mgr._uid_to_paged_cache_startpos.end())
+            onload_length[seq_idx] = gpu_mgr._uid_to_paged_cache_startpos[uid];
+        else if (gpu_mgr._uid_to_offloaded_length.find(uid) != gpu_mgr._uid_to_offloaded_length.end())
+            onload_length[seq_idx] = gpu_mgr._uid_to_offloaded_length[uid];
+        else
+            onload_length[seq_idx] = 0;
+        total_onload_length += onload_length[seq_idx];
+    }
+    if (total_onload_length == 0) return;
+
+    for (int layer_idx = 0; layer_idx < host_mgr.num_layers; layer_idx++) {
+        for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
+            std::vector<uint16_t *> chunk_ptrs = host_mgr.get_kvdata_v2(user_ids[seq_idx], onload_length[seq_idx], layer_idx);
+            for (int chunk_idx = 0; chunk_idx < chunk_ptrs.size(); chunk_idx++) {
+                cudaHostUnregister(chunk_ptrs[chunk_idx]);
+            }
+        }
+    }
+};
+
+void offload_kvcache_init(
+    HostKVStorageImpl& host_mgr, 
+    int num_offload_pages)
+{
+    {
+        std::unique_lock<std::mutex> lock(host_mgr.offload_init_mutex_);
+        host_mgr.offload_init_queue.push(num_offload_pages);
+    }
+    host_mgr.offload_init_cv_.notify_one();
+};
+
+void offload_kvcache_launch(
     HostKVStorageImpl& host_mgr, 
     KVOffloadHandle& offload_handle,
-    // int num_offload_pages,
     at::Tensor offload_user_ids,      // host
     at::Tensor offload_page_ids,      // gpu
     at::Tensor gather_kv_gpu_buffer,  // gpu
-    // at::Tensor pinned_input_kvdata,   // host
     at::Tensor new_offload_startpos,  // host
     at::Tensor new_offload_lengths)   // host
 {
-    size_t num_offload_pages = offload_page_ids.numel();
-    if (num_offload_pages == 0) return;
-
-    // std::cout << "offload kvcache start" << std::endl << std::flush;
-    offload_handle.wait_ready(gpu_mgr.offload_stream);
-    size_t gather_layer_stride = num_offload_pages * gpu_mgr.page_stride;
-
-    // gather
-    gather_paged_kv_cache_all_layers(
-                          static_cast<uint16_t*>(gather_kv_gpu_buffer.data_ptr()),
-                          gpu_mgr.get_cache_table(),
-                          static_cast<int*>(offload_page_ids.data_ptr()),
-                          gpu_mgr.num_layers,
-                          gather_layer_stride,
-                          gpu_mgr.layer_stride,
-                          gpu_mgr.num_kv_heads,
-                          gpu_mgr.kv_headdim,
-                          gpu_mgr.num_tokens_per_page,
-                          gpu_mgr.page_stride,
-                          gpu_mgr.k2v_stride,
-                          gpu_mgr.num_kv_heads * gpu_mgr.kv_headdim,
-                          gpu_mgr.kv_headdim,
-                          num_offload_pages,
-                          gpu_mgr.offload_stream);
-    
-    uint16_t *pinned_input_kvdata_ptr;
-    cudaMallocHost((void**)(&pinned_input_kvdata_ptr), gpu_mgr.num_layers * gather_layer_stride * sizeof(uint16_t));
-    // d2h
-    cudaMemcpyAsync(
-        pinned_input_kvdata_ptr,  // [#layers, #num_offload_page, 2, page_size, num_heads, headdim]
-        gather_kv_gpu_buffer.data_ptr(), 
-        gpu_mgr.num_layers * gather_layer_stride * sizeof(uint16_t),
-        cudaMemcpyDeviceToHost, 
-        gpu_mgr.offload_stream);
-    cudaStreamSynchronize(gpu_mgr.offload_stream);
-    // std::cout << "offload kvcache gpu cache release" << std::endl << std::flush;
-
-    // append to host
-    const int batch_size = offload_user_ids.numel();
-    size_t page_offset = 0;
-    int* _offload_startpos = static_cast<int *>(new_offload_startpos.data_ptr());
-    int* _offload_lengths = static_cast<int *>(new_offload_lengths.data_ptr());
-    for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
-        int64_t uid = static_cast<int64_t*>(offload_user_ids.data_ptr())[seq_idx];
-        uint16_t *input_ptr = pinned_input_kvdata_ptr + page_offset * gpu_mgr.page_stride;
-        host_mgr.append_kvdata(uid, _offload_startpos[seq_idx], _offload_lengths[seq_idx], input_ptr, gather_layer_stride);
-        gpu_mgr._uid_to_offloaded_length[uid] = _offload_startpos[seq_idx] + _offload_lengths[seq_idx];
-        page_offset += _offload_lengths[seq_idx] / gpu_mgr.num_tokens_per_page;
+    {
+        std::unique_lock<std::mutex> lock(host_mgr.offload_task_mutex_);
+        host_mgr.offload_task_queue.push(std::make_tuple(
+            offload_user_ids, 
+            offload_page_ids, 
+            gather_kv_gpu_buffer, 
+            new_offload_startpos, 
+            new_offload_lengths, 
+            offload_handle.ready_event
+        ));
     }
-    cudaFreeHost(pinned_input_kvdata_ptr);
-
-    // std::cout << "offload kvcache end" << std::endl << std::flush;
-}
-
+    host_mgr.offload_task_cv_.notify_one();
+};
 
 }  // namespace kvcache
 
@@ -852,12 +1120,14 @@ PYBIND11_MODULE(paged_kvcache_ops, m) {
   m.def("gather_kvcache", &gather_paged_kv_cache, "gather paged kv cache on GPU", py::call_guard<py::gil_scoped_release>());
 
   py::class_<kvcache::HostKVStorageImpl>(m, "HostKVStorageImpl")
-    .def(py::init<int, int, int, int, int64_t>(), 
+    .def(py::init<int, int, int, int, int64_t, kvcache::GPUKVCacheMangerImpl&>(), 
          py::arg("num_layers"),
          py::arg("num_kv_heads"),
          py::arg("kv_headdim"),
          py::arg("num_tokens_per_page"),
-         py::arg("num_tokens_per_chunk"))
+         py::arg("num_tokens_per_chunk"),
+         py::arg("gpu_kvcache_mgr"))
+    .def("is_busy_offloading", &kvcache::HostKVStorageImpl::is_busy_offloading)
   ;
 
   py::class_<kvcache::GPUKVCacheMangerImpl>(m, "GPUKVCacheMangerImpl")
@@ -874,6 +1144,7 @@ PYBIND11_MODULE(paged_kvcache_ops, m) {
          py::arg("max_sequence_length"),
          py::arg("cache_table"))
     .def("get_total_cache_length", &kvcache::GPUKVCacheMangerImpl::get_total_cache_length)
+    .def("evict_all", &kvcache::GPUKVCacheMangerImpl::evict_all)
   ;
 
   py::class_<kvcache::KVOnloadHandle>(m, "KVOnloadHandle")
@@ -887,6 +1158,8 @@ PYBIND11_MODULE(paged_kvcache_ops, m) {
   ;
 
   m.def("prepare_kvcache", &kvcache::prepare_kvcache, "prepare_kvcache", py::call_guard<py::gil_scoped_release>());
-  m.def("onload_kvcache", &kvcache::onload_kvcache, "onload_kvcache", py::call_guard<py::gil_scoped_release>());
-  m.def("offload_kvcache", &kvcache::offload_kvcache, "offload_kvcache", py::call_guard<py::gil_scoped_release>());
+  m.def("onload_kvcache", &kvcache::onload_kvcache_v2, "onload_kvcache", py::call_guard<py::gil_scoped_release>());
+  m.def("onload_kvcache_finalize", &kvcache::onload_kvcache_finalize, "onload_kvcache_finalize", py::call_guard<py::gil_scoped_release>());
+  m.def("offload_kvcache_init", &kvcache::offload_kvcache_init, "offload_kvcache_init", py::call_guard<py::gil_scoped_release>());
+  m.def("offload_kvcache_launch", &kvcache::offload_kvcache_launch, "offload_kvcache_launch", py::call_guard<py::gil_scoped_release>());
 }
