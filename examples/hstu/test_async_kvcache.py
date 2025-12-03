@@ -51,19 +51,12 @@ def forward(
                 async_kvcache.static_onload_handle,
             )
 
-            async_kvcache.offload_kvcache_init(kvcache_metadata)
-
-            # kvcache_metadata.total_history_offsets += jagged_data.num_candidates_offsets
-            # kvcache_metadata.total_history_lengths += jagged_data.num_candidates
-            # kvcache_metadata.max_seqlen += jagged_data.max_num_candidates
-
             for layer_idx in range(async_kvcache.num_layers):
-                kvcache_metadata.kv_onload_handle.wait(layer_idx)
+                kvcache_metadata.kv_onload_handle.wait_host(layer_idx)
 
-            kvcache_metadata.kv_offload_handle.record_ready()
-            async_kvcache.offload_kvcache_launch(kvcache_metadata)
+            async_kvcache.offload_kvcache(kvcache_metadata)
 
-            async_kvcache.onload_kvcache_finalize(user_ids_list)
+            # async_kvcache.onload_kvcache_finalize(user_ids_list)
 
         return None
 
@@ -80,7 +73,7 @@ if __name__ == "__main__":
             "num_primary_cache_pages": 10240,
             "num_onload_buffer_pages": math.ceil(max_batch_size * max_seq_len / 32),
             "num_reserved_buffer_pages": 0,
-            "num_tokens_per_chunk": 1024,
+            "num_tokens_per_chunk": 2048,
             "max_num_sequences": -1,
             "max_sequence_length": max_seq_len,
             "max_batch_size": max_batch_size,
@@ -104,9 +97,11 @@ if __name__ == "__main__":
             user_ids = torch.tensor(user_ids, dtype=torch.int64)
             total_history_lengths = torch.tensor(total_history_lengths, dtype=torch.int32)
 
+            print("forward", init_user_ids[ind:ind+batch_size])
+
             forward(kvc_mgr, batch_size, user_ids, total_history_lengths)
         
-        while (kvc_mgr.host_kv_mgr.is_busy_offloading()):
+        while (kvc_mgr.gpu_kvcache_mgr.is_busy_offloading()):
             pass
 
         # torch.cuda.profiler.stop()
@@ -130,7 +125,7 @@ if __name__ == "__main__":
 
             forward(kvc_mgr, batch_size, user_ids, total_history_lengths)
         
-        while (kvc_mgr.host_kv_mgr.is_busy_offloading()):
+        while (kvc_mgr.gpu_kvcache_mgr.is_busy_offloading()):
             pass
 
         torch.cuda.profiler.stop()
