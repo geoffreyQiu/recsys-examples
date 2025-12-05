@@ -25,7 +25,7 @@ from dataset.random_inference_dataset import RandomInferenceDataGenerator
 from dataset.utils import FeatureConfig
 
 sys.path.append("./model/")
-from inference_ranking_gr import InferenceRankingGR
+from inference_ranking_gr import get_inference_ranking_gr
 
 
 def run_ranking_gr_inference():
@@ -104,7 +104,7 @@ def run_ranking_gr_inference():
     )
 
     with torch.inference_mode():
-        model_predict = InferenceRankingGR(
+        model_predict = get_inference_ranking_gr(
             hstu_config=hstu_config,
             kvcache_config=kv_cache_config,
             task_config=task_config,

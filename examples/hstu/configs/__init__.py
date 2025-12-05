@@ -11,7 +11,6 @@ from .inference_config import (
     EmbeddingBackend,
     InferenceEmbeddingConfig,
     InferenceHSTUConfig,
-    InferenceMode,
     KVCacheConfig,
     KVCacheMetadata,
     copy_kvcache_metadata,
@@ -49,6 +48,5 @@ __all__ = [
     "EmbeddingBackend",
     "InferenceEmbeddingConfig",
     "InferenceHSTUConfig",
-    "InferenceMode",
     "get_inference_hstu_config",
 ]
