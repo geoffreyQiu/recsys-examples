@@ -14,7 +14,6 @@
 # limitations under the License.
 import itertools
 import math
-import sys
 from typing import List
 
 import torch
@@ -27,10 +26,8 @@ from configs import (
     get_kvcache_config,
 )
 from dataset.utils import FeatureConfig
+from modules.inference_dense_module import InferenceDenseModule, copy_jagged_metadata
 from modules.jagged_data import JaggedData
-
-sys.path.append("./model/")
-from inference_ranking_gr import InferenceRankingGR, copy_jagged_metadata
 
 _item_fea_name = "item_feat"
 _item_vocab_size = 10000
@@ -127,7 +124,7 @@ def benchmark_model(
         prediction_head_arch=[128, 10, 1],
         num_tasks=num_tasks,
     )
-    bench_model = InferenceRankingGR(
+    bench_model = InferenceDenseModule(
         hstu_config=hstu_config,
         kvcache_config=kv_cache_config,
         task_config=task_config,

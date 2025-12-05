@@ -26,7 +26,6 @@
 
 import json
 import math
-import sys
 
 import gin
 import torch
@@ -38,22 +37,15 @@ import torch
 import triton_python_backend_utils as pb_utils
 from configs import (
     InferenceEmbeddingConfig,
-    InferenceMode,
     PositionEncodingConfig,
     RankingConfig,
     get_inference_hstu_config,
 )
 from dataset.utils import Batch
-from preprocessor import get_common_preprocessors
+from module.inference_dense_module import get_inference_dense_model
 from torch.utils.dlpack import from_dlpack, to_dlpack
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from utils import DatasetArgs, NetworkArgs, RankingArgs
-
-# import threading
-
-
-sys.path.append("./model/")
-from inference_ranking_gr import InferenceRankingGR
 
 TRITON_STRING_TO_NUMPY = {
     "TYPE_BOOL": torch.bool,
@@ -163,19 +155,20 @@ def get_inference_dataset_and_embedding_configs(
     raise ValueError(f"dataset {dataset_args.dataset_name} is not supported")
 
 
-def get_inference_hstu_model(
-    emb_configs,
+def get_inference_dense_model_with_feature_names(
+    gin_config_file,
     max_batch_size,
-    num_contextual_features,
-    total_max_seqlen,
     checkpoint_dir,
-    use_kvcache,
+    use_kvcache=False,
 ):
+    gin.parse_config_file(self.gin_config_file)
+    dataset_args, emb_configs = get_inference_dataset_and_embedding_configs()
+    num_contextual_features = len(emb_configs) - 2
+    total_max_seqlen = dataset_args.max_sequence_length * 2 + num_contextual_features
+
     network_args = NetworkArgs()
     if network_args.dtype_str == "bfloat16":
         inference_dtype = torch.bfloat16
-    # elif network_args.dtype_str == "float16":
-    #     inference_dtype = torch.float16
     else:
         raise ValueError(
             f"Inference data type {network_args.dtype_str} is not supported"
@@ -215,13 +208,12 @@ def get_inference_hstu_model(
         "length_per_sequence": [128] + [i * 256 for i in range(1, 34)],
     }
 
-    model = InferenceRankingGR(
+    model = get_inference_dense_model(
         hstu_config=hstu_config,
         kvcache_config=None,
         task_config=task_config,
         use_cudagraph=True,
         cudagraph_configs=hstu_cudagraph_configs,
-        mode=InferenceMode.dense,
     )
     if hstu_config.bf16:
         model.bfloat16()
@@ -230,7 +222,7 @@ def get_inference_hstu_model(
     model.load_checkpoint(checkpoint_dir)
     model.eval()
 
-    return model
+    return model, feature_names
 
 
 def pack_batch_from_numpy_host_input(
@@ -312,31 +304,20 @@ class TritonPythonModel:
         # Convert Triton types to numpy types
         self.output_dtype = triton_string_to_torch_dtype(output_config["data_type"])
 
-        self.max_batch_size = get_hstu_max_batch_size_from_config(self.model_config)
         self.gin_config_file = get_hstu_gin_config_from_config(self.model_config)
+        self.max_batch_size = get_hstu_max_batch_size_from_config(self.model_config)
         self.checkpoint_dir = get_hstu_ckpt_dir_from_config(self.model_config)
-
-        gin.parse_config_file(self.gin_config_file)
-        dataset_args, emb_configs = get_inference_dataset_and_embedding_configs()
-        dataproc = get_common_preprocessors("")[dataset_args.dataset_name]
-        num_contextual_features = len(dataproc._contextual_feature_names)
-        total_max_seqlen = (
-            dataset_args.max_sequence_length * 2 + num_contextual_features
-        )
-        embedding_backend = NetworkArgs().embedding_backend
-        self.embedding_backend = (
-            EmbeddingBackend(embedding_backend) if embedding_backend else None
-        )
 
         # Instantiate the PyTorch model
         with torch.inference_mode():
-            self.hstu_model = get_inference_hstu_model(
-                emb_configs,
+            (
+                self.hstu_model,
+                self.feature_names,
+            ) = get_inference_dense_model_with_feature_names(
+                self.gin_config_file,
                 self.max_batch_size,
-                num_contextual_features,
-                total_max_seqlen,
                 self.checkpoint_dir,
-                False,
+                use_kvcache=False,
             )
 
     def execute(self, requests):
@@ -382,13 +363,9 @@ class TritonPythonModel:
                 tokens,
                 token_lengths,
                 num_candidates,
-                self.hstu_model._feature_names,
+                self.feature_names,
                 self._device,
             )
-
-            # if True: ## random
-            #     num_tokens = int(np.sum(token_lengths))
-            #     raw_embeddings = torch.randn((num_tokens, self.hstu_model._embedding_dim), dtype=torch.bfloat16, device=self._device)
 
             hstu_sparse_request = pb_utils.InferenceRequest(
                 model_name="hstu_sparse",
@@ -418,10 +395,7 @@ class TritonPythonModel:
 
             embeddings = pack_embeddings(hstu_batch, raw_embeddings[0])
 
-            jagged_item_logit = self.hstu_model.forward_dense(
-                hstu_batch,
-                embeddings,
-            )
+            jagged_item_logit = self.hstu_model.forward(hstu_batch, embeddings)
 
             inference_response = pb_utils.InferenceResponse(
                 output_tensors=[

@@ -179,13 +179,6 @@ class InferenceHSTUConfig:
         assert self.target_group_size == 1
 
 
-@unique
-class InferenceMode(Enum):
-    default = 0
-    sparse = 1
-    dense = 2
-
-
 def get_inference_hstu_config(
     hidden_size: int,
     num_layers: int,

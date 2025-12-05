@@ -37,7 +37,7 @@ from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from utils import DatasetArgs, NetworkArgs, RankingArgs
 
 sys.path.append("./model/")
-from inference_ranking_gr import InferenceRankingGR
+from inference_ranking_gr import get_inference_ranking_gr
 
 
 class RunningMode(enum.Enum):
@@ -182,7 +182,7 @@ def get_inference_hstu_model(
         "length_per_sequence": [128] + [i * 256 for i in range(1, 34)],
     }
 
-    model = InferenceRankingGR(
+    model = get_inference_ranking_gr(
         hstu_config=hstu_config,
         kvcache_config=kv_cache_config if use_kvcache else None,
         task_config=task_config,
@@ -231,9 +231,9 @@ def run_ranking_gr_simulate(
 
         if check_auc:
             eval_module = get_multi_event_metric_module(
-                num_classes=model._task_config.prediction_head_arch[-1],
-                num_tasks=model._task_config.num_tasks,
-                metric_types=model._task_config.eval_metrics,
+                num_classes=model.get_num_class(),
+                num_tasks=model.get_num_tasks(),
+                metric_types=model.get_metric_types(),
             )
 
         dataset = InferenceDataset(
@@ -382,9 +382,9 @@ def run_ranking_gr_evaluate(
         )
 
         eval_module = get_multi_event_metric_module(
-            num_classes=model._task_config.prediction_head_arch[-1],
-            num_tasks=model._task_config.num_tasks,
-            metric_types=model._task_config.eval_metrics,
+            num_classes=model.get_num_class(),
+            num_tasks=model.get_num_tasks(),
+            metric_types=model.get_metric_types(),
         )
 
         _, eval_dataset = get_dataset(
@@ -392,7 +392,7 @@ def run_ranking_gr_evaluate(
             dataset_path=dataset_args.dataset_path,
             max_sequence_length=dataset_args.max_sequence_length,
             max_num_candidates=dataset_args.max_num_candidates,
-            num_tasks=model._task_config.num_tasks,
+            num_tasks=model.get_num_tasks(),
             batch_size=max_batch_size,
             rank=0,
             world_size=1,
@@ -407,7 +407,7 @@ def run_ranking_gr_evaluate(
         while True:
             try:
                 batch = next(dataloader_iter)
-                if model._task_config.num_tasks > 0:
+                if model.get_num_tasks() > 0:
                     batch = strip_candidate_action_tokens(
                         batch, dataproc._action_feature_name
                     )

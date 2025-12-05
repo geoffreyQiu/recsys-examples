@@ -154,7 +154,7 @@ def run_ranking_gr_evaluate():
                     inputs[2].set_data_from_numpy(tokens)
                     inputs[3].set_data_from_numpy(num_candidates)
 
-                    outputs = [ httpclient.InferRequestedOutput("OUTPUT") ]
+                    outputs = [httpclient.InferRequestedOutput("OUTPUT")]
                     response = client.infer(
                         model_name, inputs, request_id=str(0), outputs=outputs
                     )
