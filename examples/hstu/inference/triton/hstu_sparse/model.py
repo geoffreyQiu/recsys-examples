@@ -35,7 +35,7 @@ import torch
 # and converting Triton input/output types to numpy types.
 import triton_python_backend_utils as pb_utils
 from configs import EmbeddingBackend, InferenceEmbeddingConfig
-from modules import get_inference_sparse_model
+from modules.inference_embedding import get_inference_sparse_model
 from torch.utils.dlpack import from_dlpack, to_dlpack
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from utils import DatasetArgs, NetworkArgs
@@ -149,43 +149,38 @@ def get_shared_inference_sparse_model(
     embedding_backend,
     checkpoint_dir,
 ):
-    network_args = NetworkArgs()
-    if network_args.dtype_str == "bfloat16":
-        torch.bfloat16
+    if embedding_backend == EmbeddingBackend.NVEMB:
+        from modules.nve_embeddingcollection import (
+            InferenceNVEEmbeddingCollection,
+            get_nve_local_ps,
+        )
+
+        models = []
+        sparse_shareables = {
+            config.table_name: get_nve_local_ps(0, config.dim, torch.float32)
+            for config in emb_configs
+            if config.use_dynamicemb
+        }
+        InferenceNVEEmbeddingCollection.load_checkpoint_into_ps(
+            sparse_shareables, checkpoint_dir
+        )
+
+        for dev_id in range(torch.cuda.device_count()):
+            torch.cuda.set_device(dev_id)
+            model = get_inference_sparse_model(
+                emb_configs,
+                embedding_backend=embedding_backend,
+                sparse_shareables=sparse_shareables,
+            )
+            model.load_checkpoint(checkpoint_dir)
+            model.eval()
+            models.append(model)
     else:
-        raise ValueError(
-            f"Inference data type {network_args.dtype_str} is not supported"
-        )
-
-    print("=====", embedding_backend, "=======")
-
-    models = []
-    sparse_shareables = None
-    for dev_id in range(torch.cuda.device_count()):
-        print("===== DEVICE ID", dev_id, "=====")
-        if dev_id == 0 and embedding_backend == EmbeddingBackend.NVEMB:
-            import pynve.nve as nve
-
-            sparse_shareables = {
-                config.table_name: nve.LinearMemBlock(
-                    config.dim, config.vocab_size, nve.DataType_t.Float16
-                )
-                for config in emb_configs
-                if config.use_dynamicemb
-            }
-
-        torch.cuda.set_device(dev_id)
-        model = get_inference_sparse_model(
-            emb_configs,
-            sparse_shareables=sparse_shareables,
-        )
+        model = get_inference_sparse_model(emb_configs)
         model.load_checkpoint(checkpoint_dir)
         model.eval()
 
-        models.append(model)
-
-        if embedding_backend != EmbeddingBackend.NVEMB:
-            break
+        models = [model]
 
     return models
 
@@ -234,7 +229,7 @@ class TritonPythonModel:
                 self.checkpoint_dir,
             )
 
-        self.feature_names = [ebc.table_name for ebc in emb_configs]
+        self.feature_names = [ebc.feature_names[0] for ebc in emb_configs]
 
     def execute(self, requests):
         """`execute` must be implemented in every Python model. `execute`

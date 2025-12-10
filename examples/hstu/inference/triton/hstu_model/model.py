@@ -36,13 +36,14 @@ import torch
 # and converting Triton input/output types to numpy types.
 import triton_python_backend_utils as pb_utils
 from configs import (
+    EmbeddingBackend,
     InferenceEmbeddingConfig,
     PositionEncodingConfig,
     RankingConfig,
     get_inference_hstu_config,
 )
 from dataset.utils import Batch
-from module.inference_dense_module import get_inference_dense_model
+from modules.inference_dense_module import get_inference_dense_model
 from torch.utils.dlpack import from_dlpack, to_dlpack
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from utils import DatasetArgs, NetworkArgs, RankingArgs
@@ -78,6 +79,21 @@ def get_hstu_gin_config_from_config(config):
 
 def get_hstu_ckpt_dir_from_config(config):
     return config["parameters"]["HSTU_CHECKPOINT_DIR"]["string_value"]
+
+
+def check_hstu_sparse_dense_model_instance_config(model_config):
+    assert "instance_group" in model_config, "No instance config found for HSTU model"
+
+    embedding_backend = NetworkArgs().embedding_backend
+    embedding_backend = (
+        EmbeddingBackend(embedding_backend) if embedding_backend else None
+    )
+    if embedding_backend != EmbeddingBackend.NVEMB:
+        conf_err_msg = "HSTU model only support 1 GPU instance when using DynamicEmb embedding backend"
+        assert len(model_config["instance_group"]) == 1, conf_err_msg
+        instance_group_conf = model_config["instance_group"][0]
+        assert "gpus" in instance_group_conf, conf_err_msg
+        assert len(instance_group_conf["gpus"]) == 1, conf_err_msg
 
 
 def get_inference_dataset_and_embedding_configs(
@@ -156,15 +172,14 @@ def get_inference_dataset_and_embedding_configs(
 
 
 def get_inference_dense_model_with_feature_names(
-    gin_config_file,
     max_batch_size,
     checkpoint_dir,
     use_kvcache=False,
 ):
-    gin.parse_config_file(self.gin_config_file)
     dataset_args, emb_configs = get_inference_dataset_and_embedding_configs()
     num_contextual_features = len(emb_configs) - 2
     total_max_seqlen = dataset_args.max_sequence_length * 2 + num_contextual_features
+    feature_names = [ebc.feature_names[0] for ebc in emb_configs]
 
     network_args = NetworkArgs()
     if network_args.dtype_str == "bfloat16":
@@ -295,30 +310,31 @@ class TritonPythonModel:
         """
 
         self.model_config = model_config = json.loads(args["model_config"])
+        self.gin_config_file = get_hstu_gin_config_from_config(self.model_config)
+        gin.parse_config_file(self.gin_config_file)
+
+        check_hstu_sparse_dense_model_instance_config(model_config)
         self._device = torch.device("cuda:" + args["model_instance_device_id"])
         torch.cuda.set_device(self._device)
+
+        # Instantiate the PyTorch model
+        self.max_batch_size = get_hstu_max_batch_size_from_config(self.model_config)
+        self.checkpoint_dir = get_hstu_ckpt_dir_from_config(self.model_config)
+        with torch.inference_mode():
+            (
+                self.hstu_model,
+                self.feature_names,
+            ) = get_inference_dense_model_with_feature_names(
+                self.max_batch_size,
+                self.checkpoint_dir,
+                use_kvcache=False,
+            )
 
         # Get OUTPUT configuration
         output_config = pb_utils.get_output_config_by_name(model_config, "OUTPUT")
 
         # Convert Triton types to numpy types
         self.output_dtype = triton_string_to_torch_dtype(output_config["data_type"])
-
-        self.gin_config_file = get_hstu_gin_config_from_config(self.model_config)
-        self.max_batch_size = get_hstu_max_batch_size_from_config(self.model_config)
-        self.checkpoint_dir = get_hstu_ckpt_dir_from_config(self.model_config)
-
-        # Instantiate the PyTorch model
-        with torch.inference_mode():
-            (
-                self.hstu_model,
-                self.feature_names,
-            ) = get_inference_dense_model_with_feature_names(
-                self.gin_config_file,
-                self.max_batch_size,
-                self.checkpoint_dir,
-                use_kvcache=False,
-            )
 
     def execute(self, requests):
         """`execute` must be implemented in every Python model. `execute`

@@ -122,6 +122,27 @@ class InferenceDynamicEmbeddingCollection(torch.nn.Module):
         self._features_split_sizes = features_split_size
         self._features_split_indices = features_split_indices
 
+    def load_checkpoint(self, checkpoint_dir):
+        if checkpoint_dir is None:
+            return
+
+        embedding_table_dir = os.path.join(
+            checkpoint_dir,
+            "dynamicemb_module",
+            "model._embedding_collection._model_parallel_embedding_collection",
+        )
+
+        try:
+            for idx, table_name in enumerate(self._embedding_tables.table_names):
+                self._embedding_tables.load(
+                    embedding_table_dir, optim=False, table_names=[table_name]
+                )
+        except ValueError as e:
+            warnings.warn(
+                f"FAILED TO LOAD dynamic embedding tables failed due to ValueError:\n\t{e}\n\n"
+                "Please check if the checkpoint is version 1. The loading of this old version is disabled."
+            )
+
     def forward(self, features: KeyedJaggedTensor) -> Dict[str, JaggedTensor]:
         with torch.no_grad():
             features_split = features.split(self._features_split_sizes)
@@ -235,7 +256,7 @@ class InferenceEmbedding(torch.nn.Module):
             use_static=False,
             ps=None,
             enable_cache=False,
-            gpu_cache_ratio=0.1,
+            gpu_cache_ratio=0.05,
             sparse_shareables=sparse_shareables,
         )
 
@@ -256,28 +277,17 @@ class InferenceEmbedding(torch.nn.Module):
             features_split_sizes, features_split_indices
         )
 
-    def load_checkpoint(self, checkpoint_dir, model_state_dict):
+    def load_checkpoint(self, checkpoint_dir, model_state_dict=None):
         if checkpoint_dir is None:
             return
 
-        embedding_table_dir = os.path.join(
-            checkpoint_dir,
-            "dynamicemb_module",
-            "model._embedding_collection._model_parallel_embedding_collection",
-        )
-        dynamic_tables = self._dynamic_embedding_collection._embedding_tables
+        self._dynamic_embedding_collection.load_checkpoint(checkpoint_dir)
 
-        try:
-            for idx, table_name in enumerate(dynamic_tables.table_names):
-                dynamic_tables.load(
-                    embedding_table_dir, optim=False, table_names=[table_name]
-                )
-        except ValueError as e:
-            warnings.warn(
-                f"FAILED TO LOAD dynamic embedding tables failed due to ValueError:\n\t{e}\n\n"
-                "Please check if the checkpoint is version 1. The loading of this old version is disabled."
+        if model_state_dict is None:
+            model_state_dict_path = os.path.join(
+                checkpoint_dir, "torch_module", "model.0.pth"
             )
-
+            model_state_dict = torch.load(model_state_dict_path)["model_state_dict"]
         self.load_state_dict(model_state_dict, strict=False)
 
     def load_state_dict(self, model_state_dict, *args, **kwargs):
@@ -306,9 +316,13 @@ class InferenceEmbedding(torch.nn.Module):
 
         unloaded_modules = super().load_state_dict(new_state_dict, *args, **kwargs)
 
-        assert unloaded_modules.missing_keys == [
-            "_dynamic_embedding_collection._embedding_tables._empty_tensor"
-        ]
+        if self.dynamic_emb_backend == EmbeddingBackend.DYNAMICEMB:
+            assert set(unloaded_modules.missing_keys) == set(
+                ["_dynamic_embedding_collection._embedding_tables._empty_tensor"]
+            )
+        elif self.dynamic_emb_backend == EmbeddingBackend.NVEMB:
+            for key in unloaded_modules.missing_keys:
+                assert key.startswith("_dynamic_embedding_collection.embeddings")
         assert unloaded_modules.unexpected_keys == []
 
     def get_features_splits(self, embedding_configs):
@@ -353,9 +367,12 @@ class InferenceEmbedding(torch.nn.Module):
 
 
 def get_inference_sparse_model(
-    embedding_configs: List[InferenceEmbeddingConfig], sparse_shareables=None
+    embedding_configs: List[InferenceEmbeddingConfig],
+    embedding_backend=None,
+    sparse_shareables=None,
 ):
     return InferenceEmbedding(
         embedding_configs,
+        embedding_backend,
         sparse_shareables,
     )
