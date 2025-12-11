@@ -77,7 +77,7 @@ def strip_padding_batch(batch, unpadded_batch_size):
     return batch
 
 
-def run_ranking_gr_evaluate():
+def run_ranking_gr_evaluate(use_train_dataset=False):
     dataset_args = get_dataset_configs()
 
     dataproc = get_common_preprocessors("")[dataset_args.dataset_name]
@@ -95,7 +95,7 @@ def run_ranking_gr_evaluate():
             metric_types=ranking_args.eval_metrics,
         )
 
-        _, eval_dataset = get_dataset(
+        train_dataset, eval_dataset = get_dataset(
             dataset_name=dataset_args.dataset_name,
             dataset_path=dataset_args.dataset_path,
             max_sequence_length=dataset_args.max_sequence_length,
@@ -109,7 +109,9 @@ def run_ranking_gr_evaluate():
             eval_batch_size=max_batch_size,
         )
 
-        dataloader = get_data_loader(dataset=eval_dataset)
+        dataloader = get_data_loader(
+            dataset=eval_dataset if not use_train_dataset else train_dataset
+        )
         dataloader_iter = iter(dataloader)
 
         with httpclient.InferenceServerClient("localhost:8000") as client:
@@ -179,8 +181,9 @@ def run_ranking_gr_evaluate():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Inference End-to-end Example")
     parser.add_argument("--gin_config_file", type=str, required=True)
+    parser.add_argument("--train_dataset", action="store_true")
 
     args = parser.parse_args()
     gin.parse_config_file(args.gin_config_file)
 
-    run_ranking_gr_evaluate()
+    run_ranking_gr_evaluate(use_train_dataset=args.train_dataset)
