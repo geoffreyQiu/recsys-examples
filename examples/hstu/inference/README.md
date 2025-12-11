@@ -23,6 +23,9 @@ We utilize the graph capture and replay support in Torch for convenient CUDA gra
 
 5. Serving HSTU model with Triton Server Python backend
 
+Currently we use the python backend to load and serve hstu models. The hstu model consists of two parts -- the sparse module and the dense module.
+The sparse module is served as one instance per node, in which we create a set of gpu embedding tables or caches for each gpu sharing the same PS on the local host node or remote. (NVEmbedding backend only. To get access to NVEmbedding project please contact us.)
+The dense module is served as one instance per GPU, and the KV cache is not supported for now.
 
 
 ## KVCache Manager for Inference
@@ -242,7 +245,7 @@ Within the client container:
 
 - Setup for NVEmbedding backend
 ```
-~/recsys-examples/examples/hstu$ echo "\nNetworkArgs.embedding_backend = 'NVEmb'" >> ./inference/configs/kuairand_1k_inference_ranking.gin
+~/recsys-examples/examples/hstu$ printf "\nNetworkArgs.embedding_backend = 'NVEmb'" >> ./inference/configs/kuairand_1k_inference_ranking.gin
 ~/recsys-examples/examples/hstu$ # note: The checkpoint from DynamicEmb needs conversion for NVEmbedding modules.
 ~/recsys-examples/examples/hstu$ TABLE_NAMES="user_id,video_id" && \
 python3 ./inference/convert_dynamicemb_ckpt_to_numpy.py \
@@ -265,7 +268,7 @@ python3 ./inference/convert_dynamicemb_ckpt_to_numpy.py \
     bash -cx inference/launch_triton_server.sh
 ```
 
-- Launch the hstu container and install triton client (showcase in the interacive model)
+- Launch the hstu container and install triton client (showcase in the interactive model)
 ```
 ~/recsys-examples$ docker run \
     --rm --shm-size 8G --cap-add SYS_NICE --net host \
@@ -282,14 +285,14 @@ python3 ./inference/convert_dynamicemb_ckpt_to_numpy.py \
 /workspace/recsys-examples/examples/hstu$ PYTHONPATH=${PYTHONPATH}:$(realpath ../) python3 ./inference/triton/hstu_model/client.py --gin_config_file ./inference/configs/kuairand_1k_inference_ranking.gin
 ...
 [eval]:
-    Metrics.task0.AUC: 0.556777
-    Metrics.task1.AUC: 0.801971
-    Metrics.task2.AUC: 0.599631
-    Metrics.task3.AUC: 0.666604
-    Metrics.task4.AUC: 0.558464
-    Metrics.task5.AUC: 0.577246
-    Metrics.task6.AUC: 0.620458
-    Metrics.task7.AUC: 0.556104
+    Metrics.task0.AUC: 0.568207
+    Metrics.task1.AUC: 0.746528
+    Metrics.task2.AUC: 0.618382
+    Metrics.task3.AUC: 0.645711
+    Metrics.task4.AUC: 0.529315
+    Metrics.task5.AUC: 0.592606
+    Metrics.task6.AUC: 0.581823
+    Metrics.task7.AUC: 0.556803
 ```
 
 Note: The NVEmbedding backend may provide different default embedding values for unseen tokens. Use the training_dataset for validation
