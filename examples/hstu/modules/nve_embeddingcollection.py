@@ -112,16 +112,16 @@ try:
                 return
 
             for table_name in ps_dict:
-                ps_dict[table_name].load_from_numpy_file(
+                ps_dict[table_name].load_from_file(
                     os.path.join(
                         checkpoint_dir,
                         "ps_module",
-                        f"{table_name}_emb_keys.rank_{rank}.world_size_{world_size}.npy",
+                        f"{table_name}_emb_keys.rank_{rank}.world_size_{world_size}.dyn",
                     ),
                     os.path.join(
                         checkpoint_dir,
                         "ps_module",
-                        f"{table_name}_emb_values.rank_{rank}.world_size_{world_size}.npy",
+                        f"{table_name}_emb_values.rank_{rank}.world_size_{world_size}.dyn",
                     ),
                 )
 

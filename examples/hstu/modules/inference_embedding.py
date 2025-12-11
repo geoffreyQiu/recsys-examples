@@ -75,6 +75,7 @@ def create_dynamic_embedding_tables(
             initializer_args=DynamicEmbInitializerArgs(
                 mode=DynamicEmbInitializerMode.NORMAL,
             ),
+            training=False,
         )
         for config in embedding_configs
     ]

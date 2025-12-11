@@ -536,8 +536,8 @@ class TestModule:
         self.num_heads = hstu_config.num_heads
         self.head_dim = hstu_config.head_dim
         self.dtype = torch.bfloat16
-        self.max_batchsize = self.kvcache_config.max_batch_size
-        self.max_len_per_seq = self.kvcache_config.max_seq_len
+        self.max_batchsize = hstu_config.max_batch_size
+        self.max_len_per_seq = hstu_config.max_seq_len
 
         self.hstu_block_inference = HSTUBlockInference(
             hstu_config, kvcache_config=self.kvcache_config

@@ -85,11 +85,3 @@ parameters [
     value: { string_value: "8" }
   }
 ]
-parameters [
-  {
-    key: "HSTU_CHECKPOINT_DIR"
-    value: {
-      string_value: "/home/junyiq/newscratch/kuairand_1k_ckpt_v2"
-    }
-  }
-]
