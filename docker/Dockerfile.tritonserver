@@ -64,8 +64,9 @@ COPY . .
 
 RUN cd /workspace/recsys-examples/corelib/dynamicemb && \
     python3 setup.py install
-    
-RUN cd /workspace/recsys-examples/corelib/hstu && \
+
+RUN pip3 uninstall -y hstu_attn hstu_hopper && \
+    cd /workspace/recsys-examples/corelib/hstu && \
     HSTU_DISABLE_86OR89=FALSE HSTU_DISABLE_ARBITRARY=TRUE HSTU_DISABLE_LOCAL=TRUE HSTU_DISABLE_RAB=TRUE HSTU_DISABLE_DRAB=TRUE pip install . && \
     cd hopper && \
     HSTU_DISABLE_ARBITRARY=TRUE HSTU_DISABLE_SM8x=TRUE HSTU_DISABLE_LOCAL=TRUE HSTU_DISABLE_RAB=TRUE HSTU_DISABLE_DELTA_Q=FALSE HSTU_DISABLE_DRAB=TRUE pip install .
