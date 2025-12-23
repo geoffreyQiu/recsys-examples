@@ -23,7 +23,11 @@ RUN ARCH=$([ "${TARGETPLATFORM}" = "linux/arm64" ] && echo "aarch64" || echo "x8
     if [ ${ARCH} = "aarch64" ]; then \
       ln -s /usr/local/cuda-12.9/targets/sbsa-linux/lib/stubs/libnvidia-ml.so  /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1; \
     else \
-      ln -s /usr/local/cuda-12.9/targets/${ARCH}-linux/lib/stubs/libnvidia-ml.so  /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1; \
+      if [[ "${INFERENCEBUILD}" == "1" && "${TRITONSERVER_BUILD}" != "1" ]]; then \
+        ln -s /usr/local/cuda-12.8/targets/${ARCH}-linux/lib/stubs/libnvidia-ml.so  /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1; \
+      else \
+        ln -s /usr/local/cuda-12.9/targets/${ARCH}-linux/lib/stubs/libnvidia-ml.so  /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1; \
+      fi \
     fi
 
 RUN if [ "${INFERENCEBUILD}" != "1" ]; then \
