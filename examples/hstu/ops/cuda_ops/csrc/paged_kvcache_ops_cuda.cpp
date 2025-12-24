@@ -40,6 +40,13 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+// #include "nvcomp/lz4.h"
+#include "nvcomp/ans.h"
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
+#include <cassert>
+
 #define cudaCheck(ans) { cudaSuccesAssert((ans), __FILE__, __LINE__); }
 inline void cudaSuccesAssert(cudaError_t code, const char *file, int line, bool abort=true)
 {
@@ -302,6 +309,7 @@ public:
         , page_size(num_tokens_per_page)
         , chunk_size(num_tokens_per_chunk)
         , _uid_to_chunk_id(num_layers, std::unordered_map<int64_t, std::vector<uintptr_t>>())
+        , _uid_to_bytes(num_layers, std::unordered_map<int64_t, std::vector<size_t>>())
     {
         this->chunk_numel = num_tokens_per_chunk * 2 * num_kv_heads * kv_headdim;
         this->page_numel = 2 * page_size * num_kv_heads * kv_headdim;
@@ -345,6 +353,20 @@ public:
         _uid_to_length[user_id] = start_position + length;
     };
 
+    void append_kvdata_bytes(int64_t user_id, int64_t start_position, int64_t length, size_t *bytes, size_t layer_stride) {
+        assert(length % this->chunk_size == 0);
+        if (start_position == 0) {
+            for (int layer_idx = 0; layer_idx < num_layers; layer_idx++)
+                _uid_to_bytes[layer_idx][user_id] = std::vector<size_t>();
+        }
+        size_t num_chunks = length / chunk_size;
+        for (int layer_idx = 0; layer_idx < num_layers; layer_idx++) {
+            for (size_t chunk_idx = 0; chunk_idx < num_chunks; chunk_idx ++) {
+                _uid_to_bytes[layer_idx][user_id].push_back(bytes[chunk_idx + layer_stride * layer_idx]);
+            }
+        }
+    };
+
     std::vector<uint16_t*> get_kvdata_v2(int64_t user_id, int64_t length, int64_t layer_idx) {
         // int64_t offloaded_length = get_kvdata_length(user_id);
         // assert(offloaded_length >= length);
@@ -365,10 +387,18 @@ public:
         return chunk_ptrs;
     };
 
+    size_t* get_kvdata_bytes(int64_t user_id, int64_t length, int64_t layer_idx) {
+        if (length == 0) {
+            return nullptr;
+        }
+        return _uid_to_bytes[layer_idx][user_id].data();
+    };
+
 public:
     std::vector<std::unordered_map<int64_t, std::vector<uintptr_t>>> _uid_to_chunk_id;
     std::unordered_map<int64_t, int64_t> _uid_to_length;
     std::unordered_map<int64_t, std::vector<uintptr_t>> _uid_to_mempool;
+    std::vector<std::unordered_map<int64_t, std::vector<size_t>>> _uid_to_bytes;
 
     const int num_layers;
     const int num_kv_heads;
@@ -464,6 +494,8 @@ public:
     cudaEvent_t ready_event;
 };
 
+static const nvcompBatchedANSCompressOpts_t nvcompBatchedANSCompressLocalOpts = {nvcomp_rANS, NVCOMP_TYPE_FLOAT16, {0}};
+
 class GPUKVCacheMangerImpl
 {
 public:
@@ -497,6 +529,10 @@ public:
      , offload_pinned_buffers(2)
      , offload_memcpy_event(2)
      , onload_memcpy_barrier_(std::barrier<>(3 + 1))
+     , onload_comp_buffers(2)
+     , offload_comp_buffers(2)
+     , decomp_tmp_buffers(2)
+     , comp_tmp_buffers(2)
     {
         const c10::cuda::OptionalCUDAGuard device_guard(this->device);
 
@@ -524,6 +560,43 @@ public:
             cudaMallocHost((void**)&offload_pinned_buffers[i], host_kv_mgr.chunk_numel * sizeof(uint16_t));
             cudaEventCreate(&offload_memcpy_event[i]);
         }
+
+        size_t chunk_bytes = host_kv_mgr.chunk_numel * sizeof(uint16_t);
+        cudaMalloc((void**)&common_uncomp_bytes, sizeof(size_t));
+        cudaMemcpy(common_uncomp_bytes, &chunk_bytes, sizeof(size_t), cudaMemcpyHostToDevice);
+
+        size_t max_comp_bytes;
+        nvcompBatchedANSCompressGetMaxOutputChunkSize(chunk_bytes, nvcompBatchedANSCompressLocalOpts, &max_comp_bytes);
+        for (int i = 0; i < 2; i++) {
+            cudaMalloc((void**)&onload_comp_buffers[i], max_comp_bytes);
+            cudaMalloc((void**)&offload_comp_buffers[i], max_comp_bytes);
+        }
+        {
+            cudaMalloc((void**)&onload_comp_ptrs, 2 * sizeof(intptr_t));
+            cudaMalloc((void**)&offload_comp_ptrs, 2 * sizeof(intptr_t));
+            std::vector<void *> ptrs(2);
+            for (int i = 0; i < 2; i++) ptrs[i] = (void*)onload_comp_buffers[i];
+            cudaMemcpy(onload_comp_ptrs, ptrs.data(), 2 * sizeof(intptr_t), cudaMemcpyHostToDevice);
+            for (int i = 0; i < 2; i++) ptrs[i] = (void*)offload_comp_buffers[i];
+            cudaMemcpy(offload_comp_ptrs, ptrs.data(), 2 * sizeof(intptr_t), cudaMemcpyHostToDevice);
+        }
+
+        nvcompBatchedANSCompressGetTempSizeAsync(1, chunk_bytes, nvcompBatchedANSCompressLocalOpts, &comp_temp_bytes, 1 * chunk_bytes);
+        nvcompBatchedANSDecompressGetTempSizeAsync(1, chunk_bytes, nvcompBatchedANSDecompressDefaultOpts, &decomp_temp_bytes, 1 * chunk_bytes);
+        for (int i = 0; i < 2; i++) {
+            cudaMalloc((void**)&comp_tmp_buffers[i], comp_temp_bytes);
+            cudaMalloc((void**)&decomp_tmp_buffers[i], decomp_temp_bytes);
+        }
+
+        {
+            cudaMalloc((void**)&p_onload_uncp_cmpb, 2 * sizeof(intptr_t) + 2 * sizeof(size_t));
+            cudaMalloc((void**)&onload_uncomp_bytes_out, 2 * sizeof(size_t));
+            cudaMalloc((void**)&device_statuses, 2*sizeof(nvcompStatus_t));
+
+            cudaMalloc((void**)&offload_uncomp_ptrs, 2 * sizeof(intptr_t));
+            cudaMalloc((void**)&offload_comp_bytes, 2 * sizeof(size_t));
+        }
+        std::cout << "dynamic_buffers\n";
 
         this->terminate_ = false;
         this->num_onload_memcpy_worker = 3;
@@ -764,6 +837,7 @@ public:
         // std::cout << "[Onload Launch] {" << user_ids[0] << "}: " << onload_length[0] << std::endl;
 
         const size_t chunk_numel_part = host_kv_mgr->chunk_numel / (this->num_onload_memcpy_worker + 1);
+        size_t hp_onload_uncp_cmpb[4];
 
         int task_idx = 0;
         for (int layer_idx = 0; layer_idx < this->num_layers; layer_idx++) {
@@ -771,16 +845,42 @@ public:
 
             for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
                 std::vector<uint16_t *> chunk_ptrs = host_kv_mgr->get_kvdata_v2(user_ids[0], onload_length[0], layer_idx);
+                size_t* chunk_bytes = host_kv_mgr->get_kvdata_bytes(user_ids[0], onload_length[0], layer_idx);
                 
                 // std::cout << "[Onload] uid: " << user_ids[seq_idx] << " - " << chunk_ptrs.size() << std::endl;
                 // std::cout << "\t" << host_kv_mgr->chunk_numel << " - " << host_kv_mgr->chunk_size * this->per_token_kv_stride << std::endl;
                 for (int chunk_idx = 0; chunk_idx < chunk_ptrs.size(); chunk_idx++) {
                     // std::cout << "\t" << reinterpret_cast<uintptr_t>(chunk_ptrs[chunk_idx]) << " - " << (chunk_ptrs[chunk_idx] - chunk_ptrs[0]) << std::endl;
+                    int _taskidx = task_idx%2;
 
-                    onload_host_memcpy(onload_pinned_buffers[task_idx%2], chunk_ptrs[chunk_idx], host_kv_mgr->chunk_numel * sizeof(uint16_t), chunk_numel_part * sizeof(uint16_t));
+                    onload_host_memcpy(onload_pinned_buffers[_taskidx], chunk_ptrs[chunk_idx], 
+                                       chunk_bytes[chunk_idx], // host_kv_mgr->chunk_numel * sizeof(uint16_t),
+                                       (chunk_bytes[chunk_idx] + 3) / 4 // chunk_numel_part * sizeof(uint16_t)
+                    );
                     
-                    cudaCheck(cudaMemcpyAsync(gpu_onload_buffer + onload_offsets[seq_idx] * this->per_token_kv_stride + chunk_idx * host_kv_mgr->chunk_numel, 
-                        onload_pinned_buffers[task_idx%2], host_kv_mgr->chunk_numel * sizeof(uint16_t), cudaMemcpyHostToDevice, this->onload_stream));
+                    cudaCheck(cudaMemcpyAsync(onload_comp_buffers[_taskidx], 
+                        onload_pinned_buffers[_taskidx], chunk_bytes[chunk_idx], cudaMemcpyHostToDevice, this->onload_stream));
+                    
+                    hp_onload_uncp_cmpb[_taskidx * 2] = reinterpret_cast<size_t>(gpu_onload_buffer + onload_offsets[seq_idx] * this->per_token_kv_stride + chunk_idx * host_kv_mgr->chunk_numel);
+                    hp_onload_uncp_cmpb[_taskidx * 2 + 1] = chunk_bytes[chunk_idx];
+                    cudaMemcpyAsync(p_onload_uncp_cmpb + _taskidx * 2, hp_onload_uncp_cmpb + _taskidx * 2, 2 * sizeof(size_t), cudaMemcpyHostToDevice, this->onload_stream);
+                    nvcompStatus_t decomp_res = nvcompBatchedANSDecompressAsync(
+                        onload_comp_ptrs + _taskidx,
+                        p_onload_uncp_cmpb + _taskidx * 2 + 1,
+                        common_uncomp_bytes,
+                        onload_uncomp_bytes_out + _taskidx,
+                        1,
+                        decomp_tmp_buffers[_taskidx],
+                        decomp_temp_bytes,
+                        (void**)(p_onload_uncp_cmpb + _taskidx * 2),
+                        nvcompBatchedANSDecompressDefaultOpts,
+                        device_statuses + _taskidx,
+                        this->onload_stream);
+                    if (decomp_res != nvcompSuccess) {
+                        std::cout << "decomp err\n";
+                        abort();
+                    }
+
                     cudaCheck(cudaEventRecord(onload_memcpy_event[task_idx%2], this->onload_stream));
 
                     if (task_idx > 0) {
@@ -1024,11 +1124,37 @@ private:
             size_t chunk_numel_part = host_kv_mgr->chunk_numel / (this->num_offload_memcpy_worker + 1);
 
             int num_chunks = (num_offload_pages * this->num_tokens_per_page) / this->num_tokens_per_chunk * this->num_layers;
+
+            size_t hptr[2];
+            std::vector<size_t> comp_bytes(num_chunks);
             for (int chunk_idx = 0; chunk_idx < num_chunks; chunk_idx++) {
+                auto taskidx = chunk_idx%2;
+                hptr[taskidx] = reinterpret_cast<size_t>(gather_kv_gpu_buffer_data_ptr + chunk_idx * host_kv_mgr->chunk_numel);
+                cudaMemcpyAsync(&offload_uncomp_ptrs[taskidx], &hptr[taskidx], sizeof(size_t), cudaMemcpyHostToDevice, this->offload_stream);
+                nvcompStatus_t comp_res = nvcompBatchedANSCompressAsync(
+                    offload_uncomp_ptrs + taskidx,
+                    common_uncomp_bytes,
+                    host_kv_mgr->chunk_numel * sizeof(uint16_t),
+                    1,
+                    comp_tmp_buffers[taskidx],
+                    comp_temp_bytes,
+                    offload_comp_ptrs + taskidx,
+                    offload_comp_bytes + taskidx,
+                    nvcompBatchedANSCompressLocalOpts,
+                    nullptr,
+                    this->offload_stream);
+                if (comp_res != nvcompSuccess) {
+                    std::cout << "comp err\n";
+                    abort();
+                }
+                cudaMemcpyAsync(&comp_bytes[chunk_idx], offload_comp_bytes + taskidx, sizeof(size_t),
+                    cudaMemcpyDeviceToHost, this->offload_stream);
+                cudaStreamSynchronize(this->offload_stream);
+
                 cudaMemcpyAsync(
                     offload_pinned_buffers[chunk_idx%2],
-                    gather_kv_gpu_buffer_data_ptr + chunk_idx * host_kv_mgr->chunk_numel,
-                    host_kv_mgr->chunk_numel * sizeof(uint16_t),
+                    offload_comp_buffers[taskidx],
+                    comp_bytes[chunk_idx],
                     cudaMemcpyDeviceToHost, 
                     this->offload_stream);
                 cudaEventRecord(offload_memcpy_event[chunk_idx%2], this->offload_stream);
@@ -1038,8 +1164,8 @@ private:
                     offload_host_memcpy(
                         host_kv_ptr + (chunk_idx-1) * host_kv_mgr->chunk_numel,
                         offload_pinned_buffers[(chunk_idx-1)%2],
-                        host_kv_mgr->chunk_numel * sizeof(uint16_t),
-                        chunk_numel_part * sizeof(uint16_t));
+                        comp_bytes[chunk_idx-1], // host_kv_mgr->chunk_numel * sizeof(uint16_t),
+                        (comp_bytes[chunk_idx-1] + 3 ) / 4); // chunk_numel_part * sizeof(uint16_t));
                 }
             }
             {
@@ -1047,8 +1173,8 @@ private:
                 offload_host_memcpy(
                     host_kv_ptr + (num_chunks-1) * host_kv_mgr->chunk_numel,
                     offload_pinned_buffers[(num_chunks-1)%2],
-                    host_kv_mgr->chunk_numel * sizeof(uint16_t),
-                    chunk_numel_part * sizeof(uint16_t));
+                    comp_bytes[num_chunks-1], // host_kv_mgr->chunk_numel * sizeof(uint16_t),
+                    (comp_bytes[num_chunks-1] + 3 ) / 4); // chunk_numel_part * sizeof(uint16_t));
             }
             // std::cout << "[Offload Launch] {" << dbg_uid << "}: copied data" << std::endl;
 
@@ -1059,15 +1185,20 @@ private:
                     nvtx3::scoped_range r1{"offload_bookkeeping"};
 
                     size_t page_offset = 0;
+                    size_t chunk_offset = 0;
                     int* offload_startpos = reinterpret_cast<int *>(host_metadata.data() + num_offload_uids * 2);
                     int* offload_lengths = reinterpret_cast<int *>(host_metadata.data() + num_offload_uids * 3);
+                    size_t num_chunks_per_layer = num_chunks / this->num_layers;
 
                     for (int seq_idx = 0; seq_idx < num_offload_uids; seq_idx++) {
                         int64_t uid = offload_uids[seq_idx];
                         uint16_t *input_ptr = host_kv_ptr + page_offset * this->page_stride;
+                        size_t *bytes = comp_bytes.data() + chunk_offset;
                         host_kv_mgr->append_kvdata_v2(uid, offload_startpos[seq_idx], offload_lengths[seq_idx], input_ptr, gather_layer_stride);
+                        host_kv_mgr->append_kvdata_bytes(uid, offload_startpos[seq_idx], offload_lengths[seq_idx], bytes, num_chunks_per_layer);
                         this->_uid_to_offloaded_length[uid] = offload_startpos[seq_idx] + offload_lengths[seq_idx];
                         page_offset += offload_lengths[seq_idx] / this->num_tokens_per_page;
+                        chunk_offset += offload_lengths[seq_idx] / this->num_tokens_per_chunk;
                         {
                             std::unique_lock<std::mutex> lock(queued_offload_lastpos_mutex_);
                             if (offload_startpos[seq_idx] + offload_lengths[seq_idx] == queued_offload_lastpos[uid]) {
@@ -1115,6 +1246,16 @@ public:
     std::vector<uint16_t*> onload_pinned_buffers;
     std::vector<cudaEvent_t> onload_memcpy_event;
 
+    size_t *common_uncomp_bytes;
+
+    std::vector<uint16_t*> onload_comp_buffers;
+    void** onload_comp_ptrs;
+    std::vector<uint16_t*> decomp_tmp_buffers;
+    size_t decomp_temp_bytes;
+    size_t *p_onload_uncp_cmpb; // ptr, bytes, ptr, bytes
+    size_t *onload_uncomp_bytes_out;
+    nvcompStatus_t *device_statuses;
+
     std::queue<std::tuple<void*, void*, size_t>> onload_memcpy_task_queue;
     std::mutex onload_memcpy_task_mtx_;
     std::condition_variable onload_memcpy_task_cv_;
@@ -1137,6 +1278,13 @@ public:
     std::vector<std::thread> offload_memcpy_worker;
     std::vector<uint16_t*> offload_pinned_buffers;
     std::vector<cudaEvent_t> offload_memcpy_event;
+
+    std::vector<uint16_t*> offload_comp_buffers;
+    void** offload_comp_ptrs;
+    std::vector<uint16_t*> comp_tmp_buffers;
+    size_t comp_temp_bytes;
+    void **offload_uncomp_ptrs;
+    size_t *offload_comp_bytes;
 
     std::queue<std::tuple<void*, void*, size_t>> offload_memcpy_task_queue;
     std::mutex offload_memcpy_task_mtx_;
@@ -1289,7 +1437,133 @@ void prepare_kvcache(
 
     cudaStreamSynchronize(gpu_mgr.worker_stream);
     // std::cout << "prepare_kvcache stop" << std::endl << std::flush;
- }
+}
+
+int get_comp_temp_size(int batch_size, int chunk_size) {
+    size_t temp_bytes;
+    nvcompBatchedANSCompressGetTempSizeAsync(batch_size, chunk_size, nvcompBatchedANSCompressLocalOpts, &temp_bytes, batch_size * chunk_size);
+    return (int)temp_bytes;
+}
+
+int get_comp_max_chunksize(int chunk_size) {
+    assert(chunk_size <= nvcompANSCompressionMaxAllowedChunkSize);
+    size_t max_out_bytes;
+    nvcompBatchedANSCompressGetMaxOutputChunkSize(chunk_size, nvcompBatchedANSCompressLocalOpts, &max_out_bytes);
+    return (int)max_out_bytes;
+}
+
+void compress(at::Tensor input, at::Tensor ptrs_buffer, at::Tensor bytes_buffer,
+              at::Tensor output, at::Tensor comp_ptrs_buffer, at::Tensor comp_bytes_buffer, at::Tensor tmp_buffer) {
+    const c10::cuda::OptionalCUDAGuard device_guard(input.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+
+    const size_t num_pages = input.size(0);
+    const size_t page_numel = input.stride(0);
+    const size_t page_bytes = input.stride(0) * input.element_size();
+    const size_t max_out_numel = output.stride(0);
+
+    assert(ptrs_buffer.numel() == num_pages);
+    assert(bytes_buffer.numel() == num_pages);
+    assert(comp_ptrs_buffer.numel() == num_pages);
+    assert(comp_bytes_buffer.numel() == num_pages);
+
+    std::vector<void *> h_uncomp_ptrs(num_pages);
+    std::vector<size_t> h_uncomp_bytes(num_pages);
+    std::vector<void *> h_comp_ptrs(num_pages);
+
+    for (auto i = 0; i < num_pages; i++) {
+        h_uncomp_ptrs[i] = (void *)((uint16_t *)input.data_ptr() + i * page_numel);
+        h_uncomp_bytes[i] = page_bytes;
+        h_comp_ptrs[i] = (void *)((uint16_t *)output.data_ptr() + i * max_out_numel);
+    }
+
+    void **uncomp_ptrs = (void**)ptrs_buffer.data_ptr();
+    size_t *uncomp_bytes = (size_t*)bytes_buffer.data_ptr();
+    void **comp_ptrs = (void**)comp_ptrs_buffer.data_ptr();
+    size_t *comp_bytes = (size_t*)comp_bytes_buffer.data_ptr();
+
+    cudaMemcpyAsync(uncomp_ptrs, h_uncomp_ptrs.data(), num_pages*sizeof(intptr_t), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(uncomp_bytes, h_uncomp_bytes.data(), num_pages*sizeof(size_t), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(comp_ptrs, h_comp_ptrs.data(), num_pages*sizeof(intptr_t), cudaMemcpyHostToDevice, stream);
+
+    nvcompStatus_t comp_res = nvcompBatchedANSCompressAsync(
+      uncomp_ptrs,
+      uncomp_bytes,
+      page_bytes,
+      num_pages,
+      (void *)tmp_buffer.data_ptr(),
+      tmp_buffer.nbytes(),
+      comp_ptrs,
+      comp_bytes,
+      nvcompBatchedANSCompressLocalOpts,
+      nullptr,
+      stream);
+
+    assert(comp_res == nvcompSuccess);
+    cudaStreamSynchronize(stream);
+}
+
+int get_decomp_temp_size(int batch_size, int chunk_size) {
+    size_t temp_bytes;
+    nvcompBatchedANSDecompressGetTempSizeAsync(batch_size, chunk_size, nvcompBatchedANSDecompressDefaultOpts, &temp_bytes, batch_size * chunk_size);
+    return (int)temp_bytes;
+}
+
+void decompress(at::Tensor input, at::Tensor comp_ptrs_buffer, at::Tensor comp_bytes_buffer,
+                at::Tensor output, at::Tensor ptrs_buffer, at::Tensor bytes_buffer_in, at::Tensor bytes_buffer_out, at::Tensor tmp_buffer, at::Tensor status) {
+    const c10::cuda::OptionalCUDAGuard device_guard(input.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    const size_t num_pages = input.size(0);
+    const size_t max_comp_numel = input.stride(0);
+    const size_t page_numel = output.stride(0);
+    const size_t page_bytes = output.stride(0) * output.element_size();
+
+    assert(comp_ptrs_buffer.numel() == num_pages);
+    assert(comp_bytes_buffer.numel() == num_pages);
+    assert(ptrs_buffer.numel() == num_pages);
+    assert(bytes_buffer_in.numel() == num_pages);
+    assert(bytes_buffer_out.numel() == num_pages);
+
+    std::vector<void *> h_comp_ptrs(num_pages);
+    std::vector<void *> h_uncomp_ptrs(num_pages);
+    std::vector<size_t> h_uncomp_bytes(num_pages);
+
+    for (auto i = 0; i < num_pages; i++) {
+        h_comp_ptrs[i] = (void *)((uint16_t *)input.data_ptr() + i * max_comp_numel);
+        h_uncomp_ptrs[i] = (void *)((uint16_t *)output.data_ptr() + i * page_numel);
+        h_uncomp_bytes[i] = page_bytes;
+    }
+    
+    void **comp_ptrs = (void**)comp_ptrs_buffer.data_ptr();
+    size_t *comp_bytes = (size_t*)comp_bytes_buffer.data_ptr();
+    void **uncomp_ptrs = (void**)ptrs_buffer.data_ptr();
+    size_t *uncomp_bytes_in = (size_t*)bytes_buffer_in.data_ptr();
+    size_t *uncomp_bytes_out = (size_t*)bytes_buffer_out.data_ptr();
+
+    cudaMemcpyAsync(comp_ptrs, h_comp_ptrs.data(), num_pages*sizeof(intptr_t), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(uncomp_ptrs, h_uncomp_ptrs.data(), num_pages*sizeof(intptr_t), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(uncomp_bytes_in, h_uncomp_bytes.data(), num_pages*sizeof(size_t), cudaMemcpyHostToDevice, stream);
+
+    nvcompStatus_t* device_statuses = (nvcompStatus_t*)status.data_ptr();
+
+    nvcompStatus_t decomp_res = nvcompBatchedANSDecompressAsync(
+      comp_ptrs,
+      comp_bytes,
+      uncomp_bytes_in,
+      uncomp_bytes_out,
+      num_pages,
+      (void *)tmp_buffer.data_ptr(),
+      tmp_buffer.nbytes(),
+      uncomp_ptrs,
+      nvcompBatchedANSDecompressDefaultOpts,
+      device_statuses,
+      stream);
+
+    assert(decomp_res == nvcompSuccess);
+    cudaStreamSynchronize(stream);
+}
 
 }  // namespace kvcache
 
@@ -1340,4 +1614,10 @@ PYBIND11_MODULE(paged_kvcache_ops, m) {
   ;
 
   m.def("prepare_kvcache", &kvcache::prepare_kvcache, "prepare_kvcache", py::call_guard<py::gil_scoped_release>());
+
+  m.def("get_comp_max_chunksize", &kvcache::get_comp_max_chunksize, "get_comp_max_chunksize", py::call_guard<py::gil_scoped_release>());
+  m.def("get_comp_temp_size", &kvcache::get_comp_temp_size, "get_comp_temp_size", py::call_guard<py::gil_scoped_release>());
+  m.def("compress", &kvcache::compress, "compress", py::call_guard<py::gil_scoped_release>());
+  m.def("get_decomp_temp_size", &kvcache::get_decomp_temp_size, "get_decomp_temp_size", py::call_guard<py::gil_scoped_release>());
+  m.def("decompress", &kvcache::decompress, "decompress", py::call_guard<py::gil_scoped_release>());
 }
