@@ -541,8 +541,11 @@ public:
             ));
         }
 
+        this->queued_offload_tokens = 0;
+        this->queued_offload_limits = num_reserved_buffer_pages * num_tokens_per_page;
         this->offload_busy_.store(false);
         this->offload_worker = std::thread(&GPUKVCacheMangerImpl::offload_loop, this);
+
     };
 
     ~GPUKVCacheMangerImpl() {
@@ -805,6 +808,16 @@ public:
         at::Tensor new_offload_lengths)   // host
     {
         const size_t num_offload_uids = offload_user_ids.numel();
+        {
+            std::unique_lock<std::mutex> lock(queued_offload_lastpos_mutex_);
+            if (queued_offload_tokens >= queued_offload_limits) {
+                return;
+            }
+            for (auto seq_idx = 0; seq_idx < num_offload_uids; seq_idx++) {
+                queued_offload_tokens += ((int*)new_offload_lengths.data_ptr())[seq_idx];
+            }
+        }
+
         std::vector<int> offload_host_metadata(4*num_offload_uids);
 
         std::memcpy((void*)offload_host_metadata.data(), 
@@ -832,6 +845,7 @@ public:
                 offload_handle.ready_event
             ));
         }
+
         offload_task_cv_.notify_one();
     };
 
@@ -1073,6 +1087,7 @@ private:
                             if (offload_startpos[seq_idx] + offload_lengths[seq_idx] == queued_offload_lastpos[uid]) {
                                 queued_offload_lastpos.erase(uid);
                             }
+                            queued_offload_tokens -= offload_lengths[seq_idx];
                         }
                     }
                 }
@@ -1131,7 +1146,9 @@ public:
     std::mutex offload_task_mutex_;
     std::condition_variable offload_task_cv_;
     std::unordered_map<int64_t, int> queued_offload_lastpos;
+    size_t queued_offload_tokens;
     std::mutex queued_offload_lastpos_mutex_;
+    size_t queued_offload_limits;
 
     int num_offload_memcpy_worker;
     std::vector<std::thread> offload_memcpy_worker;

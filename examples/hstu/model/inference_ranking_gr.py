@@ -172,7 +172,7 @@ class InferenceRankingGR(torch.nn.Module):
             kvcache_config.page_size,
             kvcache_config.blocks_in_primary_pool,
             math.ceil(kvcache_config.max_batch_size * kvcache_config.max_seq_len / kvcache_config.page_size),
-            0,
+            4 * math.ceil(kvcache_config.max_batch_size * kvcache_config.max_seq_len / kvcache_config.page_size),
             kvcache_config.offload_chunksize,
             -1,
             kvcache_config.max_seq_len,
