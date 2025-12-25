@@ -520,14 +520,14 @@ class TestModule:
             num_layers=4,
             num_heads=4,
             head_dim=128,
+            max_batch_size=16,
+            max_seq_len=4096,
             bf16=True,
         )
         self.kvcache_config = get_kvcache_config(
             blocks_in_primary_pool=10240,
             page_size=32,
             offload_chunksize=1024,
-            max_batch_size=16,
-            max_seq_len=4096,
         )
         device = torch.cuda.current_device()
 
@@ -536,8 +536,8 @@ class TestModule:
         self.num_heads = hstu_config.num_heads
         self.head_dim = hstu_config.head_dim
         self.dtype = torch.bfloat16
-        self.max_batchsize = self.kvcache_config.max_batch_size
-        self.max_len_per_seq = self.kvcache_config.max_seq_len
+        self.max_batchsize = hstu_config.max_batch_size
+        self.max_len_per_seq = hstu_config.max_seq_len
 
         self.hstu_block_inference = HSTUBlockInference(
             hstu_config, kvcache_config=self.kvcache_config
