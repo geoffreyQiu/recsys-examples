@@ -262,7 +262,6 @@ def init_embedding_tables(stbe, bdet):
                 scores = None
             insert_or_assign(table, num_emb, indices, values, scores)
         elif isinstance(table, KeyValueTable):
-            table = cast(KeyValueTable, table)
             val_dim = table.value_dim()
             assert emb_dim == table.embedding_dim()
             values = torch.empty(

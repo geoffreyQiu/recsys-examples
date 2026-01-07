@@ -224,6 +224,12 @@ class ScoredHashTable(abc.ABC):
         """
 
     @abc.abstractmethod
+    def reset(self) -> None:
+        """
+        Reset the table.
+        """
+
+    @abc.abstractmethod
     def capacity(self) -> int:
         """
         Return the capacity of the table.
@@ -440,6 +446,15 @@ class GroupedScoredHashTable(abc.ABC):
         Returns:
             out_keys (List[torch.Tensor]): output tensor of keys for tables.
             out_scores (List[Dict[str, torch.Tensor]]): output tensors of scores for tables.
+        """
+
+    @abc.abstractmethod
+    def reset(
+        self,
+        table_names: List[str],
+    ) -> None:
+        """
+        Reset the table in `table_names`.
         """
 
     @abc.abstractmethod
@@ -885,9 +900,10 @@ class LinearBucketTable(ScoredHashTable):
         target_device: torch.device,
         thresholds: Optional[List[int]] = None,
         batch_size: int = 65536,
-    ) -> Iterator[Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
+        return_index: bool = False,
+    ) -> Iterator[Tuple[torch.Tensor, Dict[str, torch.Tensor], Optional[torch.Tensor]]]:
         """
-        export keys, {score_name: scores}
+        export keys, {score_name: scores}, indices
 
         Args:
             score_names (List[str]): list of score names
@@ -896,10 +912,12 @@ class LinearBucketTable(ScoredHashTable):
                 only dump a key when all its scores which in score_names are not less than thresholds.
                 only dump scores for score_names.
             batch_size (int): the batch size when scan the table.
+            return_index (bool) : whether export indices or not, default to False.
 
         Returns:
             out_keys (torch.Tensor): output tensor of keys
             out_scores (Dict[str, torch.Tensor]): output tensors of scores.
+            out_indices (Optional[torch.Tensor]): output tensor of indices
         """
 
         search_capacity = self.capacity_
@@ -929,6 +947,11 @@ class LinearBucketTable(ScoredHashTable):
             batch_ = min(batch_size, search_capacity - offset)
 
             keys = torch.empty(batch_, dtype=key_dtype, device=device)
+            indices = (
+                torch.empty(batch_, dtype=self.index_type, device=device)
+                if return_index
+                else None
+            )
             scores_list = []
             for score_name in self.score_names_:
                 if score_name in score_names:
@@ -949,6 +972,7 @@ class LinearBucketTable(ScoredHashTable):
                 keys,
                 scores_list,
                 thresholds_,
+                indices,
             )
 
             actual_length = d_counter.item()
@@ -964,6 +988,7 @@ class LinearBucketTable(ScoredHashTable):
                 yield (
                     keys[:actual_length].to(KEY_TYPE).to(target_device),
                     named_scores,
+                    indices[:actual_length].to(target_device) if return_index else None,
                 )
             offset += batch_size
 
@@ -992,7 +1017,7 @@ class LinearBucketTable(ScoredHashTable):
 
         dump_timestamp = device_timestamp()
 
-        for keys, named_scores in self._batched_export_keys_scores(
+        for keys, named_scores, _ in self._batched_export_keys_scores(
             fscores.keys(), self.device
         ):
             fkey.write(keys.cpu().numpy().tobytes())
@@ -1013,7 +1038,8 @@ class LinearBucketTable(ScoredHashTable):
         score_threshold: Dict[str, int],
         batch_size: int = 65536,
         pg: Optional[dist.ProcessGroup] = None,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        return_index: bool = False,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Optional[torch.Tensor]]:
         """
         Dump incremental keys and scores into cpu tensors.
 
@@ -1021,14 +1047,17 @@ class LinearBucketTable(ScoredHashTable):
             score_threshold (Dict[str, int]): input threshold of each score.
             batch_size (int): the batch size when scan the table.
             pg (Optional[dist.ProcessGroup]): process group.
+            return_index: whether return the index or not.
 
         Returns:
             out_keys (torch.Tensor): output tensor of keys
             out_scores (Dict[str, torch.Tensor]): output tensors of scores.
+            out_indices (Optional[torch.Tensor]): output tensors of indices.
         """
 
         out_keys: torch.Tensor
         out_scores: Dict[str, torch.Tensor] = {}
+        out_indices: torch.Tensor
 
         scores = []
         thresholds = []
@@ -1054,123 +1083,48 @@ class LinearBucketTable(ScoredHashTable):
             d_num_matched,
         )
 
-        if not dist.is_initialized() or dist.get_world_size(group=pg) == 1:
-            total_matched = d_num_matched.cpu().item()
+        # if not dist.is_initialized() or dist.get_world_size(group=pg) == 1:
+        total_matched = d_num_matched.cpu().item()
 
-            out_keys = torch.empty(total_matched, dtype=KEY_TYPE, device="cpu")
+        out_keys = torch.empty(total_matched, dtype=KEY_TYPE, device="cpu")
+        out_indices = (
+            torch.empty(total_matched, dtype=self.index_type, device="cpu")
+            if return_index
+            else None
+        )
+        for score_name in out_scores.keys():
+            out_scores[score_name] = torch.empty(
+                total_matched, dtype=SCORE_TYPE, device="cpu"
+            )
+
+        out_offset = 0
+        for keys, named_scores, indices in self._batched_export_keys_scores(
+            scores, self.device, thresholds, batch_size, return_index=return_index
+        ):
+            h_count = keys.numel()
+            out_keys[out_offset : out_offset + h_count].copy_(keys, non_blocking=True)
+            if indices is not None:
+                out_indices[out_offset : out_offset + h_count].copy_(
+                    indices, non_blocking=True
+                )
             for score_name in out_scores.keys():
-                out_scores[score_name] = torch.empty(
-                    total_matched, dtype=SCORE_TYPE, device="cpu"
+                out_scores[score_name][out_offset : out_offset + h_count].copy_(
+                    named_scores[score_name], non_blocking=True
                 )
 
-            out_offset = 0
-            for keys, named_scores in self._batched_export_keys_scores(
-                scores, self.device, thresholds, batch_size
-            ):
-                h_count = keys.numel()
-                out_keys[out_offset : out_offset + h_count].copy_(
-                    keys, non_blocking=True
-                )
-                for score_name in out_scores.keys():
-                    out_scores[score_name][out_offset : out_offset + h_count].copy_(
-                        named_scores[score_name], non_blocking=True
-                    )
+            out_offset += h_count
 
-                out_offset += h_count
+        assert (
+            total_matched == out_offset
+        ), "Dumped keys number mismatched with the expected count."
 
-            assert (
-                total_matched == out_offset
-            ), "Dumped keys number mismatched with the expected count."
+        return out_keys, out_scores, out_indices
 
-        else:
-            # Get the rank of the current process
-            world_size = dist.get_world_size(group=pg)
-
-            gathered_num_matched = [
-                torch.tensor(0, dtype=COUNTER_TYPE, device=self.device)
-                for _ in range(world_size)
-            ]
-            dist.all_gather(gathered_num_matched, d_num_matched, group=pg)
-
-            total_matched = sum([t.item() for t in gathered_num_matched])
-
-            out_keys = torch.empty(total_matched, dtype=KEY_TYPE, device="cpu")
-            for score_name in out_scores.keys():
-                out_scores[score_name] = torch.empty(
-                    total_matched, dtype=SCORE_TYPE, device="cpu"
-                )
-
-            d_keys = torch.empty(batch_size, dtype=KEY_TYPE, device=self.device)
-            d_scores: List[torch.Tensor] = [None for _ in self.score_names_]
-            for score_name in out_scores.keys():
-                index = self.score_names_.index(score_name)
-                d_scores[index] = torch.empty(
-                    batch_size, dtype=SCORE_TYPE, device=self.device
-                )
-            d_count = torch.zeros(1, dtype=COUNTER_TYPE, device=self.device)
-
-            # Gather keys and scores for all ranks
-            gathered_keys = [torch.empty_like(d_keys) for _ in range(world_size)]
-            gathered_scores: Dict[str, List[torch.Tensor]] = {}
-
-            for score_name in out_scores.keys():
-                index = self.score_names_.index(score_name)
-                gathered_scores[score_name] = [
-                    torch.empty_like(d_scores[index]) for _ in range(world_size)
-                ]
-
-            gathered_counts = [
-                torch.empty_like(d_count, dtype=COUNTER_TYPE) for _ in range(world_size)
-            ]
-
-            out_offset = 0
-            search_offset = 0
-            search_capacity = self.capacity_
-
-            while search_offset < search_capacity:
-                batch_ = min(batch_size, search_capacity - search_offset)
-                table_export_batch(
-                    self.table_storage_,
-                    self.fileds_type_,
-                    self.bucket_capacity_,
-                    batch_,
-                    search_offset,
-                    d_count,
-                    d_keys,
-                    d_scores,
-                    thresholds_total,
-                )
-
-                dist.all_gather(gathered_keys, d_keys, group=pg)
-                for score_name in out_scores.keys():
-                    index = self.score_names_.index(score_name)
-                    dist.all_gather(
-                        gathered_scores[score_name], d_scores[index], group=pg
-                    )
-
-                dist.all_gather(gathered_counts, d_count, group=pg)
-
-                for i in range(world_size):
-                    d_keys_ = gathered_keys[i]
-                    d_count_ = gathered_counts[i]
-
-                    h_count = d_count_.cpu().item()
-                    out_keys[out_offset : out_offset + h_count].copy_(
-                        d_keys_[:h_count], non_blocking=True
-                    )
-                    for score_name in out_scores.keys():
-                        out_scores[score_name][out_offset : out_offset + h_count].copy_(
-                            gathered_scores[score_name][i][:h_count], non_blocking=True
-                        )
-
-                    out_offset += h_count
-
-                search_offset += batch_
-                d_count.fill_(0)
-
-            assert out_offset == total_matched
-
-        return out_keys, out_scores
+    def reset(self) -> None:
+        """
+        Reset the table.
+        """
+        self._init_table(self.keys_, self.scores_list, self.digests_)
 
     def capacity(self) -> int:
         """
@@ -1228,7 +1182,7 @@ class LinearBucketTable(ScoredHashTable):
         bucket_sizes = torch.zeros(num_buckets, dtype=torch.int32, device=self.device)
 
         # move existed data to new table
-        for keys_, named_scores in self._batched_export_keys_scores(
+        for keys_, named_scores, _ in self._batched_export_keys_scores(
             self.score_names_, self.device
         ):
             score_args = []

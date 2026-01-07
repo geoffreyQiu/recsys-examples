@@ -41,7 +41,6 @@ from dynamicemb.dynamicemb_config import (
 )
 from dynamicemb.embedding_admission import KVCounter
 from dynamicemb.get_planner import get_planner
-from dynamicemb.key_value_table import batched_export_keys_values
 from dynamicemb.scored_hashtable import ScoreArg, ScorePolicy
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder
 from dynamicemb.types import AdmissionStrategy
@@ -363,7 +362,7 @@ def check_counter_table_checkpoint(x, y):
         ):
             assert cnt_tx.table_.size() == cnt_ty.table_.size()
 
-            for keys, named_scores in cnt_tx._batched_export_keys_scores(
+            for keys, named_scores, _ in cnt_tx._batched_export_keys_scores(
                 cnt_tx.table_.score_names_, torch.device(f"cuda:{device}")
             ):
                 if keys.numel() == 0:
@@ -500,8 +499,8 @@ def test_model_load_dump(
                 ):
                     key_to_score = {}
                     visited_keys = set({})
-                    for batched_key, _, _, batched_score in batched_export_keys_values(
-                        table.table, torch.device(f"cpu")
+                    for batched_key, _, _, batched_score in table.export_keys_values(
+                        torch.device(f"cpu")
                     ):
                         for key, score in zip(
                             batched_key.tolist(), batched_score.tolist()
@@ -511,6 +510,7 @@ def test_model_load_dump(
                     for (
                         keys,
                         named_scores,
+                        _,
                     ) in counter_table.table_._batched_export_keys_scores(
                         counter_table.table_.score_names_, torch.device(f"cpu")
                     ):
