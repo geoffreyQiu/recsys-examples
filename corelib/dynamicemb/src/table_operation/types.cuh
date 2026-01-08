@@ -56,6 +56,7 @@ enum class InsertResult : uint8_t {
   Evict,      // Evict a key and insert into the evicted slot.
   Duplicated, // Meet duplicated keys on the fly.
   Busy,       // Insert failed as all slots busy.
+  Illegal, // The key is illagal key which means conflicts with reserved keys.
   Init,
 };
 
@@ -278,7 +279,7 @@ struct LinearBucket {
   __forceinline__ __device__ ProbeResult probe(KeyType key, Iterator &iter,
                                                int &step) const {
     static_assert(GroupSize == 1);
-    if (not storage_) {
+    if (storage_ == nullptr or capacity_ == 0) {
       step = capacity_;
       return ProbeResult::Failed;
     }
@@ -290,12 +291,6 @@ struct LinearBucket {
     auto hashcode = hash(key);
     auto digest = hashcode_to_digest(hashcode);
     auto digest_vec = digest_to_vector(digest);
-
-    // bool early_stop = false; // used when GroupSize > 1
-    if (storage_ == nullptr or capacity_ == 0) {
-      // early_stop = true;
-      return ProbeResult::Failed;
-    }
 
     if (iter < 0 or iter > capacity_) {
       iter = hashcode % capacity_;
@@ -376,6 +371,10 @@ struct LinearBucket {
                                          ScoreType *sm_buffers) const {
 
     static_assert(GroupSize == 1);
+    bool succeed = false;
+    if (storage_ == nullptr or capacity_ == 0) {
+      return false;
+    }
 
     static constexpr int BulkDim = BufferDim / 2;
     static_assert(BulkDim == 4);
@@ -395,8 +394,6 @@ struct LinearBucket {
     async_copy_bulk<ScoreType, BulkDim, Stride>(&sm_buffers[rank * BufferDim],
                                                 scores(iter));
     __pipeline_commit();
-
-    bool succeed = false;
 
     for (; iter < capacity_; iter += BulkDim) {
       if (iter < capacity_ - BulkDim) {

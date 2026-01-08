@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import random
 from typing import Dict, Optional, Tuple, cast
 
 import pytest
@@ -305,11 +307,16 @@ def init_embedding_tables(stbe, bdet):
     ],
 )
 @pytest.mark.parametrize("caching", [True, False])
+@pytest.mark.parametrize("deterministic", [True, False])
 @pytest.mark.parametrize("PS", [None, PyDictStorage])
-def test_forward_train_eval(opt_type, opt_params, caching, PS):
+def test_forward_train_eval(opt_type, opt_params, caching, deterministic, PS):
     print(
         f"step in test_forward_train_eval , opt_type = {opt_type} opt_params = {opt_params}"
     )
+
+    if deterministic:
+        os.environ["DEMB_DETERMINISM_MODE"] = "ON"
+
     assert torch.cuda.is_available()
     device_id = 0
     device = torch.device(f"cuda:{device_id}")
@@ -389,6 +396,9 @@ def test_forward_train_eval(opt_type, opt_params, caching, PS):
     assert torch.all(embs_train_non_exist[0, :] != 0)
     torch.testing.assert_close(embs_train_non_exist[1:, :], embs_non_exist[1:, :])
 
+    if deterministic:
+        del os.environ["DEMB_DETERMINISM_MODE"]
+
     print("all check passed")
 
 
@@ -438,9 +448,14 @@ For torchrec's adam optimizer, it will increment the optimizer_step in every for
         (False, DynamicEmbPoolingMode.MEAN, [4, 8, 16]),
     ],
 )
+@pytest.mark.parametrize("deterministic", [True, False])
 @pytest.mark.parametrize("PS", [None, PyDictStorage])
-def test_backward(opt_type, opt_params, caching, pooling_mode, dims, PS):
+def test_backward(opt_type, opt_params, caching, pooling_mode, dims, deterministic, PS):
     print(f"step in test_backward , opt_type = {opt_type} opt_params = {opt_params}")
+
+    if deterministic:
+        os.environ["DEMB_DETERMINISM_MODE"] = "ON"
+
     assert torch.cuda.is_available()
     device_id = 0
     device = torch.device(f"cuda:{device_id}")
@@ -521,6 +536,9 @@ def test_backward(opt_type, opt_params, caching, pooling_mode, dims, PS):
 
         print(f"Passed iteration {i}")
 
+    if deterministic:
+        del os.environ["DEMB_DETERMINISM_MODE"]
+
 
 @pytest.mark.parametrize(
     "opt_type,opt_params",
@@ -552,11 +570,15 @@ def test_backward(opt_type, opt_params, caching, pooling_mode, dims, PS):
         ),
     ],
 )
+@pytest.mark.parametrize("deterministic", [True, False])
 @pytest.mark.parametrize("PS", [None, PyDictStorage])
-def test_prefetch_flush_in_cache(opt_type, opt_params, PS):
+def test_prefetch_flush_in_cache(opt_type, opt_params, deterministic, PS):
     print(
         f"step in test_prefetch_flush , opt_type = {opt_type} opt_params = {opt_params}"
     )
+    if deterministic:
+        os.environ["DEMB_DETERMINISM_MODE"] = "ON"
+
     assert torch.cuda.is_available()
     device_id = 0
     device = torch.device(f"cuda:{device_id}")
@@ -714,3 +736,120 @@ def test_prefetch_flush_in_cache(opt_type, opt_params, PS):
             metrics = cache.cache_metrics
             # cache hit_rate = 100% as we do prefetch.
             assert metrics[0].item() == metrics[1].item()
+
+    if deterministic:
+        del os.environ["DEMB_DETERMINISM_MODE"]
+
+
+def random_indices(batch, min_index, max_index):
+    result = set({})
+    while len(result) < batch:
+        result.add(random.randint(min_index, max_index))
+    return result
+
+
+@pytest.mark.parametrize(
+    "opt_type,opt_params",
+    [
+        (EmbOptimType.SGD, {"learning_rate": 0.3}),
+    ],
+)
+@pytest.mark.parametrize("caching", [False, True])
+@pytest.mark.parametrize("PS", [None])
+@pytest.mark.parametrize("iteration", [16])
+@pytest.mark.parametrize("batch_size", [2048, 65536])  # ,[])
+def test_deterministic_insert(opt_type, opt_params, caching, PS, iteration, batch_size):
+    print(
+        f"step in test_deterministic_insert , opt_type = {opt_type} opt_params = {opt_params}"
+    )
+
+    assert torch.cuda.is_available()
+    device_id = 0
+    device = torch.device(f"cuda:{device_id}")
+
+    dims = [8]
+    table_names = ["table0"]
+    key_type = torch.int64
+    value_type = torch.float32
+
+    init_capacity = iteration * batch_size
+    max_capacity = init_capacity
+
+    dyn_emb_table_options_list = []
+    for dim in dims:
+        dyn_emb_table_options = DynamicEmbTableOptions(
+            dim=dim,
+            init_capacity=init_capacity,
+            max_capacity=max_capacity,
+            index_type=key_type,
+            embedding_dtype=value_type,
+            device_id=device_id,
+            score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
+            caching=caching,
+            local_hbm_for_values=init_capacity * dim * 4,
+            external_storage=PS,
+        )
+        dyn_emb_table_options_list.append(dyn_emb_table_options)
+
+    bdebt_x = BatchedDynamicEmbeddingTablesV2(
+        table_names=table_names,
+        table_options=dyn_emb_table_options_list,
+        feature_table_map=[0],
+        pooling_mode=DynamicEmbPoolingMode.NONE,
+        optimizer=opt_type,
+        use_index_dedup=True,
+        **opt_params,
+    )
+
+    bdebt_y = BatchedDynamicEmbeddingTablesV2(
+        table_names=table_names,
+        table_options=dyn_emb_table_options_list,
+        feature_table_map=[0],
+        pooling_mode=DynamicEmbPoolingMode.NONE,
+        optimizer=opt_type,
+        use_index_dedup=True,
+        **opt_params,
+    )
+
+    print(
+        f"Test deterministic insert with batch={batch_size}, iteration={iteration}, capacity={init_capacity}"
+    )
+    os.environ["DEMB_DETERMINISM_MODE"] = "ON"
+
+    for i in range(iteration):
+        indices = torch.tensor(
+            list(random_indices(batch_size, 0, 2**63 - 1)),
+            dtype=key_type,
+            device=device,
+        )
+        offsets = torch.arange(0, batch_size + 1, dtype=key_type, device=device)
+
+        bdebt_x(indices, offsets)
+        bdebt_y(indices, offsets)
+
+        torch.cuda.synchronize()
+
+        assert len(bdebt_x.tables) == len(bdebt_y.tables)
+        for tables_x, tables_y in zip(bdebt_x.tables, bdebt_y.tables):
+            map_x = tables_x.key_index_map
+            map_y = tables_y.key_index_map
+
+            assert torch.equal(map_x.keys_, map_y.keys_)
+
+            print(
+                f"Iteration {i} passed for deterministic insertion with table_x's size({map_x.size()}), table_y's size({map_y.size()}), totoal({map_x.capacity()})"
+            )
+        for cache_x, cache_y in zip(bdebt_x._caches, bdebt_y._caches):
+            if cache_x is None:
+                break
+            map_x = cache_x.key_index_map
+            map_y = cache_y.key_index_map
+
+            assert torch.equal(map_x.keys_, map_y.keys_)
+
+            print(
+                f"Iteration {i} passed for deterministic insertion with cache_x's size({map_x.size()}), cache_y's size({map_y.size()}), totoal({map_x.capacity()})"
+            )
+
+    del os.environ["DEMB_DETERMINISM_MODE"]
+    print("all check passed")

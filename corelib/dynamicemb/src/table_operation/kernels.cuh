@@ -171,7 +171,7 @@ table_insert_kernel(Table table, int *__restrict__ bucket_sizes, int64_t batch,
 
     InsertResult result = InsertResult::Init;
 
-    Bucket bucket;
+    Bucket bucket = Bucket();
     KeyType hashcode = KeyType();
     uint64_t bucket_id;
     if (Bucket::is_valid(key)) {
@@ -180,6 +180,8 @@ table_insert_kernel(Table table, int *__restrict__ bucket_sizes, int64_t batch,
       bucket_id = global_idx / table.bucket_capacity();
       // bucket_id = (hashcode % table.capacity()) / table.bucket_capacity();
       bucket = table[bucket_id];
+    } else {
+      result = InsertResult::Illegal;
     }
     Iter iter = Iter(hashcode % table.bucket_capacity());
     ProbeResult probe_res = ProbeResult::Init;
@@ -206,6 +208,11 @@ table_insert_kernel(Table table, int *__restrict__ bucket_sizes, int64_t batch,
           result = InsertResult::Insert;
           break;
         } // else it was locked by another thread.
+      }
+
+      if (probe_res == ProbeResult::Failed) {
+        result = InsertResult::Illegal;
+        break;
       }
     }
 
@@ -296,7 +303,7 @@ __global__ void table_insert_and_evict_kernel(
 
     InsertResult result = InsertResult::Init;
 
-    Bucket bucket;
+    Bucket bucket = Bucket();
     KeyType hashcode = KeyType();
     int64_t bucket_id;
     if (Bucket::is_valid(key)) {
@@ -305,6 +312,8 @@ __global__ void table_insert_and_evict_kernel(
       bucket_id = global_idx / table.bucket_capacity();
       // bucket_id = (hashcode % table.capacity()) / table.bucket_capacity();
       bucket = table[bucket_id];
+    } else {
+      result = InsertResult::Illegal;
     }
     Iter iter = Iter(hashcode % table.bucket_capacity());
     ProbeResult probe_res = ProbeResult::Init;
@@ -329,6 +338,11 @@ __global__ void table_insert_and_evict_kernel(
           result = InsertResult::Insert;
           break;
         } // else it was locked by another thread.
+      }
+
+      if (probe_res == ProbeResult::Failed) {
+        result = InsertResult::Illegal;
+        break;
       }
     }
 

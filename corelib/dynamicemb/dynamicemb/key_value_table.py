@@ -15,7 +15,7 @@
 
 import json
 import os
-from typing import Any, Callable, Dict, Iterator, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, Optional, Tuple, cast
 
 import numpy as np
 import torch  # usort:skip
@@ -34,6 +34,7 @@ from dynamicemb.initializer import BaseDynamicEmbInitializer
 from dynamicemb.optimizer import *
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizerV2
 from dynamicemb.scored_hashtable import (
+    LinearBucketTable,
     ScoreArg,
     ScorePolicy,
     ScoreSpec,
@@ -75,6 +76,7 @@ from dynamicemb_extensions import (
     store_to_combined_table,
 )
 from torch import Tensor, nn  # usort:skip
+from torchrec import JaggedTensor
 
 
 def save_to_json(data: Dict[str, Any], file_path: str) -> None:
@@ -869,6 +871,7 @@ class KeyValueTable(
         ):
             if keys.numel() != 0:
                 values = torch.cat((embeddings, opt_states), dim=1).contiguous()
+                # TODO: assign the score directly, otherwise the score will be accumulated for LFU.
                 storage.insert(keys, values, scores)
 
     def reset(
@@ -1061,7 +1064,7 @@ class DynamicEmbeddingTable(KeyValueTable):
         self._timestamp = device_timestamp()
 
     def expand(self):
-        if self.capacity == self.options.max_capacity:
+        if self._capacity == self.options.max_capacity:
             return
         if self.key_index_map.load_factor() < self.options.max_load_factor:
             return
@@ -1295,6 +1298,9 @@ class DynamicEmbeddingTable(KeyValueTable):
         unique_values: torch.Tensor,
         scores: Optional[torch.Tensor] = None,
     ) -> None:
+        if os.environ.get("DEMB_DETERMINISM_MODE", None) is not None:
+            return self.deterministic_insert(unique_keys, unique_values, scores)
+
         self.expand()
 
         h_num_unique_keys = unique_keys.numel()
@@ -1763,6 +1769,9 @@ class DynamicEmbeddingTable(KeyValueTable):
         values: torch.Tensor,
         scores: Optional[torch.Tensor] = None,
     ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if os.environ.get("DEMB_DETERMINISM_MODE", None) is not None:
+            return self.deterministic_insert_and_evict(keys, values, scores)
+
         self.expand()
 
         batch = keys.numel()
@@ -1960,6 +1969,255 @@ class DynamicEmbeddingTable(KeyValueTable):
 
     def size(self) -> int:
         return self.key_index_map.size()
+
+    def deterministic_insert(
+        self,
+        unique_keys: torch.Tensor,
+        unique_values: torch.Tensor,
+        scores: Optional[torch.Tensor] = None,
+    ) -> None:
+        self.expand()
+
+        # 1.Preprocess
+        h_num_unique_keys = unique_keys.numel()
+
+        if h_num_unique_keys == 0:
+            return
+
+        if self._use_score and scores is None:
+            scores = torch.empty(
+                h_num_unique_keys, device=unique_keys.device, dtype=torch.uint64
+            )
+            scores.fill_(self.score)
+
+        policy = self.score_policy.policy
+
+        if self.score_policy.policy == ScorePolicy.ACCUMULATE:
+            # Case 1: table works on cache+storage mode, frequencies should be assigned but not accumulated.
+            # Case 2: table works on storage mode, frequencies should be accumulated but unique_keys are not in the table.
+            #           so ASSIGIN has the same result as ACCUMULATE, so we didn't distinguish them
+            policy = ScorePolicy.ASSIGN
+
+        if not self._use_score and scores is not None:
+            # Case: table works on cache+storage and LRU mode, and the scores is from the cache,
+            # we assign it to preserve the distribution of score values ​​in the cache.
+            policy = ScorePolicy.ASSIGN
+
+        # 2. Bucketize keys: bkt_keys=unique_keys[inverse]
+        assert isinstance(
+            self.key_index_map, LinearBucketTable
+        ), "deterministic insert implementation only supports LinearBucketTable as key-index-map."
+        bkt_keys, offsets, inverse = cast(
+            LinearBucketTable, self.key_index_map
+        ).bucketize_keys(unique_keys)
+
+        jagged_keys = JaggedTensor(
+            values=bkt_keys.to(torch.int64),
+            offsets=offsets,
+            weights=scores.to(torch.int64)[inverse] if scores is not None else None,
+        )
+
+        # static_cast<int64_t>(double(-1)) will get 0xFFFFFFFFFFFFFFFF, which is EmptyKey for table.
+        pad_keys = jagged_keys.to_padded_dense(padding_value=-1.0)
+        pad_scores = jagged_keys.to_padded_dense_weights(padding_value=0.0)
+
+        keys_t = pad_keys.transpose(0, 1).to(self.key_type()).contiguous()
+        score_t = (
+            pad_scores.transpose(0, 1).contiguous() if pad_scores is not None else None
+        )
+
+        # 3. Insert iteratively
+        num_iter = keys_t.size(0)
+        for i in range(num_iter):
+            valid_mask = keys_t[i] != -1
+            valid_batch = valid_mask.sum().item()
+            valid_keys = keys_t[i][valid_mask].contiguous()
+            insert_results = torch.empty(
+                valid_batch, dtype=torch.uint8, device=keys_t[i].device
+            )
+            score_args_insert = [
+                ScoreArg(
+                    name=self.score_policy.name,
+                    # value=score_t[i] if score_t is not None else None,
+                    value=score_t[i][valid_mask].contiguous().to(torch.uint64)
+                    if score_t is not None
+                    else None,
+                    policy=policy,
+                    is_return=False,
+                )
+            ]
+
+            # self.key_index_map.insert(keys_t[i], score_args_insert)
+            self.key_index_map.insert(
+                valid_keys, score_args_insert, None, insert_results
+            )
+
+        # 4. lookup the indices in unique_keys' order and store the values.
+        score_args_lookup = [
+            ScoreArg(
+                name=self.score_policy.name,
+                policy=ScorePolicy.CONST,
+                is_return=False,
+            )
+        ]
+        indices = torch.zeros(
+            h_num_unique_keys,
+            dtype=self.key_index_map.index_type,
+            device=unique_keys.device,
+        )
+        founds = torch.zeros(
+            h_num_unique_keys, dtype=torch.bool, device=unique_keys.device
+        )
+        self.key_index_map.lookup(unique_keys, score_args_lookup, founds, indices)
+        store_to_combined_table(
+            self.dev_table, self.uvm_table, indices, unique_values.to(self.value_type())
+        )
+        return
+
+    def deterministic_insert_and_evict(
+        self,
+        unique_keys: torch.Tensor,
+        unique_values: torch.Tensor,
+        scores: Optional[torch.Tensor] = None,
+    ) -> None:
+        self.expand()
+
+        # 1.Preprocess
+        h_num_unique_keys = unique_keys.numel()
+
+        if h_num_unique_keys == 0:
+            return 0, None, None, None
+
+        num_evicted_accum = 0
+        evicted_keys_accum = torch.empty_like(unique_keys)
+        evicted_indices_accum = torch.zeros(
+            h_num_unique_keys,
+            dtype=self.key_index_map.index_type,
+            device=unique_keys.device,
+        )
+        evicted_scores_accum = torch.empty(
+            h_num_unique_keys, dtype=torch.uint64, device=unique_keys.device
+        )
+        evicted_values_accum: torch.Tensor = torch.empty_like(unique_values)
+
+        if self._use_score and scores is None:
+            scores = torch.empty(
+                h_num_unique_keys, device=unique_keys.device, dtype=torch.uint64
+            )
+            scores.fill_(self.score)
+
+        # 2. Bucketize keys: bkt_keys=unique_keys[inverse]
+        assert isinstance(
+            self.key_index_map, LinearBucketTable
+        ), "deterministic insert_and_evict implementation only supports LinearBucketTable as key-index-map."
+        bkt_keys, offsets, inverse = cast(
+            LinearBucketTable, self.key_index_map
+        ).bucketize_keys(unique_keys)
+
+        jagged_keys = JaggedTensor(
+            values=bkt_keys.to(torch.int64),
+            offsets=offsets,
+            weights=scores.to(torch.int64)[inverse] if scores is not None else None,
+        )
+
+        # static_cast<int64_t>(double(-1)) will get 0xFFFFFFFFFFFFFFFF, which is EmptyKey for table.
+        pad_keys = jagged_keys.to_padded_dense(padding_value=-1.0)
+        pad_scores = jagged_keys.to_padded_dense_weights(padding_value=0.0)
+
+        keys_t = pad_keys.transpose(0, 1).to(self.key_type()).contiguous()
+        score_t = (
+            pad_scores.transpose(0, 1).contiguous() if pad_scores is not None else None
+        )
+
+        # 3. Insert iteratively
+        num_iter = keys_t.size(0)
+        for i in range(num_iter):
+            valid_mask = keys_t[i] != -1
+            valid_batch = valid_mask.sum().item()
+            valid_keys = keys_t[i][valid_mask].contiguous()
+            insert_results = torch.empty(
+                valid_batch, dtype=torch.uint8, device=keys_t[i].device
+            )
+            score_args_insert = [
+                ScoreArg(
+                    name=self.score_policy.name,
+                    # value=score_t[i] if score_t is not None else None,
+                    value=score_t[i][valid_mask].contiguous().to(torch.uint64)
+                    if score_t is not None
+                    else None,
+                    policy=self.score_policy.policy,
+                    is_return=False,
+                )
+            ]
+
+            (
+                num_evicted,
+                evicted_keys,
+                evicted_indices,
+                evicted_scores,
+            ) = self.key_index_map.insert_and_evict(
+                valid_keys, score_args_insert, None, insert_results
+            )
+            evicted_scores = evicted_scores[0]
+
+            if num_evicted != 0:
+                evicted_keys_accum[
+                    num_evicted_accum : num_evicted_accum + num_evicted
+                ].copy_(evicted_keys, non_blocking=True)
+                evicted_indices_accum[
+                    num_evicted_accum : num_evicted_accum + num_evicted
+                ].copy_(evicted_indices, non_blocking=True)
+                evicted_scores_accum[
+                    num_evicted_accum : num_evicted_accum + num_evicted
+                ].copy_(evicted_scores, non_blocking=True)
+
+                num_evicted_accum += num_evicted
+
+        # check there is no duplicated eviction
+        evicted_keys_accum = evicted_keys_accum[:num_evicted_accum]
+        evicted_indices_accum = evicted_indices_accum[:num_evicted_accum]
+        evicted_scores_accum = evicted_scores_accum[:num_evicted_accum]
+        evicted_values_accum = evicted_values_accum[:num_evicted_accum, :]
+
+        assert len(set(evicted_indices_accum.tolist())) == num_evicted_accum
+
+        load_from_combined_table(
+            self.dev_table,
+            self.uvm_table,
+            evicted_indices_accum,
+            evicted_values_accum,
+        )
+
+        # 4. lookup the indices in unique_keys' order and store the values.
+        score_args_lookup = [
+            ScoreArg(
+                name=self.score_policy.name,
+                policy=ScorePolicy.CONST,
+                is_return=False,
+            )
+        ]
+        indices = torch.zeros(
+            h_num_unique_keys,
+            dtype=self.key_index_map.index_type,
+            device=unique_keys.device,
+        )
+        founds = torch.zeros(
+            h_num_unique_keys, dtype=torch.bool, device=unique_keys.device
+        )
+        self.key_index_map.lookup(unique_keys, score_args_lookup, founds, indices)
+        store_to_combined_table(
+            self.dev_table, self.uvm_table, indices, unique_values.to(self.value_type())
+        )
+
+        if self._record_cache_metrics:
+            self._cache_metrics[2] = h_num_unique_keys
+            self._cache_metrics[3] = num_evicted_accum
+        return (
+            num_evicted_accum,
+            evicted_keys_accum,
+            evicted_values_accum,
+            evicted_scores_accum,
+        )
 
 
 def update_cache(
