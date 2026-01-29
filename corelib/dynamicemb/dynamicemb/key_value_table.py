@@ -546,6 +546,9 @@ class KeyValueTable(
 
         batch = keys.size(0)
 
+        if batch == 0:
+            return 0, None, None
+
         device = keys.device
         founds = torch.empty(batch, dtype=torch.bool, device=device)
         pointers = torch.empty(batch, dtype=torch.long, device=device)
@@ -1184,6 +1187,16 @@ class DynamicEmbeddingTable(KeyValueTable):
 
         scores = self.create_scores(batch, device, input_scores)
 
+        if batch == 0:
+            return (
+                0,
+                torch.empty_like(unique_keys),
+                torch.empty(batch, dtype=torch.long, device=device),
+                torch.empty(batch, dtype=torch.uint64, device=device)
+                if scores is not None
+                else None,
+            )
+
         score_args_lookup = [
             ScoreArg(
                 name=self.score_policy.name,
@@ -1353,6 +1366,9 @@ class DynamicEmbeddingTable(KeyValueTable):
         assert self._score_update == False, "update is called only in backward."
 
         batch = keys.size(0)
+
+        if batch == 0:
+            return 0, None, None
 
         device = keys.device
         founds = torch.empty(batch, dtype=torch.bool, device=device)

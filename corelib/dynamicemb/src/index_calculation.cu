@@ -523,6 +523,15 @@ void select(at::Tensor flags, at::Tensor inputs, at::Tensor outputs,
   auto num_select_iter_type =
       scalartype_to_datatype(num_selected.dtype().toScalarType());
 
+  if (num_total == 0) {
+    DISPATCH_INTEGER_DATATYPE_FUNCTION(
+      num_select_iter_type, NumSelectedIteratorT, [&] {
+        DEMB_CUDA_CHECK(cudaMemsetAsync(
+          reinterpret_cast<NumSelectedIteratorT *>(num_selected.data_ptr()), 0,
+          sizeof(NumSelectedIteratorT), stream));
+    });
+    return;
+  }
   DISPATCH_INTEGER_DATATYPE_FUNCTION(key_type, KeyType, [&] {
     DISPATCH_INTEGER_DATATYPE_FUNCTION(
         num_select_iter_type, NumSelectedIteratorT, [&] {
@@ -545,6 +554,15 @@ void select_index(at::Tensor flags, at::Tensor output_indices,
   auto num_select_iter_type =
       scalartype_to_datatype(num_selected.dtype().toScalarType());
 
+  if (num_total == 0) {
+    DISPATCH_INTEGER_DATATYPE_FUNCTION(
+      num_select_iter_type, NumSelectedIteratorT, [&] {
+        DEMB_CUDA_CHECK(cudaMemsetAsync(
+          reinterpret_cast<NumSelectedIteratorT *>(num_selected.data_ptr()), 0,
+          sizeof(NumSelectedIteratorT), stream));
+    });
+    return;
+  }
   DISPATCH_INTEGER_DATATYPE_FUNCTION(key_type, KeyType, [&] {
     DISPATCH_INTEGER_DATATYPE_FUNCTION(
         num_select_iter_type, NumSelectedIteratorT, [&] {
