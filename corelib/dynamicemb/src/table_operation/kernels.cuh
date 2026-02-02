@@ -404,12 +404,8 @@ __global__ void table_insert_and_evict_kernel(
         evicted_scores[out_id] = evict_score;
       }
       if (evicted_indices) {
-        IndexType index;
-        if (result == InsertResult::Evict) {
-          index = bucket_id * bucket.capacity() + iter;
-        } else {
-          index = -1;
-        }
+        // if insert failed, save the index in input value buffer as negative index.
+        IndexType index = (result == InsertResult::Evict) ? bucket_id * bucket.capacity() + iter : -static_cast<IndexType>(i + 1); 
         evicted_indices[out_id] = index;
       }
     }
