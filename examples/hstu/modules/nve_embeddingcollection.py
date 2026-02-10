@@ -13,13 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import torch
 from torchrec.modules.embedding_configs import (
     EmbeddingConfig,
-    EmbeddingBackendConfig, 
 )
+from configs import InferenceEmbeddingConfig
 from torchrec.modules.embedding_modules import get_embedding_names_by_table
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
@@ -29,7 +30,7 @@ try:
 
 
     @dataclass
-    class NVEBackendConfig(EmbeddingBackendConfig):
+    class NVEBackendConfig(InferenceEmbeddingConfig):
         use_gpu_only: bool
         gpu_cache_ratio: float
         host_cache_ratio: float
@@ -49,7 +50,7 @@ try:
         def __init__(
             self,
             embedding_configs: List[EmbeddingConfig],
-            embedding_backend_config: EmbeddingBackendConfig,
+            embedding_backend_config: InferenceEmbeddingConfig,
             dynamic_table_names: List[str],
         ):
             super().__init__()
@@ -66,7 +67,7 @@ try:
                 if config.name in self._dynamic_table_names:
                     continue
 
-                if embedding_backend_config.use_gpu_only: # use gpu nve layer
+                if embedding_backend_config.use_gpu_only and config.name not in self._dynamic_table_names: # use gpu nve layer
                     self.embeddings[config.name] = NVEmbedding(
                         num_embeddings=config.num_embeddings,
                         embedding_size=config.embedding_dim,
@@ -75,7 +76,7 @@ try:
                         optimize_for_training=False,
                         device=self._device,
                     )
-                else: # use linear nve layer
+                elif config.name not in self._dynamic_table_names: # use linear nve layer
                     gpu_cache_size = int(
                         embedding_backend_config.gpu_cache_ratio
                         * config.num_embeddings
@@ -83,32 +84,27 @@ try:
                         * torch.tensor([], dtype=config.data_type).element_size()
                     )
                     self.embeddings[config.name] = NVEmbedding(
-                        num_embeddings=num_embeddings, 
-                        embedding_size=embedding_dim, 
-                        data_type=data_type, 
+                        num_embeddings=config.num_embeddings, 
+                        embedding_size=config.embedding_dim, 
+                        data_type=config.data_type, 
                         cache_type=nve_layers.CacheType.LinearUVM, 
                         gpu_cache_size=gpu_cache_size, 
                         weight_init=embedding_backend_config.weight_init, 
                         memblock=embedding_backend_config.memblock,
                         optimize_for_training=False,
                         device=self._device,
-                    )                    
-
-            # create embedding tables for kv-lookup
-            for config in embedding_configs:
-                if config.name not in self._dynamic_table_names:
-                    continue
-
-                self.dynamic_embeddings[config.name] = NVEmbedding(
-                    num_embeddings=config.num_embeddings,
-                    embedding_size=config.embedding_dim,
-                    data_type=config.data_type,
-                    gpu_cache_size=dynamic_backend_config.dynamic_gpu_cache_size, 
-                    host_cache_size=dynamic_backend_config.dynamic_host_cache_size, 
-                    remote_interface=dynamic_backend_config.dynamic_remote_interface, 
-                    optimize_for_training=False, 
-                    device=self._device, 
-                )
+                    )
+                else:
+                    self.embeddings[config.name] = NVEmbedding(
+                        num_embeddings=config.num_embeddings,
+                        embedding_size=config.embedding_dim,
+                        data_type=config.data_type,
+                        gpu_cache_size=embedding_backend_config.dynamic_gpu_cache_size, 
+                        host_cache_size=embedding_backend_config.dynamic_host_cache_size, 
+                        remote_interface=embedding_backend_config.dynamic_remote_interface, 
+                        optimize_for_training=False, 
+                        device=self._device, 
+                    )
 
             self._feature_names: List[List[str]] = [
                 table.feature_names for table in _embedding_configs
