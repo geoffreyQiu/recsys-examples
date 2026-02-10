@@ -162,6 +162,7 @@ class InferenceDenseModule(torch.nn.Module):
         )
         set_use_runtime_max_seq_len(False)
         set_static_max_seq_lens(max_seq_len, max_seq_len)
+        self._scaling_seqlen = hstu_config.scaling_seqlen
 
         self._hidden_states = torch.randn(
             (max_batch_size * max_seq_len, hidden_dim), dtype=dtype, device=self._device
@@ -315,6 +316,7 @@ class InferenceDenseModule(torch.nn.Module):
                 batch=batch,
                 seq_start_position=old_cached_lengths.cuda(),
             )
+            jagged_data.scaling_seqlen = self._scaling_seqlen
 
             kvcache_metadata = self.async_kvcache.prepare_kvcache_wait(
                 onload_fut,

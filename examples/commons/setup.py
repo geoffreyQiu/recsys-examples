@@ -48,17 +48,17 @@ setup(
             ],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++20", "-fvisibility=hidden"] + [
-                    "-I/home/junyiq/newscratch/november/dl/nvcomp-linux-x86_64-5.1.0.21_cuda12-archive/include",
-                    "-L/home/junyiq/newscratch/november/dl/nvcomp-linux-x86_64-5.1.0.21_cuda12-archive/lib",
+                    "-I/workspace/nvcomp/include",
+                    "-L/workspace/nvcomp/lib",
                     "-lnvcomp_static",
                 ],
                 "nvcc": nvcc_threads_args() + nvcc_flags,
             },
             include_dirs=[
-                "/home/junyiq/newscratch/november/dl/nvcomp-linux-x86_64-5.1.0.21_cuda12-archive/include", 
+                "/workspace/nvcomp/include", 
             ],
             library_dirs=[
-                "/home/junyiq/newscratch/november/dl/nvcomp-linux-x86_64-5.1.0.21_cuda12-archive/lib", 
+                "/workspace/nvcomp/lib", 
             ],
             libraries=["nvcomp_static"],
         ),

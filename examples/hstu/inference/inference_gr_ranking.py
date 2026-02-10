@@ -156,6 +156,7 @@ def get_inference_hstu_model(
         head_dim=network_args.kv_channels,
         max_batch_size=max_batch_size,
         max_seq_len=math.ceil(total_max_seqlen / 32) * 32,
+        scaling_seqlen=total_max_seqlen,
         dtype=inference_dtype,
         position_encoding_config=position_encoding_config,
         contextual_max_seqlen=num_contextual_features,

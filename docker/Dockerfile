@@ -23,11 +23,7 @@ RUN ARCH=$([ "${TARGETPLATFORM}" = "linux/arm64" ] && echo "aarch64" || echo "x8
     if [ ${ARCH} = "aarch64" ]; then \
       ln -s /usr/local/cuda-12.9/targets/sbsa-linux/lib/stubs/libnvidia-ml.so  /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1; \
     else \
-      if [[ "${INFERENCEBUILD}" == "1" && "${TRITONSERVER_BUILD}" != "1" ]]; then \
-        ln -s /usr/local/cuda-12.8/targets/${ARCH}-linux/lib/stubs/libnvidia-ml.so  /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1; \
-      else \
-        ln -s /usr/local/cuda-12.9/targets/${ARCH}-linux/lib/stubs/libnvidia-ml.so  /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1; \
-      fi \
+      ln -s /usr/local/cuda-12.9/targets/${ARCH}-linux/lib/stubs/libnvidia-ml.so  /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1; \
     fi
 
 RUN if [ "${INFERENCEBUILD}" != "1" ]; then \
@@ -49,6 +45,11 @@ RUN pip install --no-deps tensordict orjson && \
   pip install --no-deps .
 
 RUN pip install nvidia-cutlass-dsl==4.3.0
+
+RUN wget https://developer.download.nvidia.com/compute/nvcomp/redist/nvcomp/linux-x86_64/nvcomp-linux-x86_64-5.1.0.21_cuda12-archive.tar.xz && \
+    tar -xf nvcomp-linux-x86_64-5.1.0.21_cuda12-archive.tar.xz && \
+    mv nvcomp-linux-x86_64-5.1.0.21_cuda12-archive nvcomp && \
+    rm  nvcomp-linux-x86_64-5.1.0.21_cuda12-archive.tar.xz 
 
 # for dev
 RUN apt update -y --fix-missing && \
