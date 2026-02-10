@@ -46,10 +46,6 @@ RUN pip install --no-deps tensordict orjson && \
 
 RUN pip install nvidia-cutlass-dsl==4.3.0
 
-RUN wget https://developer.download.nvidia.com/compute/nvcomp/redist/nvcomp/linux-x86_64/nvcomp-linux-x86_64-5.1.0.21_cuda12-archive.tar.xz && \
-    tar -xf nvcomp-linux-x86_64-5.1.0.21_cuda12-archive.tar.xz && \
-    mv nvcomp-linux-x86_64-5.1.0.21_cuda12-archive nvcomp && \
-    rm  nvcomp-linux-x86_64-5.1.0.21_cuda12-archive.tar.xz 
 
 # for dev
 RUN apt update -y --fix-missing && \
@@ -86,5 +82,11 @@ RUN if [ "${TRITONSERVER_BUILD}" = "1" ]; then \
       pip3 uninstall -y hstu_attn hstu_hopper; \
     fi
 
+RUN cd /workspace/deps && rm -rf nvcomp && \
+    wget https://developer.download.nvidia.com/compute/nvcomp/redist/nvcomp/linux-x86_64/nvcomp-linux-x86_64-5.1.0.21_cuda12-archive.tar.xz && \
+    tar -xf nvcomp-linux-x86_64-5.1.0.21_cuda12-archive.tar.xz && \
+    mv nvcomp-linux-x86_64-5.1.0.21_cuda12-archive nvcomp && \
+    rm  nvcomp-linux-x86_64-5.1.0.21_cuda12-archive.tar.xz 
+  
 RUN cd /workspace/recsys-examples/examples/commons && \
     TORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 8.6 9.0" python3 setup.py install
