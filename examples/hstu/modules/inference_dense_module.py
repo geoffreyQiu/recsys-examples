@@ -12,27 +12,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 import math
-import warnings
-from typing import Dict, List, Optional, Tuple, Union
+import os
+from typing import Dict, List
 
+import paged_kvcache_ops
 import torch
 from commons.datasets.hstu_batch import HSTUBatch
 from configs import (
     InferenceHSTUConfig,
     KVCacheConfig,
-    KVCacheMetadata,
     RankingConfig,
     copy_kvcache_metadata,
-    get_kvcache_metadata_buffer
+    get_kvcache_metadata_buffer,
 )
 from modules.hstu_block_inference import HSTUBlockInference
 from modules.jagged_data import JaggedData
 from modules.mlp import MLP
-from ops.triton_ops.triton_jagged import triton_concat_2D_jagged
 from torchrec.sparse.jagged_tensor import JaggedTensor
-import paged_kvcache_ops
 
 
 def get_jagged_metadata_buffer(max_batch_size, max_seq_len, contextual_max_seqlen):
@@ -160,6 +157,7 @@ class InferenceDenseModule(torch.nn.Module):
             set_static_max_seq_lens,
             set_use_runtime_max_seq_len,
         )
+
         set_use_runtime_max_seq_len(False)
         set_static_max_seq_lens(max_seq_len, max_seq_len)
         self._scaling_seqlen = hstu_config.scaling_seqlen
@@ -177,14 +175,20 @@ class InferenceDenseModule(torch.nn.Module):
             from modules.async_kvcache_manager import AsyncHSTUKVCacheManager
 
             if kvcache_config.max_queued_offload_tokens is None:
-                kvcache_config.max_queued_offload_tokens = 4 * hstu_config.max_batch_size * hstu_config.max_seq_len
+                kvcache_config.max_queued_offload_tokens = (
+                    4 * hstu_config.max_batch_size * hstu_config.max_seq_len
+                )
             self.async_kvcache = AsyncHSTUKVCacheManager(
                 hstu_config.num_layers,
                 hstu_config.num_heads,
                 hstu_config.head_dim,
                 kvcache_config.page_size,
                 kvcache_config.blocks_in_primary_pool,
-                math.ceil(hstu_config.max_batch_size * hstu_config.max_seq_len / kvcache_config.page_size),
+                math.ceil(
+                    hstu_config.max_batch_size
+                    * hstu_config.max_seq_len
+                    / kvcache_config.page_size
+                ),
                 0,
                 kvcache_config.offload_chunksize,
                 -1,
@@ -205,9 +209,15 @@ class InferenceDenseModule(torch.nn.Module):
                 self._kvcache_metadata = get_kvcache_metadata_buffer(
                     hstu_config, kvcache_config
                 )
-                self._kvcache_metadata.kv_cache_table = self.async_kvcache.cache_table_list
-                self._kvcache_metadata.kv_onload_handle = paged_kvcache_ops.KVOnloadHandle()
-                self._kvcache_metadata.kv_offload_handle = paged_kvcache_ops.KVOffloadHandle()
+                self._kvcache_metadata.kv_cache_table = (
+                    self.async_kvcache.cache_table_list
+                )
+                self._kvcache_metadata.kv_onload_handle = (
+                    paged_kvcache_ops.KVOnloadHandle()
+                )
+                self._kvcache_metadata.kv_offload_handle = (
+                    paged_kvcache_ops.KVOffloadHandle()
+                )
             self._hstu_block.set_cudagraph(
                 max_batch_size,
                 max_seq_len,
@@ -306,7 +316,7 @@ class InferenceDenseModule(torch.nn.Module):
                 num_history_tokens,
                 offload_uids_buffer,
                 metadata_host_buffer,
-                metadata_gpu_buffer, # returned static
+                metadata_gpu_buffer,  # returned static
                 kvcache_metadata_fut,
                 onload_fut,
             ) = prepare_kvcache_result
@@ -327,7 +337,7 @@ class InferenceDenseModule(torch.nn.Module):
                 self.async_kvcache.static_offload_page_ids_gpu_buffer,
                 offload_uids_buffer,
                 metadata_host_buffer,
-                metadata_gpu_buffer, # returned static
+                metadata_gpu_buffer,  # returned static
                 self.async_kvcache.static_onload_handle,
             )
             self.async_kvcache.offload_kvcache(kvcache_metadata)
@@ -365,7 +375,7 @@ class InferenceDenseModule(torch.nn.Module):
             jagged_item_logit = self._mlp(jagged_data.values)
 
         return jagged_item_logit
-    
+
     def forward_nokvcache(
         self,
         batch: HSTUBatch,

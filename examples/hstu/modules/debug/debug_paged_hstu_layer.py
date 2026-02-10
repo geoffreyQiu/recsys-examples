@@ -4,9 +4,11 @@ from functools import wraps
 
 import torch
 
+
 def need_dump():
-    dump = os.environ.get('DUMP_PAGED_HSTU_TENSORS', default="0")
+    dump = os.environ.get("DUMP_PAGED_HSTU_TENSORS", default="0")
     return True if dump in {"1", 1, "True", True, "ON", "on", "On"} else False
+
 
 def dump_paged_hstu_forward_naive(frame_locals, dump_status):
     if "jagged_attn_output" in frame_locals and "jagged_attn_output" not in dump_status:
@@ -23,14 +25,14 @@ def dump_paged_hstu_forward_naive(frame_locals, dump_status):
             v_last_empty = 32 - int(v_metadata.kv_last_page_len[0])
             v_Kcand = v_K[-v_num_cand:, ...]
             v_Vcand = v_V[-v_num_cand:, ...]
-            
+
             v_table = v_metadata.kv_cache_table[layer_idx]
             v_Khist = v_table[v_metadata.kv_indices, 0, ...]
             v_Khist = v_Khist.view(-1, v_Khist.size(2), v_Khist.size(3))
             v_Vhist = v_table[v_metadata.kv_indices, 1, ...]
             v_Vhist = v_Vhist.view(-1, v_Vhist.size(2), v_Vhist.size(3))
-            v_Khist = v_Khist[:v_Khist.size(0)-v_last_empty]
-            v_Vhist = v_Vhist[:v_Vhist.size(0)-v_last_empty]
+            v_Khist = v_Khist[: v_Khist.size(0) - v_last_empty]
+            v_Vhist = v_Vhist[: v_Vhist.size(0) - v_last_empty]
             v_Kall = torch.cat([v_Khist, v_Kcand])
             v_Vall = torch.cat([v_Vhist, v_Vcand])
             torch.save(v_Kall, f"/tmp/key_layer{layer_idx}.pt")
@@ -54,6 +56,7 @@ def dump_paged_hstu_forward_naive(frame_locals, dump_status):
 
 def dump(func_name, dump_func):
     dump_status = set()
+
     def tracer(frame, event, arg):
         nonlocal dump_status
         if frame.f_code.co_name == func_name:
@@ -69,11 +72,14 @@ def dump(func_name, dump_func):
     def decorator(func):
         if not need_dump():
             return func
+
         @wraps(func)
         def wrapper(*args, **kwargs):
             sys.settrace(tracer)
             result = func(*args, **kwargs)
             sys.settrace(None)
             return result
+
         return wrapper
+
     return decorator

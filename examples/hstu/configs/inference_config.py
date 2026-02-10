@@ -64,14 +64,14 @@ class KVCacheMetadata:
 
     # paged cache metadata
     kv_indices: torch.Tensor = None  # num_pages
-    kv_indptr: torch.Tensor = None   # num_seq + 1
-    kv_last_page_len: torch.Tensor = None # num_seq
-    total_history_lengths: torch.Tensor = None # num_seq
-    total_history_offsets: torch.Tensor = None # num_seq + 1
+    kv_indptr: torch.Tensor = None  # num_seq + 1
+    kv_last_page_len: torch.Tensor = None  # num_seq
+    total_history_lengths: torch.Tensor = None  # num_seq
+    total_history_offsets: torch.Tensor = None  # num_seq + 1
 
     # appending metadata
     batch_indices: torch.Tensor = None  # num_tokens
-    position: torch.Tensor = None       # num_tokens
+    position: torch.Tensor = None  # num_tokens
     new_history_nnz: int = 0
     new_history_nnz_cuda: torch.Tensor = None  # 1
 
@@ -88,6 +88,7 @@ class KVCacheMetadata:
     new_offload_lengths: Optional[torch.Tensor] = None
 
     max_seqlen: Optional[int] = 0
+
 
 @dataclass
 class KVCacheConfig:

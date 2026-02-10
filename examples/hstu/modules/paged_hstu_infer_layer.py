@@ -23,12 +23,7 @@ from ops.triton_ops.triton_addmm import triton_addmm_silu_fwd
 from ops.triton_ops.triton_layer_norm import triton_weighted_layer_norm_fwd
 from ops.triton_ops.triton_norm_mul_dropout import triton_layer_norm_mul_dropout_fwd
 
-from .debug.debug_paged_hstu_layer import (
-    dump,
-    dump_paged_hstu_forward_naive,
-)
-
-import numpy as np
+from .debug.debug_paged_hstu_layer import dump, dump_paged_hstu_forward_naive
 
 
 class PagedHSTUInferLayer(torch.nn.Module):
@@ -276,8 +271,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
             eps=self._eps,
         )
 
-        # mixed_uvqk = self.uvqk_addmm_impl(normed_input, 0)
-        mixed_uvqk = F.silu(torch.matmul(normed_input, self._linear_uvqk_weight) + self._linear_uvqk.bias)
+        mixed_uvqk = self.uvqk_addmm_impl(normed_input, num_tokens)
         (user, value, query, key) = torch.split(
             mixed_uvqk,
             self._split_arg_list,
@@ -317,7 +311,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
                 kv_cache_metadata.total_history_offsets[: batch_size + 1],
                 jd.max_seqlen,
                 jd.max_seqlen,
-                num_contexts = None,
+                num_contexts=None,
                 num_targets=jd.num_candidates[:batch_size],
                 target_group_size=1,
                 window_size=(-1, 0),
@@ -340,7 +334,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
                 jd.seqlen_offsets[: batch_size + 1],
                 jd.max_seqlen,
                 jd.max_seqlen,
-                num_contexts = None,
+                num_contexts=None,
                 num_targets=jd.num_candidates[:batch_size],
                 target_group_size=1,
                 window_size=(-1, 0),
@@ -355,16 +349,13 @@ class PagedHSTUInferLayer(torch.nn.Module):
         )
 
         parallel_input = self.norm_mul_impl(
-            jagged_attn_output, user, False #num_tokens >= 2048
+            jagged_attn_output, user, num_tokens >= 2048
         )
 
         if self._residual:
-            # layer_output = self.proj_addmm_impl(parallel_input, layer_input, 0)
-            layer_output = (torch.matmul(parallel_input, self._linear_proj_weight) + layer_input)
+            layer_output = self.proj_addmm_impl(parallel_input, layer_input, num_tokens)
         else:
-            # layer_output = self._linear_proj(parallel_input)
-            layer_output = torch.matmul(parallel_input, self._linear_proj_weight)
-
+            layer_output = self._linear_proj(parallel_input)
         return layer_output
 
     @torch.inference_mode()
@@ -450,9 +441,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
             else jd.seqlen_offsets[: batch_size + 1],
             self._max_seqlen,
             self._max_seqlen,
-            num_contexts=jd.contextual_seqlen[:batch_size]
-            if jd.contextual_seqlen is not None
-            else None,
+            num_contexts=None,
             num_targets=jd.num_candidates[:batch_size],
             target_group_size=1,
             window_size=(-1, 0),

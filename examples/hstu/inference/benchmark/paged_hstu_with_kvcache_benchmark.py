@@ -16,6 +16,7 @@ import itertools
 import math
 from typing import List
 
+import paged_kvcache_ops
 import torch
 from commons.datasets.hstu_batch import FeatureConfig
 from configs import (
@@ -28,7 +29,6 @@ from configs import (
 )
 from modules.inference_dense_module import InferenceDenseModule, copy_jagged_metadata
 from modules.jagged_data import JaggedData
-import paged_kvcache_ops
 
 _item_fea_name = "item_feat"
 _item_vocab_size = 10000

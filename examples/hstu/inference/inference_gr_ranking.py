@@ -17,7 +17,6 @@ import enum
 import math
 import sys
 import time
-import os
 
 import gin
 import torch
@@ -269,13 +268,13 @@ def run_ranking_gr_simulate(
                 uids, dates, seq_endptrs = next(dataloader_iter)
                 if dates[0] != cur_date:
                     # if cur_date is not None:
-                        # eval_metric_dict = eval_module.compute()
-                        # print(
-                        #     f"[eval]:\n    "
-                        #     + stringify_dict(
-                        #         eval_metric_dict, prefix="Metrics", sep="\n    "
-                        #     )
-                        # )
+                    # eval_metric_dict = eval_module.compute()
+                    # print(
+                    #     f"[eval]:\n    "
+                    #     + stringify_dict(
+                    #         eval_metric_dict, prefix="Metrics", sep="\n    "
+                    #     )
+                    # )
                     # model.clear_kv_cache()
                     if cur_date is not None:
                         break
@@ -290,7 +289,7 @@ def run_ranking_gr_simulate(
                     with_ranking_labels=False,
                 )
                 total_history_lengths = seq_endptrs * 2 + num_contextual_features
-                
+
                 if batch is not None:
                     if not disable_kvcache:
                         logits = model.forward(
@@ -299,7 +298,7 @@ def run_ranking_gr_simulate(
                             total_history_lengths,
                         )
                     else:
-                        logits = model.forward_nokvcache(batch)
+                        model.forward_nokvcache(batch)
                     # eval_module(logits, batch.labels)
 
                 num_batches_ctr += 1
@@ -333,7 +332,6 @@ def run_ranking_gr_evaluate(
         dataset_args.max_num_candidates + dataset_args.max_history_seqlen
     ) * 2 + num_contextual_features
     print("total_max_seqlen", total_max_seqlen)
-
 
     def strip_padding_batch(batch, unpadded_batch_size):
         batch.batch_size = unpadded_batch_size
@@ -392,9 +390,14 @@ def run_ranking_gr_evaluate(
                 user_ids = d["user_id"].values().cpu().long()
                 if user_ids.shape[0] != batch.batch_size:
                     batch = strip_padding_batch(batch, user_ids.shape[0])
-                total_history_lengths = torch.sum(batch.features.lengths().view(-1, batch.batch_size), 0).view(-1) - batch.num_candidates
+                total_history_lengths = (
+                    torch.sum(
+                        batch.features.lengths().view(-1, batch.batch_size), 0
+                    ).view(-1)
+                    - batch.num_candidates
+                )
                 total_history_lengths = total_history_lengths.cpu()
-                
+
                 if not disable_kvcache:
                     logits = model.forward(batch, user_ids, total_history_lengths)
                 else:

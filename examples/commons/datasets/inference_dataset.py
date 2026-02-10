@@ -160,12 +160,12 @@ class InferenceDataset(IterableDataset[HSTUBatch]):
                 )
                 dates.append(self._batch_logs_frame.iloc[sample_id][self._date_name])
                 seq_endptrs.append(seq_endptr)
-            
+
             last_date = dates[0]
             final_user_ids: List[int] = []
             final_dates: List[int] = []
             final_seq_endptrs: List[int] = []
-            for (uid, date, endp) in zip(user_ids, dates, seq_endptrs):
+            for uid, date, endp in zip(user_ids, dates, seq_endptrs):
                 if date != last_date:
                     continue
                 if uid not in final_user_ids:
@@ -319,7 +319,7 @@ class InferenceDataset(IterableDataset[HSTUBatch]):
         labels = torch.tensor(labels, dtype=torch.int64, device=self._device)
         batch_kwargs = dict(
             features=features,
-            batch_size=len(user_ids), # self._batch_size,
+            batch_size=len(user_ids),
             feature_to_max_seqlen=feature_to_max_seqlen,
             contextual_feature_names=self._contextual_feature_names,
             item_feature_name=self._item_feature_name,

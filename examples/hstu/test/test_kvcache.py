@@ -12,25 +12,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import sys
-
-import torch
-from commons.datasets.hstu_batch import FeatureConfig, HSTUBatch
-from configs import (
-    InferenceEmbeddingConfig,
-    KVCacheMetadata,
-    RankingConfig,
-    get_inference_hstu_config,
-    get_kvcache_config,
-)
-from modules.async_kvcache_manager import AsyncHSTUKVCacheManager
-import paged_kvcache_ops
 import math
 import random
-import time
+
+import paged_kvcache_ops
+import torch
+from commons.datasets.hstu_batch import FeatureConfig
+from configs import KVCacheMetadata, get_inference_hstu_config, get_kvcache_config
+from modules.async_kvcache_manager import AsyncHSTUKVCacheManager
 
 
-def get_test_kvcache_mgr(num_layers, blocks_in_primary_pool, page_size, offload_chunksize, enable_nvcomp = False):
+def get_test_kvcache_mgr(
+    num_layers,
+    blocks_in_primary_pool,
+    page_size,
+    offload_chunksize,
+    enable_nvcomp=False,
+):
     # requires to test sequentientially
     max_batch_size = 8
     max_seqlen = 10240
@@ -45,7 +43,6 @@ def get_test_kvcache_mgr(num_layers, blocks_in_primary_pool, page_size, offload_
             is_jagged=False,
         ),
     ]
-    max_contextual_seqlen = 0
 
     hidden_dim_size = 512
     num_heads = 4
@@ -74,14 +71,20 @@ def get_test_kvcache_mgr(num_layers, blocks_in_primary_pool, page_size, offload_
         hstu_config.head_dim,
         kv_cache_config.page_size,
         kv_cache_config.blocks_in_primary_pool,
-        math.ceil(hstu_config.max_batch_size * hstu_config.max_seq_len / kv_cache_config.page_size),
+        math.ceil(
+            hstu_config.max_batch_size
+            * hstu_config.max_seq_len
+            / kv_cache_config.page_size
+        ),
         4 * hstu_config.max_batch_size * hstu_config.max_seq_len,
         kv_cache_config.offload_chunksize,
         -1,
         hstu_config.max_seq_len,
         hstu_config.max_batch_size,
         4 * hstu_config.max_batch_size * hstu_config.max_seq_len,
-        1, 8, 8,
+        1,
+        8,
+        8,
         enable_nvcomp,
     )
 
@@ -91,13 +94,18 @@ def get_test_kvcache_mgr(num_layers, blocks_in_primary_pool, page_size, offload_
 
     return async_kvcache_mgr
 
+
 def init_random_kvcache_status():
     pass
+
 
 def reset_kvcache_status():
     pass
 
-def get_test_userids_and_metadata(min_user_id, seq_lengths, num_layers, gpu_kvcache_mgr):
+
+def get_test_userids_and_metadata(
+    min_user_id, seq_lengths, num_layers, gpu_kvcache_mgr
+):
     batch_size = len(seq_lengths)
     page_size = 32
     chunk_size = 1024
@@ -107,16 +115,28 @@ def get_test_userids_and_metadata(min_user_id, seq_lengths, num_layers, gpu_kvca
     random.shuffle(uids)
     user_ids = torch.tensor(uids[:batch_size]).long().cuda()
     offload_user_ids = user_ids.clone().cpu()
-    
-    num_pages = torch.floor(seq_lengths / chunk_size).int() * int(chunk_size / page_size)
-    num_pages = num_pages.cpu().tolist()
-    offload_page_ids = torch.cat([ torch.randint(blocks_in_primary_pool, (int(num_pages[idx]),)) for idx in range(batch_size) ], 0).int()
 
-    kv_offload_handle = paged_kvcache_ops.KVOffloadHandle(num_layers, gpu_kvcache_mgr, True)
+    num_pages = torch.floor(seq_lengths / chunk_size).int() * int(
+        chunk_size / page_size
+    )
+    num_pages = num_pages.cpu().tolist()
+    offload_page_ids = torch.cat(
+        [
+            torch.randint(blocks_in_primary_pool, (int(num_pages[idx]),))
+            for idx in range(batch_size)
+        ],
+        0,
+    ).int()
+
+    kv_offload_handle = paged_kvcache_ops.KVOffloadHandle(
+        num_layers, gpu_kvcache_mgr, True
+    )
 
     # zero start
     new_offload_startpos = torch.zeros((batch_size,)).int().cpu()
-    new_offload_lengths = torch.floor(seq_lengths / chunk_size).int().cpu() * int(chunk_size)
+    new_offload_lengths = torch.floor(seq_lengths / chunk_size).int().cpu() * int(
+        chunk_size
+    )
 
     kvcache_metadata = KVCacheMetadata(
         offload_user_ids=offload_user_ids,
@@ -137,7 +157,8 @@ def test_kvcache_offload_onload():
 
     with torch.inference_mode():
         async_kvcache_mgr = get_test_kvcache_mgr(
-            num_layers, blocks_in_primary_pool, page_size, offload_chunksize)
+            num_layers, blocks_in_primary_pool, page_size, offload_chunksize
+        )
 
         uid_min_limit = 0
         for batch_size, seq_len in [
@@ -146,8 +167,10 @@ def test_kvcache_offload_onload():
             (6, 8000),
         ]:
             uids, kv_metadata = get_test_userids_and_metadata(
-                uid_min_limit, torch.tensor([seq_len] * batch_size).int().cuda(),
-                num_layers, async_kvcache_mgr.gpu_kvcache_mgr,
+                uid_min_limit,
+                torch.tensor([seq_len] * batch_size).int().cuda(),
+                num_layers,
+                async_kvcache_mgr.gpu_kvcache_mgr,
             )
             async_kvcache_mgr.offload_kvcache(kv_metadata)
 
@@ -156,23 +179,31 @@ def test_kvcache_offload_onload():
 
             while async_kvcache_mgr.gpu_kvcache_mgr.is_busy_offloading():
                 pass
-            
+
             async_kvcache_mgr.static_onload_handle.reset()
-            async_kvcache_mgr.gpu_kvcache_mgr.onload_kvcache(uids.tolist(), async_kvcache_mgr.static_onload_handle)
+            async_kvcache_mgr.gpu_kvcache_mgr.onload_kvcache(
+                uids.tolist(), async_kvcache_mgr.static_onload_handle
+            )
 
             for layer_idx in range(num_layers):
                 async_kvcache_mgr.static_onload_handle.wait_host(layer_idx)
 
             # check data
             total_onload_pages = len(kv_metadata.offload_page_ids)
-            origin_kvdata = async_kvcache_mgr.cache_table[:, kv_metadata.offload_page_ids, ...]
-            onload_kvdata = async_kvcache_mgr.cache_table[:, blocks_in_primary_pool:blocks_in_primary_pool+total_onload_pages, ...]
+            origin_kvdata = async_kvcache_mgr.cache_table[
+                :, kv_metadata.offload_page_ids, ...
+            ]
+            onload_kvdata = async_kvcache_mgr.cache_table[
+                :,
+                blocks_in_primary_pool : blocks_in_primary_pool + total_onload_pages,
+                ...,
+            ]
             assert torch.allclose(onload_kvdata, origin_kvdata)
-            
+
             torch.cuda.synchronize()
 
             uid_min_limit += batch_size
-        
+
 
 if __name__ == "__main__":
     random.seed(1)

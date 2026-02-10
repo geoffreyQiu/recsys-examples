@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-from typing import List, Tuple, Union
 
 import torch
 from commons.datasets.hstu_batch import HSTUBatch
@@ -88,19 +87,24 @@ class InferenceRankingGR(torch.nn.Module):
         total_history_lengths: torch.Tensor,
     ):
         with torch.inference_mode():
-            prepare_kvcache_result = self.dense_module.async_kvcache.prepare_kvcache_async(
-                batch.batch_size,
-                user_ids.tolist(),
-                total_history_lengths.tolist(),
-                self.dense_module.async_kvcache.static_page_ids_gpu_buffer,
-                self.dense_module.async_kvcache.static_offload_page_ids_gpu_buffer,
-                self.dense_module.async_kvcache.static_metadata_gpu_buffer,
-                self.dense_module.async_kvcache.static_onload_handle,
+            prepare_kvcache_result = (
+                self.dense_module.async_kvcache.prepare_kvcache_async(
+                    batch.batch_size,
+                    user_ids.tolist(),
+                    total_history_lengths.tolist(),
+                    self.dense_module.async_kvcache.static_page_ids_gpu_buffer,
+                    self.dense_module.async_kvcache.static_offload_page_ids_gpu_buffer,
+                    self.dense_module.async_kvcache.static_metadata_gpu_buffer,
+                    self.dense_module.async_kvcache.static_onload_handle,
+                )
             )
-            
-            old_cached_lengths = torch.tensor(prepare_kvcache_result[0], dtype=torch.int32)
+
+            old_cached_lengths = torch.tensor(
+                prepare_kvcache_result[0], dtype=torch.int32
+            )
             striped_batch = self.dense_module.async_kvcache.strip_cached_tokens(
-                batch, old_cached_lengths,
+                batch,
+                old_cached_lengths,
             )
 
             torch.cuda.nvtx.range_push("HSTU embedding")
@@ -109,11 +113,15 @@ class InferenceRankingGR(torch.nn.Module):
 
             prepare_kvcache_result = [old_cached_lengths] + prepare_kvcache_result[1:]
             logits = self.dense_module(
-                striped_batch, embeddings, user_ids, total_history_lengths, prepare_kvcache_result
+                striped_batch,
+                embeddings,
+                user_ids,
+                total_history_lengths,
+                prepare_kvcache_result,
             )
 
         return logits
-    
+
     def forward_nokvcache(
         self,
         batch: HSTUBatch,
@@ -122,9 +130,7 @@ class InferenceRankingGR(torch.nn.Module):
             torch.cuda.nvtx.range_push("HSTU embedding")
             embeddings = self.sparse_module(batch.features)
             torch.cuda.nvtx.range_pop()
-            logits = self.dense_module.forward_nokvcache(
-                batch, embeddings
-            )
+            logits = self.dense_module.forward_nokvcache(batch, embeddings)
 
         return logits
 

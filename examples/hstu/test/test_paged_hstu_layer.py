@@ -31,7 +31,7 @@ from configs import (
 from hstu_assert_close import assert_hstu_close
 from modules.hstu_block_inference import HSTUBlockInference
 from modules.jagged_data import JaggedData
-from paged_kvcache_ops import KVOnloadHandle, KVOffloadHandle
+from paged_kvcache_ops import KVOffloadHandle, KVOnloadHandle
 from test_paged_hstu_attn_kernel import _hstu_attention_maybe_from_cache
 
 
@@ -599,7 +599,8 @@ class TestModule:
             kvcache_metadata.kv_onload_handle.reset()
             for layer_idx in range(self.num_layers):
                 kvcache_metadata.kv_cache_table[layer_idx][
-                    self.kvcache_config.blocks_in_primary_pool:self.kvcache_config.blocks_in_primary_pool+onload_num_pages
+                    self.kvcache_config.blocks_in_primary_pool : self.kvcache_config.blocks_in_primary_pool
+                    + onload_num_pages
                 ].copy_(
                     host_kv_data[layer_idx, :onload_num_pages, ...], non_blocking=True
                 )

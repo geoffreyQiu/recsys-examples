@@ -12,8 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import sys
 import argparse
+import sys
 
 import torch
 from commons.datasets import get_data_loader
@@ -35,7 +35,7 @@ def run_ranking_gr_inference(disable_kvcache: bool):
     max_num_history = 2048
     max_num_candidates = 256
     max_incremental_seqlen = 128
-    max_seqlen = max_num_history * 2 + max_num_candidates 
+    max_seqlen = max_num_history * 2 + max_num_candidates
 
     # context_emb_size = 1000
     item_fea_name, item_vocab_size = "item_feat", 10000
@@ -111,7 +111,7 @@ def run_ranking_gr_inference(disable_kvcache: bool):
             hstu_config=hstu_config,
             kvcache_config=kv_cache_config,
             task_config=task_config,
-            use_cudagraph=False, #True,
+            use_cudagraph=False,  # True,
             cudagraph_configs=hstu_cudagraph_configs,
         )
         model_predict.bfloat16()
@@ -127,7 +127,7 @@ def run_ranking_gr_inference(disable_kvcache: bool):
             max_history_length=max_num_history,
             max_num_candidates=max_num_candidates,
             max_incremental_seqlen=max_incremental_seqlen,
-            max_num_cached_batches = 16,
+            max_num_cached_batches=16,
             full_mode=True,
         )
 
@@ -135,16 +135,15 @@ def run_ranking_gr_inference(disable_kvcache: bool):
 
         num_warmup = 16
         for idx in range(num_warmup):
-            pass 
+            pass
 
-        num_test_batches = 16
         ts_start, ts_end = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
         ts_start.record()
-        for (batch, user_ids, total_history_lengths) in dataloader:
+        for batch, user_ids, total_history_lengths in dataloader:
             if not disable_kvcache:
-                logits = model_predict.forward(batch, user_ids, total_history_lengths)
+                model_predict.forward(batch, user_ids, total_history_lengths)
             else:
-                logits = model_predict.forward_nokvcache(batch)
+                model_predict.forward_nokvcache(batch)
 
         ts_end.record()
         predict_time = ts_start.elapsed_time(ts_end)

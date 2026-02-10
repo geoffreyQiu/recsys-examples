@@ -183,7 +183,9 @@ def hstu_preprocess_embeddings(
             )
 
             sequence_embeddings_lengths_offsets = (
-                torch.ops.fbgemm.asynchronous_complete_cumsum(sequence_embeddings_lengths)
+                torch.ops.fbgemm.asynchronous_complete_cumsum(
+                    sequence_embeddings_lengths
+                )
             )
             sequence_max_seqlen = sequence_max_seqlen + contextual_max_seqlen
 
