@@ -55,6 +55,7 @@ void gather_paged_kv_cache_all_layers(
     uint32_t stride_n,
     uint32_t stride_h,
     uint32_t num_pages,
+    const int num_sms,
     cudaStream_t stream);
 
 namespace kvcache {
@@ -898,6 +899,10 @@ void GPUKVCacheMangerImpl::init_random_offload_status(int64_t user_id, size_t le
 void GPUKVCacheMangerImpl::offload_loop()
 {
     const c10::cuda::OptionalCUDAGuard device_guard(this->device);
+    int dev_id = 0;
+    int k_num_sms = 0;
+    cudaGetDevice(&dev_id);
+    cudaDeviceGetAttribute(&k_num_sms, cudaDevAttrMultiProcessorCount, dev_id);
 
     while (true) {
         std::vector<int> host_metadata;
@@ -982,6 +987,7 @@ void GPUKVCacheMangerImpl::offload_loop()
                         this->num_kv_heads * this->kv_headdim,
                         this->kv_headdim,
                         num_d2d_pages,
+                        k_num_sms,
                         this->offload_stream);
                     // release on gpu kvcache
                     if (last_layer && chunk_idx + this->num_offload_device_chunks >= num_chunks_per_layer) {

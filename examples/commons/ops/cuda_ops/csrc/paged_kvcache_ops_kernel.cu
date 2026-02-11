@@ -160,12 +160,9 @@ cudaError_t AppendPagedKVCache(DType* k_data,
                                IdType* nnz_cuda, uint32_t nnz,
                                size_t append_k_stride_n, size_t append_k_stride_h,
                                size_t append_v_stride_n, size_t append_v_stride_h,
+                               int num_sms,
                                cudaStream_t stream) {
-  int dev_id = 0;
-  int num_sms = 0;
   int num_blocks_per_sm = 0;
-  cudaGetDevice(&dev_id);
-  cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id);
 
   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
@@ -213,6 +210,7 @@ cudaError_t AppendPagedKVCache<nv_bfloat16, int32_t>(
   int32_t* nnz_cuda, uint32_t nnz,
   size_t append_k_stride_n, size_t append_k_stride_h,
   size_t append_v_stride_n, size_t append_v_stride_h,
+  int num_sms,
   cudaStream_t stream);
 
 template 
@@ -232,6 +230,7 @@ cudaError_t AppendPagedKVCache<nv_half, int32_t>(
   int32_t* nnz_cuda, uint32_t nnz,
   size_t append_k_stride_n, size_t append_k_stride_h,
   size_t append_v_stride_n, size_t append_v_stride_h,
+  int num_sms,
   cudaStream_t stream);
 
 
@@ -282,12 +281,9 @@ cudaError_t GatherPagedKVCache(DType* gather_kv,
                                uint32_t stride_h,
                                DType* kv_cache,
                                uint32_t nnz,
+                               int num_sms,
                                cudaStream_t stream) {
-  int dev_id = 0;
-  int num_sms = 0;
   int num_blocks_per_sm = 0;
-  cudaGetDevice(&dev_id);
-  cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id);
 
   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
@@ -327,6 +323,7 @@ cudaError_t GatherPagedKVCache<nv_bfloat16, int32_t>(
   uint32_t stride_h,
   nv_bfloat16* kv_cache,
   uint32_t nnz,
+  int num_sms,
   cudaStream_t stream);
   
 template 
@@ -342,6 +339,7 @@ cudaError_t GatherPagedKVCache<nv_half, int32_t>(
   uint32_t stride_h,
   nv_half* kv_cache,
   uint32_t nnz,
+  int num_sms,
   cudaStream_t stream);
 
 template <uint32_t head_dim, uint32_t vec_size, typename DType, typename IdType>
@@ -400,12 +398,9 @@ cudaError_t GatherPagedKVCacheAllLayers(DType* gather_kv,
                                uint32_t stride_h,
                                DType* kv_cache,
                                uint32_t nnz,
+                               int num_sms,
                                cudaStream_t stream) {
-  int dev_id = 0;
-  int num_sms = 0;
   int num_blocks_per_sm = 0;
-  cudaGetDevice(&dev_id);
-  cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id);
 
   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
@@ -449,6 +444,7 @@ cudaError_t GatherPagedKVCacheAllLayers<nv_bfloat16, int32_t>(
   uint32_t stride_h,
   nv_bfloat16* kv_cache,
   uint32_t nnz,
+  int num_sms,
   cudaStream_t stream);
 
 

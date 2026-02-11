@@ -45,6 +45,7 @@ cudaError_t AppendPagedKVCache(DType* k_data,
                                IdType* nnz_cuda, uint32_t nnz, 
                                size_t append_k_stride_n, size_t append_k_stride_h,
                                size_t append_v_stride_n, size_t append_v_stride_h,
+                               int num_sms,
                                cudaStream_t stream);
 
 template <typename DType, typename IdType>
@@ -59,6 +60,7 @@ cudaError_t GatherPagedKVCache(DType* gather_kv,
                                uint32_t stride_h,
                                DType* kv_cache,
                                uint32_t nnz,
+                               int num_sms,
                                cudaStream_t stream);
 
 template <typename DType, typename IdType>
@@ -76,6 +78,7 @@ cudaError_t GatherPagedKVCacheAllLayers(DType* gather_kv,
                                         uint32_t stride_h,
                                         DType* kv_cache,
                                         uint32_t nnz,
+                                        int num_sms,
                                         cudaStream_t stream);
 
 cudaError_t GetPagedBatchIndicesPositions(
@@ -92,7 +95,7 @@ void append_paged_kv_cache(at::Tensor append_key, at::Tensor append_value, at::T
                            at::Tensor nnz_cuda, unsigned int nnz,
                            at::Tensor paged_k_cache, at::Tensor paged_v_cache,
                            at::Tensor kv_indices, at::Tensor kv_indptr, at::Tensor kv_last_page_len,
-                           int64_t kv_layout) {
+                           int64_t kv_layout, const int num_sms) {
   // unsigned int batch_size = kv_last_page_len.size(0);
   auto device = append_key.device();
 
@@ -144,7 +147,7 @@ void append_paged_kv_cache(at::Tensor append_key, at::Tensor append_value, at::T
                            static_cast<int32_t*>(seqlen_offsets.data_ptr()), 
                            static_cast<int32_t*>(nnz_cuda.data_ptr()), 
                            nnz, append_k_stride_n, append_k_stride_h, 
-                           append_v_stride_n, append_v_stride_h, stream);
+                           append_v_stride_n, append_v_stride_h, num_sms, stream);
         break;
     case at::ScalarType::Half:
         status =
@@ -160,7 +163,7 @@ void append_paged_kv_cache(at::Tensor append_key, at::Tensor append_value, at::T
                            static_cast<int32_t*>(seqlen_offsets.data_ptr()), 
                            static_cast<int32_t*>(nnz_cuda.data_ptr()), 
                            nnz, append_k_stride_n, append_k_stride_h, 
-                           append_v_stride_n, append_v_stride_h, stream);
+                           append_v_stride_n, append_v_stride_h, num_sms, stream);
         break;
     default:
         TORCH_CHECK(false, "AppendPagedKVCache failed to dispatch with dtype ", kv_scalar_dtype);
@@ -173,7 +176,8 @@ void gather_paged_kv_cache(at::Tensor gather_kv_gpu_buffer,
                            at::Tensor paged_kv_cache,
                            at::Tensor page_ids_to_offload,
                            unsigned int num_pages,
-                           int64_t kv_layout) {
+                           int64_t kv_layout,
+                           const int num_sms) {
   auto device = paged_kv_cache.device();
 
   TORCH_CHECK(paged_kv_cache.ndimension() == 5, 
@@ -214,7 +218,7 @@ void gather_paged_kv_cache(at::Tensor gather_kv_gpu_buffer,
             num_heads, head_dim, page_size, 
             stride_page, stride_k2v, stride_n, stride_h,
             static_cast<nv_bfloat16*>(paged_kv_cache.data_ptr()),
-            num_pages * page_size, stream);
+            num_pages * page_size, num_sms, stream);
         break;
     case at::ScalarType::Half:
         status = GatherPagedKVCache(
@@ -223,7 +227,7 @@ void gather_paged_kv_cache(at::Tensor gather_kv_gpu_buffer,
             num_heads, head_dim, page_size, 
             stride_page, stride_k2v, stride_n, stride_h,
             static_cast<nv_half*>(paged_kv_cache.data_ptr()),
-            num_pages * page_size, stream);
+            num_pages * page_size, num_sms, stream);
         break;
     default:
         TORCH_CHECK(false, "GatherPagedKVCache failed to dispatch with dtype ", kv_scalar_dtype);
@@ -246,6 +250,7 @@ void gather_paged_kv_cache_all_layers(uint16_t *gather_kv_gpu_buffer,
                                       uint32_t stride_n,
                                       uint32_t stride_h,
                                       uint32_t num_pages,
+                                      const int num_sms,
                                       cudaStream_t stream) {
 
   cudaError_t status;
@@ -256,7 +261,7 @@ void gather_paged_kv_cache_all_layers(uint16_t *gather_kv_gpu_buffer,
       num_heads, head_dim, page_size, 
       stride_page, stride_k2v, stride_n, stride_h,
       reinterpret_cast<nv_bfloat16*>(paged_kv_cache),
-      num_pages * page_size, stream);
+      num_pages * page_size, num_sms, stream);
   TORCH_CHECK(status == cudaSuccess,
               "GatherPagedKVCacheAllLayers failed with error: ", cudaGetErrorString(status));
 }

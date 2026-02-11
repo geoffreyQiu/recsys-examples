@@ -74,6 +74,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
             else torch.float32
         )
         device = torch.cuda.current_device()
+        self.num_sms = torch.cuda.get_device_properties(device).multi_processor_count
 
         # linear_uvqk
         self._linear_uvqk = torch.nn.Linear(
@@ -299,6 +300,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
                 kv_cache_metadata.kv_indptr,
                 kv_cache_metadata.kv_last_page_len,
                 0,  # NHD layout
+                self.num_sms,
             )
 
             kv_cache_metadata.kv_onload_handle.wait_host(self.layer_idx)
@@ -404,6 +406,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
                 kv_cache_metadata.kv_indptr,
                 kv_cache_metadata.kv_last_page_len,
                 0,  # NHD layout
+                self.num_sms,
             )
 
         return self.uvqk_buffer_[:num_tokens, ...]
