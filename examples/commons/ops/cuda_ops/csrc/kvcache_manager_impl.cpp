@@ -121,8 +121,8 @@ void MultithreadMemcpyProcessor::memcpy_coworker_loop(const int idx) {
 PinnedDoubleBuffer::PinnedDoubleBuffer(size_t buffer_bytes)
 : ptr_(2), cuda_event_(2) {
     for (int i = 0; i < 2; i++) {
-        cudaMallocHost((void**)&ptr_[i], buffer_bytes);
-        cudaEventCreateWithFlags(&cuda_event_[i], cudaEventBlockingSync);
+        cudaCheck(cudaMallocHost((void**)&ptr_[i], buffer_bytes));
+        cudaCheck(cudaEventCreateWithFlags(&cuda_event_[i], cudaEventBlockingSync));
     }
 }
 
@@ -144,43 +144,43 @@ KVCompressor::KVCompressor(int max_num_chunks, size_t chunk_numel, size_t chunk_
     std::vector<size_t> bytes(max_num_chunks, chunk_bytes);
 
     // compress [offload] data struct
-    cudaMalloc((void**)&comp_out_buffer_, max_num_chunks * max_comp_chunk_bytes_);
+    cudaCheck(cudaMalloc((void**)&comp_out_buffer_, max_num_chunks * max_comp_chunk_bytes_));
 
-    cudaMalloc((void**)&comp_in_ptrs_, max_num_chunks * sizeof(void*));  // setup once from gpu manager
-    cudaMalloc((void**)&comp_in_bytes_, max_num_chunks * sizeof(size_t));
-    cudaMemcpy(comp_in_bytes_, bytes.data(), max_num_chunks * sizeof(size_t), cudaMemcpyHostToDevice);
+    cudaCheck(cudaMalloc((void**)&comp_in_ptrs_, max_num_chunks * sizeof(void*)));  // setup once from gpu manager
+    cudaCheck(cudaMalloc((void**)&comp_in_bytes_, max_num_chunks * sizeof(size_t)));
+    cudaCheck(cudaMemcpy(comp_in_bytes_, bytes.data(), max_num_chunks * sizeof(size_t), cudaMemcpyHostToDevice));
 
-    cudaMalloc((void**)&comp_out_ptrs_, max_num_chunks * sizeof(void*));
+    cudaCheck(cudaMalloc((void**)&comp_out_ptrs_, max_num_chunks * sizeof(void*)));
     for (int i = 0; i < max_num_chunks; i++) ptrs[i] = (char *)comp_out_buffer_ + i * max_comp_chunk_bytes_;
-    cudaMemcpy(comp_out_ptrs_, ptrs.data(), max_num_chunks * sizeof(void*), cudaMemcpyHostToDevice);
-    cudaMalloc((void**)&comp_out_bytes_, max_num_chunks * sizeof(size_t));
+    cudaCheck(cudaMemcpy(comp_out_ptrs_, ptrs.data(), max_num_chunks * sizeof(void*), cudaMemcpyHostToDevice));
+    cudaCheck(cudaMalloc((void**)&comp_out_bytes_, max_num_chunks * sizeof(size_t)));
     
     // decompress [onload] data struct
-    cudaMalloc((void**)&decomp_in_buffer_, max_num_chunks * max_comp_chunk_bytes_);
+    cudaCheck(cudaMalloc((void**)&decomp_in_buffer_, max_num_chunks * max_comp_chunk_bytes_));
 
-    cudaMalloc((void**)&decomp_in_ptrs_, max_num_chunks * sizeof(void*));
+    cudaCheck(cudaMalloc((void**)&decomp_in_ptrs_, max_num_chunks * sizeof(void*)));
     for (int i = 0; i < max_num_chunks; i++) ptrs[i] = (char *)decomp_in_buffer_ + i * max_comp_chunk_bytes_;
-    cudaMemcpy(decomp_in_ptrs_, ptrs.data(), max_num_chunks * sizeof(void*), cudaMemcpyHostToDevice);
-    cudaMalloc((void**)&decomp_in_bytes_, max_num_chunks * sizeof(size_t));
-    cudaMemcpy(decomp_in_bytes_, ptrs.data(), max_num_chunks * sizeof(void*), cudaMemcpyHostToDevice);
+    cudaCheck(cudaMemcpy(decomp_in_ptrs_, ptrs.data(), max_num_chunks * sizeof(void*), cudaMemcpyHostToDevice));
+    cudaCheck(cudaMalloc((void**)&decomp_in_bytes_, max_num_chunks * sizeof(size_t)));
+    cudaCheck(cudaMemcpy(decomp_in_bytes_, ptrs.data(), max_num_chunks * sizeof(void*), cudaMemcpyHostToDevice));
 
-    cudaMalloc((void**)&decomp_out_ptrs_, max_num_chunks * sizeof(void*));
-    cudaMalloc((void**)&decomp_out_bytes_, max_num_chunks * sizeof(size_t));
-    cudaMalloc((void**)&decomp_buffer_bytes_, max_num_chunks * sizeof(size_t));
-    cudaMemcpy(decomp_buffer_bytes_, bytes.data(), max_num_chunks * sizeof(size_t), cudaMemcpyHostToDevice);
+    cudaCheck(cudaMalloc((void**)&decomp_out_ptrs_, max_num_chunks * sizeof(void*)));
+    cudaCheck(cudaMalloc((void**)&decomp_out_bytes_, max_num_chunks * sizeof(size_t)));
+    cudaCheck(cudaMalloc((void**)&decomp_buffer_bytes_, max_num_chunks * sizeof(size_t)));
+    cudaCheck(cudaMemcpy(decomp_buffer_bytes_, bytes.data(), max_num_chunks * sizeof(size_t), cudaMemcpyHostToDevice));
 
-    cudaMalloc((void**)&comp_status_, max_num_chunks * sizeof(nvcompStatus_t));
-    cudaMallocHost((void**)&comp_status_cpu_, max_num_chunks * sizeof(nvcompStatus_t));
-    cudaMalloc((void**)&decomp_status_, max_num_chunks * sizeof(nvcompStatus_t));
-    cudaMallocHost((void**)&decomp_status_cpu_, max_num_chunks * sizeof(nvcompStatus_t));
+    cudaCheck(cudaMalloc((void**)&comp_status_, max_num_chunks * sizeof(nvcompStatus_t)));
+    cudaCheck(cudaMallocHost((void**)&comp_status_cpu_, max_num_chunks * sizeof(nvcompStatus_t)));
+    cudaCheck(cudaMalloc((void**)&decomp_status_, max_num_chunks * sizeof(nvcompStatus_t)));
+    cudaCheck(cudaMallocHost((void**)&decomp_status_cpu_, max_num_chunks * sizeof(nvcompStatus_t)));
 
     nvcompBatchedANSCompressGetTempSizeAsync(
         max_num_chunks, chunk_bytes, k_comp_opts_, &comp_tmp_bytes_, max_num_chunks * chunk_bytes);
-    cudaMalloc(&comp_tmp_buffer_, comp_tmp_bytes_);
+    cudaCheck(cudaMalloc(&comp_tmp_buffer_, comp_tmp_bytes_));
 
     nvcompBatchedANSDecompressGetTempSizeAsync(
         max_num_chunks, chunk_bytes, k_decomp_opts_, &decomp_tmp_bytes_, max_num_chunks * chunk_bytes);
-    cudaMalloc(&decomp_tmp_buffer_, decomp_tmp_bytes_);
+    cudaCheck(cudaMalloc(&decomp_tmp_buffer_, decomp_tmp_bytes_));
 }
 
 KVCompressor::~KVCompressor() {
@@ -262,7 +262,7 @@ KVOnloadHandle::KVOnloadHandle(
 , host_complete(num_layers, 0)
 , no_onload(false) {
     for (int layer_idx = 0; layer_idx < num_layers; layer_idx ++) {
-        cudaEventCreateWithFlags(&event[layer_idx], cudaEventBlockingSync);
+        cudaCheck(cudaEventCreateWithFlags(&event[layer_idx], cudaEventBlockingSync));
     }
 }
 
@@ -281,7 +281,7 @@ void KVOnloadHandle::reset() {
 
 void KVOnloadHandle::complete_host(int layer_idx) {
     auto stream = at::cuda::getCurrentCUDAStream();
-    cudaEventRecord(event[layer_idx], stream);
+    cudaCheck(cudaEventRecord(event[layer_idx], stream));
     {
         std::unique_lock<std::mutex> lock(mtx_);
         host_complete[layer_idx] = 1;
@@ -290,7 +290,7 @@ void KVOnloadHandle::complete_host(int layer_idx) {
 };
 
 void KVOnloadHandle::complete_host(int layer_idx, cudaStream_t stream) {
-    cudaEventRecord(event[layer_idx], stream);
+    cudaCheck(cudaEventRecord(event[layer_idx], stream));
     {
         std::unique_lock<std::mutex> lock(mtx_);
         host_complete[layer_idx] = 1;
@@ -305,7 +305,7 @@ void KVOnloadHandle::wait_host(int layer_idx) {
         cv_.wait(lock, [this, layer_idx](){ return host_complete[layer_idx] == 1; });
     }
     auto stream = at::cuda::getCurrentCUDAStream();
-    cudaStreamWaitEvent(stream, event[layer_idx], 0);
+    cudaCheck(cudaStreamWaitEvent(stream, event[layer_idx], 0));
 };
 
 KVOffloadHandle::KVOffloadHandle() : gpu_kv_mgr(nullptr), no_offload(true) { }
@@ -325,7 +325,7 @@ void KVOffloadHandle::mark_ready(int layer_idx) {
     if (this->gpu_kv_mgr == nullptr || this->no_offload) return;
 
     auto stream = at::cuda::getCurrentCUDAStream();
-    cudaEventRecord(this->ready_event[layer_idx], stream);
+    cudaCheck(cudaEventRecord(this->ready_event[layer_idx], stream));
     this->host_ready[layer_idx] = 1;
     this->gpu_kv_mgr->offload_ready_cv_.notify_one();
 }
@@ -572,14 +572,14 @@ GPUKVCacheMangerImpl::GPUKVCacheMangerImpl(
 
     per_token_kv_stride = 2 * num_kv_heads * kv_headdim;
 
-    cudaStreamCreateWithFlags(&worker_stream, cudaStreamNonBlocking);
-    cudaStreamCreateWithFlags(&onload_stream, cudaStreamNonBlocking);
-    cudaStreamCreateWithFlags(&offload_stream, cudaStreamNonBlocking);
+    cudaCheck(cudaStreamCreateWithFlags(&worker_stream, cudaStreamNonBlocking));
+    cudaCheck(cudaStreamCreateWithFlags(&onload_stream, cudaStreamNonBlocking));
+    cudaCheck(cudaStreamCreateWithFlags(&offload_stream, cudaStreamNonBlocking));
 
     this->host_kv_mgr = &host_kv_mgr;
 
-    cudaMalloc((void**)&onload_device_buffers, this->num_onload_device_chunks * host_kv_mgr.chunk_numel * sizeof(uint16_t));
-    cudaMalloc((void**)&offload_device_buffers, this->num_offload_device_chunks * host_kv_mgr.chunk_numel * sizeof(uint16_t));
+    cudaCheck(cudaMalloc((void**)&onload_device_buffers, this->num_onload_device_chunks * host_kv_mgr.chunk_numel * sizeof(uint16_t)));
+    cudaCheck(cudaMalloc((void**)&offload_device_buffers, this->num_offload_device_chunks * host_kv_mgr.chunk_numel * sizeof(uint16_t)));
     compressor.set_compress_input_buffer_ptrs(
         reinterpret_cast<char*>(offload_device_buffers), this->num_offload_device_chunks);
 
@@ -864,7 +864,7 @@ void GPUKVCacheMangerImpl::offload_kvcache(
     offload_handle.host_ready = new int[this->num_layers];
     for (int layer_idx = 0; layer_idx < num_layers; layer_idx ++) {
         offload_handle.host_ready[layer_idx] = 0;
-        cudaEventCreateWithFlags(&offload_handle.ready_event[layer_idx], cudaEventBlockingSync);
+        cudaCheck(cudaEventCreateWithFlags(&offload_handle.ready_event[layer_idx], cudaEventBlockingSync));
     }
     
     {
@@ -901,8 +901,8 @@ void GPUKVCacheMangerImpl::offload_loop()
     const c10::cuda::OptionalCUDAGuard device_guard(this->device);
     int dev_id = 0;
     int k_num_sms = 0;
-    cudaGetDevice(&dev_id);
-    cudaDeviceGetAttribute(&k_num_sms, cudaDevAttrMultiProcessorCount, dev_id);
+    cudaCheck(cudaGetDevice(&dev_id));
+    cudaCheck(cudaDeviceGetAttribute(&k_num_sms, cudaDevAttrMultiProcessorCount, dev_id));
 
     while (true) {
         std::vector<int> host_metadata;
@@ -958,7 +958,7 @@ void GPUKVCacheMangerImpl::offload_loop()
                 std::unique_lock<std::mutex> lock(offload_ready_mtx_);
                 this->offload_ready_cv_.wait(lock, [this, event_recorded, layer_idx] { return event_recorded[layer_idx] == 1; });
             }
-            cudaStreamWaitEvent(this->offload_stream, offload_gpu_acq_event[layer_idx]);
+            cudaCheck(cudaStreamWaitEvent(this->offload_stream, offload_gpu_acq_event[layer_idx]));
             cudaEventDestroy(offload_gpu_acq_event[layer_idx]);
             
             const bool last_layer = (layer_idx == this->num_layers - 1);
@@ -991,7 +991,7 @@ void GPUKVCacheMangerImpl::offload_loop()
                         this->offload_stream);
                     // release on gpu kvcache
                     if (last_layer && chunk_idx + this->num_offload_device_chunks >= num_chunks_per_layer) {
-                        cudaStreamSynchronize(this->offload_stream);
+                        cudaCheck(cudaStreamSynchronize(this->offload_stream));
                         std::unique_lock<std::mutex> lock(offload_freezed_uids_mtx_);
                         for (int idx = 0; idx < num_offload_uids; idx++) {
                             int cur_freezed_times = offload_freezed_uids_[offload_uids[idx]];
@@ -1195,11 +1195,11 @@ void prepare_kvcache(
     *num_offload_page_ids = num_offload_pages;
     *num_offload_user_ids = num_offload_uids;
 
-    cudaMemcpyAsync(page_ids_gpu_buffer.data_ptr(), page_indices.data(), page_indptr[batch_size] * sizeof(int32_t), cudaMemcpyHostToDevice, gpu_mgr.worker_stream);
-    cudaMemcpyAsync(offload_page_ids_gpu_buffer.data_ptr(), offload_page_ids.data(), num_offload_pages * sizeof(int32_t), cudaMemcpyHostToDevice, gpu_mgr.worker_stream);
+    cudaCheck(cudaMemcpyAsync(page_ids_gpu_buffer.data_ptr(), page_indices.data(), page_indptr[batch_size] * sizeof(int32_t), cudaMemcpyHostToDevice, gpu_mgr.worker_stream));
+    cudaCheck(cudaMemcpyAsync(offload_page_ids_gpu_buffer.data_ptr(), offload_page_ids.data(), num_offload_pages * sizeof(int32_t), cudaMemcpyHostToDevice, gpu_mgr.worker_stream));
 
     size_t host_buffer_d2h_size = (batch_size * 5 + 4) * sizeof(int32_t);
-    cudaMemcpyAsync(metadata_gpu_buffer.data_ptr(), metadata_host_buffer.data_ptr(), host_buffer_d2h_size, cudaMemcpyHostToDevice, gpu_mgr.worker_stream);
+    cudaCheck(cudaMemcpyAsync(metadata_gpu_buffer.data_ptr(), metadata_host_buffer.data_ptr(), host_buffer_d2h_size, cudaMemcpyHostToDevice, gpu_mgr.worker_stream));
     
     int *gpu_bufptr = static_cast<int*>(metadata_gpu_buffer.data_ptr());
 
@@ -1217,7 +1217,7 @@ void prepare_kvcache(
         gpu_mgr.worker_stream
     );
 
-    cudaStreamSynchronize(gpu_mgr.worker_stream);
+    cudaCheck(cudaStreamSynchronize(gpu_mgr.worker_stream));
  }
 
 }  // namespace kvcache
