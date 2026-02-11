@@ -17,7 +17,6 @@ import sys
 from typing import List, Optional
 
 sys.path.append("../commons/utils")
-import flashinfer
 import pytest
 import torch
 import torch.nn.functional as F
@@ -461,10 +460,23 @@ def generate_test_input_data(
     ).to(device=device)
 
     total_history_lengths = host_kv_lengths + gpu_kv_lengths + new_history_lengths
-    batch_indices, position = flashinfer.page.get_batch_indices_positions(
-        new_history_offsets.cuda(),
-        total_history_lengths.cuda(),
-        new_history_offsets[-1].item(),
+    batch_indices = torch.cat(
+        [
+            torch.full((new_history_lengths[idx],), idx, dtype=torch.int32)
+            for idx in range(batchsize)
+        ],
+        dim=0,
+    )
+    position = torch.cat(
+        [
+            torch.arange(
+                total_history_lengths[idx] - new_history_lengths[idx],
+                total_history_lengths[idx],
+                dtype=torch.int32,
+            )
+            for idx in range(batchsize)
+        ],
+        dim=0,
     )
     total_history_offsets = get_offsets_from_lengths(total_history_lengths)
 
@@ -499,6 +511,8 @@ def generate_test_input_data(
         new_history_nnz_cuda=torch.tensor(
             [new_history_offsets[-1].item()], dtype=torch.int32, device=device
         ),
+        kv_onload_handle=KVOnloadHandle(num_layers),
+        kv_offload_handle=KVOffloadHandle(),
     )
 
     return (

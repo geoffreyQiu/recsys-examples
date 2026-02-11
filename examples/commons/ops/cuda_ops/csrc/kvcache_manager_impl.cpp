@@ -128,7 +128,7 @@ PinnedDoubleBuffer::PinnedDoubleBuffer(size_t buffer_bytes)
 PinnedDoubleBuffer::~PinnedDoubleBuffer() {
     for (int i = 0; i < 2; i++) {
         cudaEventDestroy(cuda_event_[i]);
-        cudaFree(ptr_[i]);
+        cudaFreeHost(ptr_[i]);
     }
 }
 
@@ -161,7 +161,6 @@ KVCompressor::KVCompressor(int max_num_chunks, size_t chunk_numel, size_t chunk_
     for (int i = 0; i < max_num_chunks; i++) ptrs[i] = (char *)decomp_in_buffer_ + i * max_comp_chunk_bytes_;
     cudaMemcpy(decomp_in_ptrs_, ptrs.data(), max_num_chunks * sizeof(void*), cudaMemcpyHostToDevice);
     cudaMalloc((void**)&decomp_in_bytes_, max_num_chunks * sizeof(size_t));
-    cudaMalloc((void**)&decomp_in_bytes_, max_num_chunks * sizeof(size_t));
     cudaMemcpy(decomp_in_bytes_, ptrs.data(), max_num_chunks * sizeof(void*), cudaMemcpyHostToDevice);
 
     cudaMalloc((void**)&decomp_out_ptrs_, max_num_chunks * sizeof(void*));
@@ -188,18 +187,16 @@ KVCompressor::~KVCompressor() {
 
     cudaFree(decomp_tmp_buffer_);
     cudaFree(comp_tmp_buffer_);
-    cudaFree(decomp_status_cpu_);
+    cudaFreeHost(decomp_status_cpu_);
     cudaFree(decomp_status_);
-    cudaFree(comp_status_cpu_);
+    cudaFreeHost(comp_status_cpu_);
     cudaFree(comp_status_);
     cudaFree(decomp_buffer_bytes_);
     cudaFree(decomp_out_bytes_);
     cudaFree(decomp_out_ptrs_);
-    // cudaFree(decomp_in_bytes_cpu_);
     cudaFree(decomp_in_bytes_);
     cudaFree(decomp_in_ptrs_);
     cudaFree(decomp_in_buffer_);
-    // cudaFree(comp_out_bytes_cpu_);
     cudaFree(comp_out_bytes_);
     cudaFree(comp_out_ptrs_);
     cudaFree(comp_in_bytes_);

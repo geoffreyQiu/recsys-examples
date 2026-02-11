@@ -187,7 +187,6 @@ class AsyncHSTUKVCacheManager:
         metadata_gpu_buffer,  # input static
         static_onload_handle,
     ):
-        # onload_fut.result()
         kvcache_metadata_fut.result()
         return self.get_kvcache_metadata_from_buffer(
             batch_size,
@@ -278,9 +277,7 @@ class AsyncHSTUKVCacheManager:
 
         num_context = len(batch.contextual_feature_names)
 
-        num_cached = torch.maximum(
-            origin_num_cached - num_context, torch.tensor([0], dtype=torch.int32)
-        )
+        num_cached = torch.clamp_min(origin_num_cached - num_context, 0).to(torch.int32)
         num_cached_action = num_cached // 2
         num_cached_item = num_cached - num_cached_action
         num_hist_cached = torch.concat([num_cached_item, num_cached_action], dim=0)
