@@ -386,15 +386,29 @@ class InferenceDenseModule(torch.nn.Module):
                 embeddings=embeddings,
                 batch=batch,
             )
+            jagged_data.scaling_seqlen = self._scaling_seqlen
 
             num_tokens = batch.features.values().shape[0]
-            hstu_output = self._hstu_block.predict(
-                batch.batch_size,
-                num_tokens,
-                jagged_data.values,
-                jagged_data,
-                None,
-            )
+            if self.use_cudagraph:
+                self._hidden_states[:num_tokens, ...].copy_(
+                    jagged_data.values, non_blocking=True
+                )
+                copy_jagged_metadata(self._jagged_metadata, jagged_data)
+                hstu_output = self._hstu_block.predict(
+                    batch.batch_size,
+                    num_tokens,
+                    self._hidden_states,
+                    self._jagged_metadata,
+                    None,
+                )
+            else:
+                hstu_output = self._hstu_block.predict(
+                    batch.batch_size,
+                    num_tokens,
+                    jagged_data.values,
+                    jagged_data,
+                    None,
+                )
             jagged_data.values = hstu_output
             jagged_data = self._hstu_block._postprocessor(jagged_data)
             jagged_item_logit = self._mlp(jagged_data.values)

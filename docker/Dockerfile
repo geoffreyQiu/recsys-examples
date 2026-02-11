@@ -78,10 +78,6 @@ COPY . .
 RUN cd /workspace/recsys-examples/corelib/dynamicemb && \
     python setup.py install
     
-RUN if [ "${TRITONSERVER_BUILD}" = "1" ]; then \
-      pip3 uninstall -y hstu_attn hstu_hopper; \
-    fi
-
 RUN cd /workspace/deps && rm -rf nvcomp && \
     wget https://developer.download.nvidia.com/compute/nvcomp/redist/nvcomp/linux-x86_64/nvcomp-linux-x86_64-5.1.0.21_cuda12-archive.tar.xz && \
     tar -xf nvcomp-linux-x86_64-5.1.0.21_cuda12-archive.tar.xz && \
