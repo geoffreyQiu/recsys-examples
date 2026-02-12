@@ -162,7 +162,6 @@ KVCompressor::KVCompressor(int max_num_chunks, size_t chunk_numel, size_t chunk_
     for (int i = 0; i < max_num_chunks; i++) ptrs[i] = (char *)decomp_in_buffer_ + i * max_comp_chunk_bytes_;
     cudaCheck(cudaMemcpy(decomp_in_ptrs_, ptrs.data(), max_num_chunks * sizeof(void*), cudaMemcpyHostToDevice));
     cudaCheck(cudaMalloc((void**)&decomp_in_bytes_, max_num_chunks * sizeof(size_t)));
-    cudaCheck(cudaMemcpy(decomp_in_bytes_, ptrs.data(), max_num_chunks * sizeof(void*), cudaMemcpyHostToDevice));
 
     cudaCheck(cudaMalloc((void**)&decomp_out_ptrs_, max_num_chunks * sizeof(void*)));
     cudaCheck(cudaMalloc((void**)&decomp_out_bytes_, max_num_chunks * sizeof(size_t)));
