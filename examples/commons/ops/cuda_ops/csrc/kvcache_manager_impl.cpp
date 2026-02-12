@@ -200,6 +200,8 @@ KVCompressor::~KVCompressor() {
     cudaFree(comp_out_bytes_);
     cudaFree(comp_out_ptrs_);
     cudaFree(comp_in_bytes_);
+    cudaFree(comp_in_ptrs_);
+    cudaFree(comp_out_buffer_);
 }
 
 void KVCompressor::set_compress_input_buffer_ptrs(char *base_ptr, size_t num_chunks) {  // call once
