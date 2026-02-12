@@ -111,7 +111,7 @@ def run_ranking_gr_inference(disable_kvcache: bool):
             hstu_config=hstu_config,
             kvcache_config=kv_cache_config,
             task_config=task_config,
-            use_cudagraph=False,  # True,
+            use_cudagraph=True,
             cudagraph_configs=hstu_cudagraph_configs,
         )
         model_predict.bfloat16()
@@ -122,8 +122,8 @@ def run_ranking_gr_inference(disable_kvcache: bool):
             item_feature_name=item_fea_name,
             contextual_feature_names=[],
             action_feature_name=action_fea_name,
-            max_num_users=8,
-            max_batch_size=8,  # test batch size
+            max_num_users=1,
+            max_batch_size=1,  # test batch size
             max_history_length=max_num_history,
             max_num_candidates=max_num_candidates,
             max_incremental_seqlen=max_incremental_seqlen,
@@ -133,10 +133,11 @@ def run_ranking_gr_inference(disable_kvcache: bool):
 
         dataloader = get_data_loader(dataset)
 
-        num_warmup = 16
-        for idx in range(num_warmup):
-            pass
+        # Warm up
+        for batch, user_ids, total_history_lengths in dataloader:
+            model_predict.forward_nokvcache(batch)
 
+        dataloader = get_data_loader(dataset)
         ts_start, ts_end = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
         ts_start.record()
         for batch, user_ids, total_history_lengths in dataloader:
@@ -144,7 +145,6 @@ def run_ranking_gr_inference(disable_kvcache: bool):
                 model_predict.forward(batch, user_ids, total_history_lengths)
             else:
                 model_predict.forward_nokvcache(batch)
-
         ts_end.record()
         predict_time = ts_start.elapsed_time(ts_end)
         print("Total time(ms):", predict_time)
