@@ -193,6 +193,7 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
         embedding_file_path: str,
         score_file_path: Optional[str],
         opt_file_path: Optional[str],
+        timestamp: int,
     ) -> None:
         pass
 
@@ -206,6 +207,7 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
         score_file_path: Optional[str],
         opt_file_path: Optional[str],
         include_optim: bool,
+        timestamp: int,
     ) -> None:
         pass
 
