@@ -55,6 +55,7 @@ class BaseTaskBalancedBatchShuffler:
         new_batch.batch_size = new_batch.batch_size // torch.distributed.get_world_size(
             pg_group
         )
+
         ret = new_batch
         if return_indices:
             ret = (ret, indices_this_rank)

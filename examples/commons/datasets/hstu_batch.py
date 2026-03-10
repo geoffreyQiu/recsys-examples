@@ -56,13 +56,15 @@ class HSTUBatch(BaseBatch):
     Additional HSTU-specific attributes:
       item_feature_name (str): The name of the item feature.
       action_feature_name (Optional[str]): The name of the action feature, if applicable.
-      max_num_candidates (int): The maximum number of candidate items.
-      num_candidates (Optional[torch.Tensor]): A tensor containing the number of candidates for each batch element.
+      max_num_candidates (int): The maximum number of candidate items (ranking only).
+      num_candidates (Optional[torch.Tensor]): Per-sample candidate count (ranking only;
+          retrieval asserts ``max_num_candidates == 0`` so this is always None there).
     """
 
     # HSTU-specific fields (BaseBatch fields are inherited)
     item_feature_name: str = "item_id"
     action_feature_name: Optional[str] = None
+    # Ranking only: retrieval enforces max_num_candidates == 0.
     max_num_candidates: int = 0
     num_candidates: Optional[torch.Tensor] = None
 
@@ -82,6 +84,7 @@ class HSTUBatch(BaseBatch):
         ), "max_num_candidates must be an int"
 
     # to(), pin_memory(), record_stream() are inherited from BaseBatch
+
     @staticmethod
     def random(
         batch_size: int,
@@ -180,7 +183,7 @@ class HSTUBatch(BaseBatch):
             )
         else:
             labels = None
-        return HSTUBatch(
+        batch = HSTUBatch(
             features=KeyedJaggedTensor.from_lengths_sync(
                 keys=keys,
                 values=torch.concat(values).to(device),
@@ -198,6 +201,7 @@ class HSTUBatch(BaseBatch):
             labels=labels,
             actual_batch_size=actual_batch_size,
         )
+        return batch
 
 
 def is_batch_valid(
