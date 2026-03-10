@@ -119,4 +119,6 @@ void flagged_compact_cub(
 
 } // namespace dyn_emb
 
+#ifdef DEMB_USE_PYBIND11
 void bind_index_calculation_op(py::module &m);
+#endif

@@ -32,3 +32,4 @@ embedding_checkpoint/
 *.xlsx
 pcie_lookup_poc/*
 **/triton/**/[0-9]*
+**/torch_binding_build/**

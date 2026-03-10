@@ -18,7 +18,9 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "check.h"
 #include "index_calculation.h"
 #include "utils.h"
+#ifdef DEMB_USE_PYBIND11
 #include <torch/extension.h>
+#endif
 
 namespace dyn_emb {
 
@@ -168,6 +170,7 @@ flagged_compact(
 
 } // namespace dyn_emb
 
+#ifdef DEMB_USE_PYBIND11
 void bind_index_calculation_op(py::module &m) {
   m.def("get_table_range", &dyn_emb::get_table_range,
         "Make offsets from <feature, batch> scope into <table> scope",
@@ -179,3 +182,4 @@ void bind_index_calculation_op(py::module &m) {
         "Returns (count, indices[count], [opt_tensors[count]...]).",
         py::arg("flags"), py::arg("inputs"));
 }
+  #endif
