@@ -74,7 +74,6 @@ class PagedHSTUInferLayer(torch.nn.Module):
             else torch.float32
         )
         device = torch.cuda.current_device()
-        self.num_sms = torch.cuda.get_device_properties(device).multi_processor_count
 
         # linear_uvqk
         self._linear_uvqk = torch.nn.Linear(

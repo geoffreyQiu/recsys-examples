@@ -210,21 +210,15 @@ class InferenceRankingGR(torch.nn.Module):
         total_history_lengths: torch.Tensor,
     ):
         with torch.inference_mode():
-            lookup_token_ids, lookup_token_mask = self._build_lookup_tokens_from_batch(
-                batch=batch,
-                total_history_lengths=total_history_lengths,
-            )
+            # lookup_token_ids, lookup_token_mask = self._build_lookup_tokens_from_batch(
+            #     batch=batch,
+            #     total_history_lengths=total_history_lengths,
+            # )
             lookup_result = self.dense_module.async_kvcache.lookup_kvcache(
                 user_ids,
                 total_history_lengths,
-                token_ids=lookup_token_ids,
-                token_mask=lookup_token_mask,
-            )
-            self.dense_module.async_kvcache.finish_or_cancel_kvcache_ops()
-            kv_index_meta, prepare_result = (
-                self.dense_module.async_kvcache.allocate_kvcache(
-                    lookup_result,
-                )
+                token_ids=None,
+                token_mask=None,
             )
 
             old_cached_lengths = torch.tensor(
@@ -233,6 +227,14 @@ class InferenceRankingGR(torch.nn.Module):
             striped_batch = self.dense_module.async_kvcache.strip_cached_tokens(
                 batch,
                 old_cached_lengths,
+            )
+
+            self.dense_module.async_kvcache.finish_or_cancel_kvcache_ops()
+            kvcache_metadata = self.dense_module.async_kvcache.allocate_kvcache(
+                lookup_result,
+            )
+            self.dense_module.async_kvcache.onboard_launch_kvcache(
+                kvcache_metadata
             )
 
             torch.cuda.nvtx.range_push("HSTU embedding")
@@ -244,12 +246,10 @@ class InferenceRankingGR(torch.nn.Module):
                 embeddings,
                 user_ids,
                 total_history_lengths,
-                prepare_result,
-                kv_index_meta,
-                lookup_result,
+                kvcache_metadata
             )
             self.dense_module.async_kvcache.lazy_offload_kvcache(
-                kv_index_meta
+                kvcache_metadata
             )
 
         return logits

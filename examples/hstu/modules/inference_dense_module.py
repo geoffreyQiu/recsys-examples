@@ -319,64 +319,21 @@ class InferenceDenseModule(torch.nn.Module):
         embeddings: Dict[str, JaggedTensor],
         user_ids: torch.Tensor,
         total_history_lengths: torch.Tensor,
-        prepare_kvcache_result: Any,
-        kv_index_meta: Optional[Any] = None,
-        lookup_result: Optional[Any] = None,
+        kvcache_metadata: Any,
     ):
         with torch.inference_mode():
-            old_cached_lengths = torch.tensor(
-                prepare_kvcache_result.old_cached_lengths, dtype=torch.int32
-            )
-            num_history_tokens = prepare_kvcache_result.new_tokens
-            offload_uids_buffer = prepare_kvcache_result.offload_uids_buffer
-            metadata_host_buffer = prepare_kvcache_result.metadata_host_buffer
-            metadata_gpu_buffer = prepare_kvcache_result.metadata_gpu_buffer
-            kvcache_metadata_fut = prepare_kvcache_result.kvcache_metadata_fut
-            onload_fut = prepare_kvcache_result.onload_fut
-
             jagged_data = self._hstu_block._preprocessor(
                 embeddings=embeddings,
                 batch=batch,
-                seq_start_position=old_cached_lengths.cuda(),
+                seq_start_position=kvcache_metadata.old_cached_lengths.cuda(),
             )
             jagged_data.scaling_seqlen = self._scaling_seqlen
 
-            kvcache_metadata = self.async_kvcache.prepare_kvcache_wait(
-                onload_fut,
-                kvcache_metadata_fut,
-                batch.batch_size,
-                num_history_tokens,
-                self.async_kvcache.static_page_ids_gpu_buffer,
-                self.async_kvcache.static_offload_page_ids_gpu_buffer,
-                offload_uids_buffer,
-                metadata_host_buffer,
-                metadata_gpu_buffer,  # returned static
-                self.async_kvcache.static_onload_handle,
-            )
-            # 1) 先基于 prepare 后的真实 kv metadata 生成 restore 映射
-            self.async_kvcache.materialize_restore_mapping_from_metadata(
-                kv_index_meta,
-                kvcache_metadata,
-            )
-            # 2) 再 launch + wait onboard（把命中的 prefix 拉回 GPU）
-            if kv_index_meta is not None and lookup_result is not None:
-                onboard_task_handle_local = self.async_kvcache.onboard_launch_kvcache(
-                    kv_index_meta
-                )
-                self.async_kvcache.onboard_try_wait_kvcache_or_fail(
-                    kv_index_meta,
-                    onboard_task_handle_local,
-                )
-            # 3) onboard 完成后，再做 append 映射和 offload
-            self.async_kvcache.materialize_append_mapping_from_metadata(
-                kv_index_meta,
-                kvcache_metadata,
-            )
-            self.async_kvcache.offload_kvcache(kvcache_metadata)
+            self.async_kvcache.onboard_try_wait_kvcache_or_fail(kvcache_metadata)
             
-            kvcache_metadata.total_history_offsets += jagged_data.num_candidates_offsets
-            kvcache_metadata.total_history_lengths += jagged_data.num_candidates
-            kvcache_metadata.max_seqlen += jagged_data.max_num_candidates
+            # kvcache_metadata.total_history_offsets += jagged_data.num_candidates_offsets
+            # kvcache_metadata.total_history_lengths += jagged_data.num_candidates
+            # kvcache_metadata.max_seqlen += jagged_data.max_num_candidates
 
             num_tokens = batch.features.values().shape[0]
             if self.use_cudagraph:
@@ -403,6 +360,8 @@ class InferenceDenseModule(torch.nn.Module):
                     kvcache_metadata,
                 )
                 jagged_data.values = hstu_output
+            
+            self.async_kvcache.eager_offload_kvcache(kvcache_metadata)
 
             jagged_data = self._hstu_block._postprocessor(jagged_data)
             jagged_item_logit = self._mlp(jagged_data.values)

@@ -1,0 +1,108 @@
+import math
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
+import torch
+from configs import KVCacheMetadata
+from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+from typing import Any, List, Dict, Optional, Tuple, Union
+from uuid import uuid4
+from dataclasses import dataclass
+from abc import ABC, abstractmethod
+from enum import Enum
+
+
+
+class KVCacheOffloadMode(Enum):
+    LAZY = "lazy"
+    EAGER = "eager"
+
+@dataclass
+class KVLookupResult:
+    request_id: str
+    # batch_size: int
+    user_ids: torch.Tensor
+    # total_history_lengths: torch.Tensor
+    cached_start_indices: Optional[torch.Tensor] = None
+    cached_lengths: Optional[torch.Tensor] = None
+    gpu_cached_start_indices: Optional[torch.Tensor] = None
+    gpu_cached_lengths: Optional[torch.Tensor] = None
+    host_cached_start_indices: Optional[torch.Tensor] = None
+    host_cached_lengths: Optional[torch.Tensor] = None
+    
+    # new_tokens_upper_bound: int
+    token_ids: Optional[torch.Tensor] = None
+    token_mask: Optional[torch.Tensor] = None
+
+    @classmethod
+    def merge(lookup_res1, lookup_res2):
+        assert lookup_res1.request_id == lookup_res2.request_id
+        assert torch.equal(lookup_res1.user_ids, lookup_res2.user_ids)
+        if lookup_res1.gpu_cached_start_indices is not None and lookup_res1.gpu_cached_lengths is not None:
+            assert lookup_res2.host_cached_start_indices is not None and lookup_res2.host_cached_lengths is not None
+        
+        if lookup_res1.host_cached_start_indices is not None and lookup_res1.host_cached_lengths is not None:
+            assert lookup_res2.gpu_cached_start_indices is not None and lookup_res2.gpu_cached_lengths is not None
+            res = lookup_res1
+            lookup_res1 = lookup_res2
+            lookup_res2 = res
+        
+        # assume lookup_res1 is gpu lookup result, lookup_res2 is host lookup result
+        batch_size = lookup_res1.user_ids.size(0)
+        cached_start_indices = []
+        cached_lengths = []
+        for i in range(batch_size):
+            cached_start_ind = 0
+            cached_len = 0
+            if lookup_res2.host_cached_lengths[i] == 0:
+                cached_start_ind = lookup_res1.gpu_cached_start_indices[i]
+                cached_len = lookup_res1.gpu_cached_lengths[i]
+            elif lookup_res1.gpu_cached_lengths[i] == 0:
+                assert lookup_res2.host_cached_start_indices[i] == 0, "Host caching from the beginning of the sequence."
+                cached_start_ind = lookup_res2.host_cached_start_indices[i]
+                cached_len = lookup_res2.host_cached_lengths[i]
+            else:
+                assert lookup_res2.host_cached_start_indices[i] == 0, "Host caching from the beginning of the sequence."
+                assert lookup_res1.gpu_cached_start_indices[i] >= 0, "Invalid gpu cache start ind."
+
+                assert lookup_res1.gpu_cached_start_indices[i] <= lookup_res2.host_cached_lengths[i], "No gaps allowed: GPU cache start index should be smaller than or equal to host cached length."
+                cached_len = max(lookup_res2.host_cached_lengths[i], lookup_res1.gpu_cached_start_indices[i] + lookup_res1.gpu_cached_lengths[i]).item()
+            
+            cached_start_indices.append(cached_start_ind)
+            cached_lengths.append(cached_len)
+
+        merged_lookup_result = KVLookupResult(
+            request_id=str(uuid4()),
+            user_ids=lookup_res1.user_ids,
+            # total_history_lengths=lookup_res1.total_history_lengths,
+            cached_start_indices=cached_start_indices,
+            cached_lengths=cached_lengths,
+            gpu_cached_start_indices=lookup_res1.gpu_cached_start_indices,
+            gpu_cached_lengths=lookup_res1.gpu_cached_lengths,
+            host_cached_start_indices=lookup_res2.host_cached_start_indices,
+            host_cached_lengths=lookup_res2.host_cached_lengths,
+        )
+        return merged_lookup_result
+
+
+@dataclass
+class KVIndexMeta:
+    request_id: str
+    batch_size: int
+    user_ids: List[int]
+    namespaces: List[str]
+    total_history_lengths: List[int]
+    old_cached_lengths: List[int]
+    seq_start_indices: List[int]
+    seq_lengths: List[int]
+    new_tokens: int
+    token_ids: Optional[torch.Tensor] = None
+    token_mask: Optional[torch.Tensor] = None
+    restore_slot_mapping: Optional[torch.Tensor] = None
+    append_slot_mapping: Optional[torch.Tensor] = None
+    append_slot_indptr: Optional[torch.Tensor] = None
+    secondary_hit_mask: Optional[torch.Tensor] = None
+    secondary_get_task_ids: Optional[List[int]] = None
+    secondary_matched_lengths: Optional[List[int]] = None
