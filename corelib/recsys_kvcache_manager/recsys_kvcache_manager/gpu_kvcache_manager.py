@@ -21,18 +21,22 @@ class GPUKVCacheManager:
         num_heads: int,
         head_dim: int,
         num_tokens_per_page: int,
+        num_tokens_per_chunk: int,
         num_primary_cache_pages: int,
-        num_onload_buffer_pages: int,
+        num_buffer_pages: int,
+        max_batch_size: int,
         dtype: torch.dtype = torch.bfloat16,
-        device: Optional[torch.device] = None):
+        device_idx: int = -1):
         self.num_layers = num_layers
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.page_size = num_tokens_per_page
+        self.chunk_size = num_tokens_per_chunk
         self.num_primary_cache_pages = num_primary_cache_pages
-        self.num_onload_buffer_pages = num_onload_buffer_pages
+        self.num_buffer_pages = num_buffer_pages
+        self.max_batch_size = max_batch_size
         self.dtype = dtype
-        self.device = device if device is not None else torch.device("cuda")
+        self.device_idx = device_idx
 
         self.gpu_kvcache_table: torch.Tensor = torch.empty(
             [
@@ -44,17 +48,22 @@ class GPUKVCacheManager:
                 self.head_dim,
             ],
             dtype=self.dtype,
-            device=self.device,
+            device=self.device_idx,
         )
         self.kvcache_mananger_impl = GPUKVCacheManagerImpl(
             self.num_layers,
+            self.num_heads,
+            self.head_dim,
             self.page_size,
+            self.chunk_size,
             self.num_primary_cache_pages,
-            self.num_onload_buffer_pages,
+            self.num_buffer_pages,
+            self.max_batch_size,
+            self.device_idx,
         )
 
         # Auxiliary metadata
-        self.num_sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+        self.num_sms = torch.cuda.get_device_properties(self.device_idx).multi_processor_count
     
     def lookup(self, uids: torch.Tensor) -> "LookupResults":
         cached_start_indices, cached_lengths = self.kvcache_mananger_impl.lookup(uid)
@@ -65,23 +74,33 @@ class GPUKVCacheManager:
             gpu_cached_lengths=cached_lengths,
         )
     
-    def allocate(self, uids: torch.Tensor, seq_history_lengths: torch.Tensor, output_kvcache_metadata: KVCacheMetadata) -> KVCacheMetadata:
+    def allocate(self, 
+        uids: torch.Tensor, 
+        seq_history_lengths: torch.Tensor, 
+        lookup_results: KVLookupResult,
+        output_kvcache_metadata: KVCacheMetadata) -> KVCacheMetadata:
         if output_kvcache_metadata is None:
             batch_size = uids.size(0)
             num_total_pages = torch.sum(torch.ceil(seq_history_lengths / self.page_size), dtype=torch.int32).item()
             output_kvcache_metadata = KVCacheMetadata(
-                page_ids_gpu_buffer=torch.empty((num_total_pages,), dtype=torch.int32, device=self.device),
-                metadata_gpu_buffer=torch.empty((batch_size * 5 + 4,), dtype=torch.int32, device=self.device),
+                page_ids_gpu_buffer=torch.empty((num_total_pages,), dtype=torch.int32, device=self.device_idx),
+                metadata_gpu_buffer=torch.empty((batch_size * 5 + 4,), dtype=torch.int32, device=self.device_idx),
             )
         self.kvcache_mananger_impl.allocate(
             uids, 
             seq_history_lengths,
+            lookup_results.host_cached_lengths,
             output_kvcache_metadata.page_ids_gpu_buffer,
             output_kvcache_metadata.metadata_gpu_buffer)
         return output_kvcache_metadata
     
-    def evict(self, uids, kvcache_metadata: KVCacheMetadata) -> None:
-        self.kvcache_mananger_impl.evict(uids)
+    def evict(self, uids) -> None:
+        for uid in uids.tolist():
+            self.kvcache_mananger_impl.evict(uid)
+    
+    def invalid(self, uids) -> None:
+        for uid in uids.tolist():
+            self.kvcache_mananger_impl.invalid(uid)
     
     def put(self, k, v, layer_idx, kvcache_metadata: KVCacheMetadata) -> None:
         assert k.shape == v.shape, f"key and value shape mismatch: {k.shape} vs {v.shape}"
@@ -109,10 +128,18 @@ class GPUKVCacheManager:
         pass
     
     # [[ offload critirea ]]
-    def check_offload(self, uids: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # return offload_user_ids
-        
-        # 1. if a new offload chunk is filled, offload [eager]
-        # 2. if ( num_empty_pages <= 4 * num_pages_per_batch ), offload [lazy]
-        offload_user_ids = self.kvcache_mananger_impl.check_offload(uids)
-        return offload_user_ids
+    def check_for_offload(self, uids: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return self.kvcache_mananger_impl.check_for_offload(
+            uids if uids is not None else torch.tensor([], dtype=torch.int64))
+    
+    def acquire_offload_pages(self, uids: torch.Tensor, offloaded_lengths: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        return self.kvcache_mananger_impl.acquire_offload_pages(uids, offloaded_lengths)
+    
+    def release_offload_pages(self, 
+        uids: torch.Tensor, 
+        offload_start_indices: torch.Tensor, 
+        offload_lengths: torch.Tensor,
+        offloaded: bool,
+    ) -> None:
+        return self.kvcache_mananger_impl.release_offload_pages(
+            uids, offload_start_indices, offload_lengths, offloaded)

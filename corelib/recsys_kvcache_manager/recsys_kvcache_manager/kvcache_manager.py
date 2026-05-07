@@ -43,27 +43,24 @@ class KVCacheManager:
         self.num_heads = num_kv_heads
         self.head_dim = kv_headdim
         self.page_size = num_tokens_per_page
-        self.num_primary_cache_pages = num_primary_cache_pages
-        self.num_onload_buffer_pages = num_onload_buffer_pages
-        self.num_reserved_buffer_pages = num_reserved_buffer_pages
         self.chunk_size = num_tokens_per_chunk
-        self.max_num_sequences = max_num_sequences
-        self.max_sequence_length = max_sequence_length
+        self.num_primary_cache_pages = num_primary_cache_pages
+        self.num_buffer_pages = num_buffer_pages
         self.max_batch_size = max_batch_size
-        self.max_num_pages_per_seq = math.ceil(
-            self.max_sequence_length / self.page_size
-        )
 
         self.gpu_kvcache_mgr = GPUKVCacheManager(
             num_layers=num_layers,
             num_heads=num_kv_heads,
             head_dim=kv_headdim,
             num_tokens_per_page=num_tokens_per_page,
+            num_tokens_per_chunk=num_tokens_per_chunk,
             num_primary_cache_pages=num_primary_cache_pages,
-            num_onload_buffer_pages=num_onload_buffer_pages,
+            num_buffer_pages=num_buffer_pages,
+            max_batch_size=max_batch_size,
             dtype=torch.bfloat16,
-            device=torch.device("cuda"),
+            device_idx=torch.cuda.current_device(),
         )
+        self.dummy_empty_tensor = torch.tensor([], dtype=torch.int32)
 
         self.secondary_kvcache_manager = secondary_kvcache_manager if secondary_kvcache_manager is not None else NopSecondaryKVCacheManager()
         self.secondary_kvcache_manager.register_gpu_cache_tensors(self.gpu_kvcache_mgr.gpu_kvcache_table)
@@ -166,32 +163,33 @@ class KVCacheManager:
         self,
         index_meta: KVIndexMeta,
     ):
-        # 0. Lookup host again in case of multi-GPU instances
+        # 0. Maybe r
+        # 1. Get the maximum batch for offloading from GPU
+        uids_to_offload = self.gpu_kvcache_mgr.check_for_offload(index_meta.user_ids)
+
+        # 2. Lookup host again in case of multi-GPU instances
         offloaded_lengths = self.secondary_kvcache_manager.lookup_kvcache(index_meta)
-        # 1. Get offload lengths from gpu cache, and extra offload uids and lengths
+
+        # 3. Acquire and lock GPU cache pages
         (offload_user_ids, 
          offload_start_indices, 
          offload_page_indices_list, 
-        ) = self.gpu_kvcache_mgr.acquire_offload_pages(index_meta.user_ids, offloaded_lengths)
+        ) = self.gpu_kvcache_mgr.acquire_offload_pages(uids_to_offload, offloaded_lengths)
         # returned with cache pages locked (per-uid). TODO(junyiq): per-(uid, lock_start, lock_end)
+        # Note: all pages from offload_page_indicesa are required to offload. duplication will be resolved when finished.
         if offload_user_ids.size(0) == 0:
             return None
 
+        # 4. Launch the offloading thru Host
         task_handle = self.secondary_kvcache_manager.offload_launch_kvcache(
-            offload_user_ids, offload_start_indices, offload_page_indices_list
+            offload_user_ids, offload_start_indices, offload_page_indices_list,
         )
         if task_handle is None:
             # offload is rejected on the host side (e.g., due to overload), release the locks immediately.
             self.gpu_kvcache_mgr.release_offload_pages(
-                offload_user_ids, offload_start_indices, [ page_ids.size(0) * self.page_size for page_ids in offload_page_indices ],
+                offload_user_ids, offload_start_indices, self.dummy_empty_tensor,
                 offloaded=False)
             return None
-        if False:
-            # unlock pages not need to offload (alreay offloaded)
-            pass
-            # self.gpu_kvcache_mgr.release_offload_pages(
-            #     offload_user_ids, offload_start_indices, [ page_ids.size(0) * self.page_size for page_ids in offload_page_indices ],
-            #     offloaded=True)
         
         rid = str(uuid4())
         self.ongoing_offload_tasks[rid] = task_handle
@@ -242,7 +240,7 @@ class KVCacheManager:
             
             self.ongoing_offload_tasks.pop(request_id, None)
             self.gpu_kvcache_mgr.release_offload_pages(
-                    task_handle.user_ids, task_handle.pages,
+                    task_handle.get_user_ids(), task_handle.get_start_indices(), task_handle.get_lengths(),
                     offloaded=offload_success)
 
 

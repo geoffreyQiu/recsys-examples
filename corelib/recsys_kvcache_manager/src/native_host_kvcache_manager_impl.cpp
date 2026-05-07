@@ -18,9 +18,8 @@
 # 
 ******************************************************************************/
 
-#include "kvcache_manager_impl.h"
+#include "native_host_kvcache_manager_impl.h"
 #include <nvtx3/nvtx3.hpp>
-#include "nvcomp/ans.h"
 
 #define cudaCheck(ans) { cudaSuccesAssert((ans), __FILE__, __LINE__); }
 inline void cudaSuccesAssert(cudaError_t code, const char *file, int line, bool abort=true)
@@ -65,17 +64,13 @@ void gather_paged_kvcache(
 namespace kvcache {
 
 
-KVOnloadHandle::KVOnloadHandle() : no_onload(true) {}
-
-KVOnloadHandle::KVOnloadHandle(
-    int num_layers
-)
+KVOnloadHandle::KVOnloadHandle(int num_layers)
 : num_layers(num_layers)
 , compl_event(std::vector<cudaEvent_t>(num_layers))
 , internal_onload_event(std::vector<cudaEvent_t>(num_layers))
 , host_complete(num_layers, 0)
-, no_onload(true)
-, inited(false) {}
+, inited(false)
+, no_onload(true) {}
 
 KVOnloadHandle::~KVOnloadHandle(){
     if (!inited) return;
@@ -89,8 +84,9 @@ void KVOnloadHandle::init() {
     this->no_onload = false;
     if (!inited) {
         for (int layer_idx = 0; layer_idx < this->num_layers; layer_idx ++) {
-            cudaCheck(cudaEventCreateWithFlags(&this->compl_event[layer_idx], cudaEventBlockingSync));
-            cudaCheck(cudaEventCreateWithFlags(&this->internal_onload_event[layer_idx], cudaEventBlockingSync));
+            cudaCheck(cudaEventCreateWithFlags(&this->compl_event[layer_idx], cudaEventDisableTiming));
+            cudaCheck(cudaEventCreateWithFlags(&this->internal_onload_event[layer_idx], cudaEventDisableTiming));
+            host_complete[layer_idx] = 0;
         }
         inited = true;
     }
@@ -123,29 +119,53 @@ void KVOnloadHandle::wait_host(int layer_idx) {
 
 
 KVOffloadHandle::KVOffloadHandle(
-    int num_layers,
-    bool has_offload
+    int num_layers
 )
 : num_layers(num_layers)
 , ready_event(std::vector<cudaEvent_t>(num_layers))
-, host_ready(std::vector<std::atomic<int>>(num_layers, 0))
-, no_offload(false) {
-    for (int layer_idx = 0; layer_idx < num_layers; layer_idx ++) {
-        cudaCheck(cudaEventCreateWithFlags(&internal_gather_event[layer_idx], cudaEventBlockingSync));
-        cudaCheck(cudaEventCreateWithFlags(&ready_event[layer_idx], cudaEventBlockingSync));
+, host_ready(num_layers)
+, inited(false)
+, no_offload(true) {
+    for (int i = 0; i < num_layers; i++) {
+        host_ready[i].store(0, std::memory_order_release);
     }
 }
 
 KVOffloadHandle::~KVOffloadHandle() {
+    if (!inited) return;
+    cudaCheck(cudaEventDestroy(inference_event));
     for (int layer_idx = 0; layer_idx < num_layers; layer_idx ++) {
-        cudaCheck(cudaEventDestroy(&internal_gather_event[layer_idx]));
-        cudaCheck(cudaEventDestroy(&ready_event[layer_idx]));
+        cudaCheck(cudaEventDestroy(internal_gather_event[layer_idx]));
+        cudaCheck(cudaEventDestroy(ready_event[layer_idx]));
     }
 }
 
+void KVOffloadHandle::init(
+    at::Tensor offload_user_ids,
+    at::Tensor offload_start_indices,
+    std::vector<int64_t>&& offload_lengths
+) {
+    this->no_offload = false;
+    if (!inited) {
+        cudaCheck(cudaEventCreateWithFlags(&inference_event, cudaEventDisableTiming));
+        for (int layer_idx = 0; layer_idx < num_layers; layer_idx ++) {
+            cudaCheck(cudaEventCreateWithFlags(&internal_gather_event[layer_idx], cudaEventDisableTiming));
+            cudaCheck(cudaEventCreateWithFlags(&ready_event[layer_idx], cudaEventDisableTiming));
+        }
+        inited = true;
+    }
+    this->offload_user_ids = offload_user_ids;
+    this->offload_start_indices = offload_start_indices;
+    this->offload_lengths = std::move(offload_lengths);
+}
+
+void KVOffloadHandle::complete_host(int layer_idx, cudaStream_t stream) {
+    cudaCheck(cudaEventRecord(this->ready_event[layer_idx], stream));
+    this->host_ready[layer_idx].store(1, std::memory_order_release);
+}
 
 void KVOffloadHandle::complete_host(int layer_idx, cudaStream_t stream,
-                                    std::vector<std::pair< std::vector<void*>, std::vector<void*> >>&& chunks) {
+                                    std::vector<std::pair< std::vector<int64_t>, std::vector<int64_t> >>&& chunks) {
     this->chunks = std::move(chunks);
     cudaCheck(cudaEventRecord(this->ready_event[layer_idx], stream));
     this->host_ready[layer_idx].store(1, std::memory_order_release);
@@ -155,7 +175,7 @@ bool KVOffloadHandle::try_wait_host(int layer_idx) {
     if (this->host_ready[layer_idx].load(std::memory_order_acquire) == 0) {
         return false;
     }
-    if (cuEventQuery(this->ready_event[layer_idx]) == cudaSuccess) {
+    if (cudaEventQuery(this->ready_event[layer_idx]) == cudaSuccess) {
         return true;
     }
     return false;
@@ -166,28 +186,109 @@ HostKVStorageImpl::HostKVStorageImpl(
     int num_kv_heads,
     int kv_headdim,
     int num_tokens_per_page,
-    int64_t num_tokens_per_chunk
+    int64_t num_tokens_per_chunk,
+    int64_t capacity_per_layer,
+    int64_t max_batch_size,
+    int64_t max_sequence_length,
+    int device_idx
 )
     : num_layers(num_layers)
     , num_kv_heads(num_kv_heads)
     , kv_headdim(kv_headdim)
-    , page_size(num_tokens_per_page)
-    , chunk_size(num_tokens_per_chunk)
-    , _uid_to_chunks(num_layers, std::unordered_map<int64_t, std::pair<std::vector<int64_t>, std::vector<int64_t>>>())
+    , num_tokens_per_page(num_tokens_per_page)
+    , num_tokens_per_chunk(num_tokens_per_chunk)
+    , capacity_per_layer(capacity_per_layer)
+    , max_batch_size(max_batch_size)
+    , max_sequence_length(max_sequence_length)
+    , device_idx(device_idx)
+    , _uid_to_chunks()
 {
-    this->chunk_numel = num_tokens_per_chunk * 2 * num_kv_heads * kv_headdim;
-    this->page_numel = 2 * page_size * num_kv_heads * kv_headdim;
+    size_t padded_pages_per_seq = (max_sequence_length + num_tokens_per_page - 1) / num_tokens_per_page;
+    this->max_numel_per_layer_buffer = max_batch_size * padded_pages_per_seq * page_numel;
+
+    this->num_pages_per_chunk = num_tokens_per_chunk / num_tokens_per_page;
+
+    this->unit_chunk_numel = num_tokens_per_chunk * 2 * num_kv_heads * kv_headdim;
+    this->page_numel = 2 * num_tokens_per_page * num_kv_heads * kv_headdim;
     this->per_token_numel = 2 * num_kv_heads * kv_headdim;
 
-    int dev_id = 0;
-    int k_num_sms = 0;
-    cudaCheck(cudaGetDevice(&dev_id));
-    cudaCheck(cudaDeviceGetAttribute(&k_num_sms, cudaDevAttrMultiProcessorCount, dev_id));
-    this->device_num_sms = k_num_sms;
+    this->unit_chunk_bytes = unit_chunk_numel * sizeof(uint16_t);
+    this->page_bytes = page_numel * sizeof(uint16_t);
+
+    this->inner_token_stride = num_kv_heads * kv_headdim;
+    this->k2v_stride = num_tokens_per_page * inner_token_stride;
+    this->page_stride = 2 * k2v_stride;
+
+    c10::cuda::OptionalCUDAGuard device_guard(this->device_idx);
+
+    cudaCheck(cudaDeviceGetAttribute(&this->device_num_sms, cudaDevAttrMultiProcessorCount, device_idx));
+    cudaCheck(cudaStreamCreateWithFlags(&onload_stream, cudaStreamNonBlocking));
+    cudaCheck(cudaStreamCreateWithFlags(&offload_stream, cudaStreamNonBlocking));
+    cudaCheck(cudaStreamCreateWithFlags(&scatter_stream, cudaStreamNonBlocking));
+    cudaCheck(cudaStreamCreateWithFlags(&gather_stream, cudaStreamNonBlocking));
+        
+    for (int i = 0; i < 2; i++) {
+        void *ptr;
+        cudaCheck(cudaMalloc(&ptr, max_numel_per_layer_buffer * sizeof(uint16_t)));
+        onload_gpu_buffers.push_back(ptr);
+    }
+    for (int i = 0; i < 2; i++) {
+        void *ptr;
+        cudaCheck(cudaMalloc(&ptr, max_numel_per_layer_buffer * sizeof(uint16_t)));
+        offload_gpu_buffers.push_back(ptr);
+    }
+
+    for (int i = 0; i < num_layers; i++) {
+        void *ptr;
+        cudaCheck(cudaMallocHost(&ptr, capacity_per_layer));
+        pinned_kvstorage_buffers.push_back(ptr);
+    }
+
+    _num_empty_chunks = capacity_per_layer / unit_chunk_bytes;
+    _empty_chunks.push(
+        std::make_pair(0, _num_empty_chunks));
+
 };
 
 HostKVStorageImpl::~HostKVStorageImpl()
-{}
+{
+    for (void* ptr : pinned_kvstorage_buffers) {
+        cudaCheck(cudaFreeHost(ptr));
+    }
+    for (void* ptr : offload_gpu_buffers) {
+        cudaCheck(cudaFree(ptr));
+    }
+    for (void* ptr : onload_gpu_buffers) {
+        cudaCheck(cudaFree(ptr));
+    }
+
+    cudaCheck(cudaStreamDestroy(gather_stream));
+    cudaCheck(cudaStreamDestroy(scatter_stream));
+    cudaCheck(cudaStreamDestroy(offload_stream));
+    cudaCheck(cudaStreamDestroy(onload_stream));
+}
+
+
+void HostKVStorageImpl::register_gpu_cache_table(
+    std::vector<at::Tensor> table)
+{
+    for (int layer_idx = 0; layer_idx < this->num_layers; layer_idx++) {
+        this->gpu_cache_table.push_back(
+            reinterpret_cast<void*>(table[layer_idx].data_ptr<char*>())
+        );
+    }
+}
+
+at::Tensor HostKVStorageImpl::lookup(at::Tensor user_ids) {
+    at::Tensor cached_lengths = at::empty({user_ids.size(0)}, torch::kInt32);
+    int *lengths_ptr = cached_lengths.data_ptr<int>();
+    for (auto i = 0; i < user_ids.size(0); i++) {
+        int64_t uid = user_ids[i].item<int64_t>();
+        auto it = _uid_to_length.find(uid);
+        lengths_ptr[i] = (it ==  _uid_to_length.end()) ? 0 : it->second;
+    }
+    return cached_lengths;
+}
 
 int64_t HostKVStorageImpl::get_kvdata_length(int64_t user_id) {
     auto it = _uid_to_length.find(user_id);
@@ -197,8 +298,6 @@ int64_t HostKVStorageImpl::get_kvdata_length(int64_t user_id) {
 
 std::pair<std::vector<void*>, std::vector<int64_t>> HostKVStorageImpl::get_kvdata(int64_t user_id, int64_t length, int64_t layer_idx) {
     // assert(this->get_kvdata_length(user_id) >= length);
-    std::unique_lock<std::mutex> lock(host_kvcache_mutex_);
-
     std::vector<void*> chunk_ptrs;
     std::vector<int64_t> chunk_bytes;
     if (length == 0) {
@@ -206,19 +305,19 @@ std::pair<std::vector<void*>, std::vector<int64_t>> HostKVStorageImpl::get_kvdat
     }
 
     const auto &chunk_offsets = _uid_to_chunks[user_id].first;
-    const auto &chunk_sizes = _uid_to_chunks[user_id].second;
+    const auto &chunk_psizes = _uid_to_chunks[user_id].second;
 
     int64_t tokens_from_chunks = 0;
     for (size_t idx = 0; idx < chunk_offsets.size(); idx++) {
         void* src_ptr = reinterpret_cast<void*>(reinterpret_cast<char*>(this->pinned_kvstorage_buffers[layer_idx]) + chunk_offsets[idx]);
         chunk_ptrs.push_back(src_ptr);
-        if (tokens_from_chunks + chunk_sizes[idx] * this->num_tokens_per_page >= length) {
+        if (tokens_from_chunks + chunk_psizes[idx] * this->num_tokens_per_page >= length) {
             int64_t last_chunk_tokens = length - tokens_from_chunks;
             chunk_bytes.push_back(last_chunk_tokens * this->per_token_numel * sizeof(uint16_t));
             break;
         }
-        tokens_from_chunks += chunk_sizes[idx] * this->num_tokens_per_page;
-        chunk_bytes.push_back(chunk_sizes[idx] * this->num_tokens_per_page * this->per_token_numel * sizeof(uint16_t));
+        tokens_from_chunks += chunk_psizes[idx] * this->num_tokens_per_page;
+        chunk_bytes.push_back(chunk_psizes[idx] * this->num_tokens_per_page * this->per_token_numel * sizeof(uint16_t));
     }
     // assert(tokens_from_chunks == length);
     return std::make_pair(chunk_ptrs, chunk_bytes);
@@ -234,23 +333,24 @@ std::vector<at::Tensor> HostKVStorageImpl::get_kvdata_tensor(std::vector<int64_t
         seqlens[seq_idx] = get_kvdata_length(user_ids[seq_idx]);
         total_seqlen += seqlens[seq_idx];
     }
-    int64_t num_total_pages = total_seqlen / this->page_size;
+    int64_t num_total_pages = total_seqlen / this->num_tokens_per_page;
 
     at::Tensor tensor_res = at::empty({
-        this->num_layers, num_total_pages, 2, this->page_size, this->num_kv_heads, this->kv_headdim}, torch::kBFloat16);
+        this->num_layers, num_total_pages, 2, this->num_tokens_per_page, this->num_kv_heads, this->kv_headdim}, torch::kBFloat16);
     
     int64_t seqlen_offset = 0;
     uint16_t *raw_ptr = static_cast<uint16_t*>(tensor_res.data_ptr());
 
 
     for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
-        uint16_t *seq_ptr = raw_ptr + (seqlen_offset / this->page_size) * tensor_res.stride(1);
-        int num_chunks = seqlens[seq_idx] / this->chunk_size;
+        uint16_t *seq_ptr = raw_ptr + (seqlen_offset / this->num_tokens_per_page) * this->page_numel;
 
         for (int layer_idx = 0 ; layer_idx < this->num_layers; layer_idx++){
             auto [chunk_ptrs, chunk_bytes] = get_kvdata(user_ids[seq_idx], seqlens[seq_idx], layer_idx);
-            for (int chk_idx = 0; chk_idx < num_chunks; chk_idx++) {
-                std::memcpy(seq_ptr + layer_idx * tensor_res.stride(0) + chk_idx * this->chunk_numel, chunk_ptrs[chk_idx], chunk_bytes[chk_idx]);
+            int64_t running_numel = 0;
+            for (size_t chk_idx = 0; chk_idx < chunk_ptrs.size(); chk_idx++) {
+                std::memcpy(seq_ptr + layer_idx * tensor_res.stride(0) + running_numel, chunk_ptrs[chk_idx], chunk_bytes[chk_idx]);
+                running_numel += chunk_bytes[chk_idx] / sizeof(uint16_t);
             }
         }
 
@@ -265,29 +365,29 @@ std::vector<at::Tensor> HostKVStorageImpl::get_kvdata_tensor(std::vector<int64_t
 //     if (_uid_to_length.find(user_id) != _uid_to_length.end()) return;
 //     if (num_tokens == 0) return;
     
-//     size_t num_chunks = ((num_tokens + this->chunk_size - 1) / this->chunk_size);
+//     size_t num_chunks = ((num_tokens + this->num_tokens_per_chunk - 1) / this->num_tokens_per_chunk);
 
-//     uint16_t *host_data_ptr = (uint16_t *)malloc(this->num_layers * num_chunks * this->chunk_numel * sizeof(uint16_t));
+//     uint16_t *host_data_ptr = (uint16_t *)malloc(this->num_layers * num_chunks * this->unit_chunk_numel * sizeof(uint16_t));
 
 //     for (int layer_idx = 0; layer_idx < num_layers; layer_idx++)
 //         _uid_to_chunk_id[layer_idx][user_id] = std::vector<uintptr_t>();
 //     _uid_to_mempool[user_id] = std::vector<uintptr_t>();
 
 //     for (int layer_idx = 0; layer_idx < num_layers; layer_idx++) {
-//         uint16_t* src_ptr = host_data_ptr + layer_idx * num_chunks * this->chunk_numel;
+//         uint16_t* src_ptr = host_data_ptr + layer_idx * num_chunks * this->unit_chunk_numel;
         
 //         for (size_t chunk_idx = 0; chunk_idx < num_chunks; chunk_idx ++) {
-//             _uid_to_chunk_id[layer_idx][user_id].push_back(reinterpret_cast<uintptr_t>(src_ptr + chunk_idx * this->chunk_numel));
+//             _uid_to_chunk_id[layer_idx][user_id].push_back(reinterpret_cast<uintptr_t>(src_ptr + chunk_idx * this->unit_chunk_numel));
 //         }
 //     }
 //     _uid_to_mempool[user_id].push_back(reinterpret_cast<uintptr_t>(host_data_ptr));
-//     _uid_to_length[user_id] = num_chunks * this->chunk_size;
+//     _uid_to_length[user_id] = num_chunks * this->num_tokens_per_chunk;
 // }
 
 
 void HostKVStorageImpl::onload_kvcache(
     at::Tensor onload_user_ids,  // on host
-    const std::vector<const at::Tensor>& onload_page_indices_list, // on gpu
+    const std::vector<at::Tensor> onload_page_indices_list, // on gpu
     KVOnloadHandle& onloadhandle) {
     const int batch_size = onload_user_ids.size(0);
 
@@ -306,13 +406,13 @@ void HostKVStorageImpl::onload_kvcache(
 
     for (int layer_idx = 0; layer_idx < this->num_layers; layer_idx++) {
         // nvtx3::scoped_range r{"onload_layer_" + std::to_string(layer_idx)};
-        char *gpu_onload_buffer = this->onload_gpu_buffers[layer_idx % 2];  // single layer for a max batch (multi-chunks)
+        char *gpu_onload_buffer = reinterpret_cast<char*>(this->onload_gpu_buffers[layer_idx % 2]);  // single layer for a max batch (multi-chunks)
         if (layer_idx >= 2) cudaCheck(cudaStreamWaitEvent(this->onload_stream, onloadhandle.compl_event[layer_idx - 2], 0));
 
         size_t bytes_offset_in_buffer = 0;
         for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
-            auto [chunk_ptrs, chunk_bytes] = host_kv_mgr->get_kvdata(
-                onload_user_ids[seq_idx], 
+            auto [chunk_ptrs, chunk_bytes] = this->get_kvdata(
+                onload_user_ids[seq_idx].item<int64_t>(), 
                 onload_page_indices_list[seq_idx].size(0) * this->num_tokens_per_page, 
                 layer_idx
             );
@@ -324,16 +424,20 @@ void HostKVStorageImpl::onload_kvcache(
         }
         cudaCheck(cudaEventRecord(onloadhandle.internal_onload_event[layer_idx], this->onload_stream));
         cudaCheck(cudaStreamWaitEvent(this->scatter_stream, onloadhandle.internal_onload_event[layer_idx], 0));
-        scatter_paged_kvcache(this->gpu_cache_table[layer_idx], gpu_onload_buffer, onload_page_indices.data_ptr<int32_t>(), 
-            this->num_kv_heads, this->kv_headdim, this->page_size, this->page_stride, this->k2v_stride, 
-            this->num_kv_heads * this->kv_headdim, this->kv_headdim, onload_page_indices.size(0) * this->num_tokens_per_page,
+        scatter_paged_kvcache(reinterpret_cast<uint16_t*>(this->gpu_cache_table[layer_idx]), 
+            reinterpret_cast<uint16_t*>(gpu_onload_buffer), 
+            onload_page_indices.data_ptr<int>(), 
+            this->num_kv_heads, this->kv_headdim, this->num_tokens_per_page, this->page_stride, this->k2v_stride, 
+            this->inner_token_stride, this->kv_headdim, onload_page_indices.size(0) * this->num_tokens_per_page,
             this->device_num_sms, this->scatter_stream);
         onloadhandle.complete_host(layer_idx, this->scatter_stream);
     }
 }
 // 32 * 8192 * 2 * 8 * 256 * 2 = 1342177280 bytes = 1.25 GB per layer
 
-std::vector<std::vector<void*>> HostKVStorageImpl::get_empty_pinned_chunks(
+
+// TODO(junyiq): make it per single uid
+std::vector<std::pair< std::vector<int64_t>, std::vector<int64_t> >> HostKVStorageImpl::get_empty_pinned_chunks(
     at::Tensor& offload_user_ids, 
     at::Tensor& offload_start_indices,
     const std::vector<int32_t>& offload_num_pages_list) {
@@ -347,7 +451,7 @@ std::vector<std::vector<void*>> HostKVStorageImpl::get_empty_pinned_chunks(
         int32_t offload_num_pages = offload_num_pages_list[idx];
 
         std::vector<int64_t> chunk_offsets;
-        std::vector<int64_t> chunk_sizes;
+        std::vector<int64_t> chunk_psizes;
 
         if (start_pos % num_tokens_per_chunk != 0)  {
             // if start_pos is not aligned to chunk size, reuse the last offloaded chunk.
@@ -356,35 +460,39 @@ std::vector<std::vector<void*>> HostKVStorageImpl::get_empty_pinned_chunks(
             // assert();
             chunk_offset = chunk_offset + partial_num_pages * this->page_bytes;
             chunk_offsets.push_back(chunk_offset);
-            chunk_sizes.push_back(this->num_pages_per_chunk - partial_num_pages);
+            chunk_psizes.push_back(this->num_pages_per_chunk - partial_num_pages);
 
-            start_pos = int32_t(std::ceil(static_cast<float>(start_pos) / num_tokens_per_chunk) * num_tokens_per_chunk);
+            start_pos += (this->num_pages_per_chunk - partial_num_pages) * this->num_tokens_per_page;
             offload_num_pages -= (this->num_pages_per_chunk - partial_num_pages);
         }
 
-        int32_t padded_num_pages = static_cast<int32_t>(std::ceil(static_cast<float>(offload_num_pages) / this->num_tokens_per_chunk) * this->num_tokens_per_chunk);
-        while (padded_num_pages > 0) {
-            if (_empty_chunks.empty()) {
+        int32_t padded_num_pages = static_cast<int32_t>(
+            std::ceil(static_cast<float>(offload_num_pages) / this->num_pages_per_chunk) * this->num_pages_per_chunk);
+        size_t left_num_pages = padded_num_pages;
+        while (left_num_pages > 0) {
+            if (_empty_chunks.empty() || _num_empty_chunks == 0) {
                 // abort if no empty chunk available
+                // TODO(junyiq): add LRU eviction
                 break;
             }
-            auto [chunk_idx, chunk_size] = _empty_chunks.front();
-            if (chunk_size > padded_num_pages) {
-                _empty_chunks.front().first += padded_num_pages / this->num_pages_per_chunk;
-                _empty_chunks.front().second -= padded_num_pages;
+            auto [chunk_idx, num_unit_chunks] = _empty_chunks.front();
+            if (num_unit_chunks * this->num_pages_per_chunk > left_num_pages) {
+                _empty_chunks.front().first += left_num_pages / this->num_pages_per_chunk;
+                _empty_chunks.front().second -= left_num_pages / this->num_pages_per_chunk;
                 chunk_offsets.push_back(static_cast<int64_t>(chunk_idx * this->unit_chunk_bytes));
-                chunk_sizes.push_back(padded_num_pages);
-                padded_num_pages = 0;
+                chunk_psizes.push_back(left_num_pages);
+                left_num_pages = 0;
+                break;
             } else {
                 _empty_chunks.pop();
                 chunk_offsets.push_back(static_cast<int64_t>(chunk_idx * this->unit_chunk_bytes));
-                chunk_sizes.push_back(chunk_size);
-                padded_num_pages -= chunk_size;
+                chunk_psizes.push_back(num_unit_chunks * this->num_pages_per_chunk);
+                left_num_pages -= num_unit_chunks * this->num_pages_per_chunk;
             }
         }
-        _empty_sizes -= padded_num_pages;
+        _num_empty_chunks -= padded_num_pages / this->num_pages_per_chunk;
 
-        empty_pinned_chunks.push_back(std::make_pair(chunks, chunk_sizes));
+        empty_pinned_chunks.push_back(std::make_pair(chunk_offsets, chunk_psizes));
     }
 
     return empty_pinned_chunks;
@@ -394,7 +502,7 @@ std::vector<std::vector<void*>> HostKVStorageImpl::get_empty_pinned_chunks(
 bool HostKVStorageImpl::offload_kvcache(
     at::Tensor offload_user_ids, // on host
     at::Tensor offload_start_indices,  // on host
-    const std::vector<const at::Tensor>& offload_page_indices_list, // on host
+    const std::vector<at::Tensor>& offload_page_indices_list, // on host
     KVOffloadHandle& offloadhandle) {
     const auto batch_size = offload_user_ids.size(0);
 
@@ -403,57 +511,50 @@ bool HostKVStorageImpl::offload_kvcache(
     c10::cuda::CUDAStream c10_gather_stream =
         c10::cuda::getStreamFromExternal(this->gather_stream, device.index());
 
-    offloadhandle.init();
-    std::vector<int64_t> filtered_user_ids;
-    std::vector<const at::Tensor> filtered_page_indices_list;
-    std::vector<int32_t> num_pages_list;
-    // filter offload uids & page_ids
-    for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
-        int32_t start_index = offload_start_indices[seq_idx].item<int32_t>();
-        const int32_t offloaded_length = this->_uid_to_length[seq_idx].item<int32_t>();
-        if (start_index < offloaded_length) {
-            // give a warning print
-        } else if (start_index > offloaded_length) {
-            // give an error print
-            // uninit offloadhandle
-            return false;
-        }
-        int32_t page_start = offloaded_length / this->num_tokens_per_page;
-        int32_t page_end = start_index / this->num_tokens_per_page + offload_page_indices_list[seq_idx].size(0);
-        if (page_end == page_start) continue;
-        filtered_user_ids.push_back(offload_user_ids[seq_idx].item<int64_t>());
-        filtered_page_indices_list.push_back(
-            offload_page_indices_list[seq_idx].narrow(0, page_start, page_end - page_start));
-        offloadhandle.pages.push_back(std::make_pair(page_start, page_end));
-        num_pages_list.push_back(page_end - page_start);
+    std::vector<int32_t> num_pages_list(batch_size);
+    std::vector<int64_t> offload_lengths(batch_size);
+    for (int i = 0; i < batch_size; i++) {
+        num_pages_list[i] = offload_page_indices_list[i].size(0);
+        offload_lengths[i] = num_pages_list[i] * this->num_tokens_per_page;
     }
-    c10::cuda::CUDAStreamGuard gather_stream_guard(c10_gather_stream);
+
+    offloadhandle.init(
+        offload_user_ids,
+        offload_start_indices,
+        std::move(offload_lengths)
+    );
+
     // [[ contains allocation from torch gpu memory, and memcpy(concat, h2d) ]]
     int64_t cat_dim = 0;
-    for (const auto& t : filtered_page_indices_list) cat_dim += t.size(0);
+    for (const auto& t : offload_page_indices_list) cat_dim += t.size(0);
     at::Tensor h_offload_page_indices = at::empty(
         {cat_dim},
         at::TensorOptions().device(torch::kCPU).dtype(torch::kInt32).pinned_memory(true)
     );
-    at::cat_out(h_offload_page_indices, filtered_page_indices_list, 0);
-    at::Tensor offload_page_indices = h_offload_page_indices.to(device, torch::kInt32);
-    
+    at::cat_out(h_offload_page_indices, offload_page_indices_list, 0);
+
+    cudaCheck(cudaEventRecord(offloadhandle.inference_event, at::cuda::getCurrentCUDAStream()));  // ensure the offload kv on gpu is ready
+    cudaCheck(cudaStreamWaitEvent(this->gather_stream, offloadhandle.inference_event, 0));
+
+    c10::cuda::CUDAStreamGuard gather_stream_guard(c10_gather_stream);
+    at::Tensor offload_page_indices = h_offload_page_indices.to(device, torch::kInt32, true, true);
     
     // Step 0. Find pinned buffers from the pool: 
     //      [[ In Use ]]: Eviction Policy based on user LRU, without pinned-to-unpinned memcpy
     std::vector<std::pair< std::vector<int64_t>, std::vector<int64_t> >> empty_pinned_chunks = this->get_empty_pinned_chunks(
         offload_user_ids,
         offload_start_indices,
-        num_pages_list,
+        num_pages_list
     );
 
     for (int layer_idx = 0; layer_idx < this->num_layers; layer_idx++) {
         void *gpu_offload_buffer = this->offload_gpu_buffers[layer_idx % 2];  // single layer for a max batch (multi-chunks)
-        if (layer_idx >= 2) cudaCheck(cudaStreamWaitEvent(this->gather_stream, offloadhandle.ready_event[layer_idx - 2], 0));
-        // Step 1. callgatherkernel<<< , this->gather_stream>>>(gpu_offload_buffer, this->gpu_cache_table, offload_page_indices, offload_page_indptrs);
-        gatter_paged_kvcache(gpu_offload_buffer, this->gpu_cache_table[layer_idx], offload_page_indices.data_ptr<int>(), 
-            this->num_kv_heads, this->kv_headdim, this->page_size, this->page_stride, this->k2v_stride, 
-            this->num_kv_heads * this->kv_headdim, this->kv_headdim, offload_page_indices.size(0),
+        // Step 1. Gather pages on GPU
+        gather_paged_kvcache(reinterpret_cast<uint16_t*>(gpu_offload_buffer), 
+            reinterpret_cast<uint16_t*>(this->gpu_cache_table[layer_idx]), 
+            offload_page_indices.data_ptr<int>(), 
+            this->num_kv_heads, this->kv_headdim, this->num_tokens_per_page, this->page_stride, this->k2v_stride, 
+            this->inner_token_stride, this->kv_headdim, offload_page_indices.size(0),
             this->device_num_sms, this->scatter_stream);
 
         // Step 2. cudaEventRecord(offloadhandle.internal_gather_event, this->offload_stream);
@@ -461,41 +562,42 @@ bool HostKVStorageImpl::offload_kvcache(
         // Step 3. cudaMemcpyAsync from GPU cache to pinned buffer
         cudaCheck(cudaStreamWaitEvent(this->offload_stream, offloadhandle.internal_gather_event[layer_idx], 0));
         for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
-            auto [chunk_offsets, chunk_sizes] = empty_pinned_chunks[seq_idx];
+            auto [chunk_offsets, chunk_psizes] = empty_pinned_chunks[seq_idx];
             size_t offset_in_buffer = 0;
             for (int idx = 0; idx < chunk_offsets.size(); idx++) {
-                cudaCheck(cudaMemcpyAsync(this->pinned_kvstorage_buffers[layer_idx] + chunk_offsets[idx], gpu_offload_buffer + offset_in_buffer, chunk_sizes[idx] * this->page_bytes, cudaMemcpyDeviceToHost, this->offload_stream));
-                offset_in_buffer += chunk_sizes[idx] * this->page_bytes;
+                cudaCheck(cudaMemcpyAsync(this->pinned_kvstorage_buffers[layer_idx] + chunk_offsets[idx], gpu_offload_buffer + offset_in_buffer, chunk_psizes[idx] * this->page_bytes, cudaMemcpyDeviceToHost, this->offload_stream));
+                offset_in_buffer += chunk_psizes[idx] * this->page_bytes;
             }
         }
         if (layer_idx < this->num_layers - 1) {
-            offloadhandle.complete_host(layer_idx, this->offload_stream, std::move(offloadhandle.chunks));
+            offloadhandle.complete_host(layer_idx, this->offload_stream);
         } else {
             offloadhandle.complete_host(layer_idx, this->offload_stream, std::move(empty_pinned_chunks));
+            // For next offload, gather stream wait for current offload completion to gpu offload buffers are not in used.
+            cudaCheck(cudaStreamWaitEvent(this->gather_stream, offloadhandle.ready_event[layer_idx], 0));
         } 
     }
     return true;
 }
 
 bool HostKVStorageImpl::finish_offload(
-    at::Tensor& offload_user_ids,
     KVOffloadHandle& offloadhandle) {
 
-    for (int seq_idx = 0; seq_idx < offload_user_ids.size(0); seq_idx++) {
-        int64_t user_id = offload_user_ids[seq_idx].item<int64_t>();
-        auto [page_start, page_end] = offloadhandle.pages[seq_idx];
-        if (page_start * this->page_size != _uid_to_length[user_id]) {
+    for (int seq_idx = 0; seq_idx < offloadhandle.offload_user_ids.size(0); seq_idx++) {
+        int64_t user_id = offloadhandle.offload_user_ids[seq_idx].item<int64_t>();
+        auto offload_start_index = offloadhandle.offload_start_indices[seq_idx].item<int64_t>();
+        if (offload_start_index != _uid_to_length[user_id]) {
             // give a warning print
             return false;
         }
 
-        auto [chunk_offsets, chunk_sizes] = offloadhandle.chunks[seq_idx];
+        auto [chunk_offsets, chunk_psizes] = offloadhandle.chunks[seq_idx];
         for (int idx = 0; idx < chunk_offsets.size(); idx++) {
-            if (chunk_sizes[idx] < this->num_pages_per_chunk) continue;
+            if (chunk_psizes[idx] < this->num_pages_per_chunk) continue;
             _uid_to_chunks[user_id].first.push_back(chunk_offsets[idx]);
-            _uid_to_chunks[user_id].second.push_back(chunk_sizes[idx]);
+            _uid_to_chunks[user_id].second.push_back(chunk_psizes[idx]);
         }
-        _uid_to_length[user_id] = page_end * this->page_size;
+        _uid_to_length[user_id] = offload_start_index + offloadhandle.offload_lengths[seq_idx];
     }
 
     return true;
@@ -507,12 +609,12 @@ bool HostKVStorageImpl::cancel_offload(
 
     auto & chunks = offloadhandle.chunks;
     for (int seq_idx = 0; seq_idx < chunks.size(); seq_idx++) {
-        auto [chunk_offsets, chunk_sizes] = chunks[seq_idx];
+        auto [chunk_offsets, chunk_psizes] = chunks[seq_idx];
         if (chunk_offsets.size() == 0) continue;
         for (int idx = 0; idx < chunk_offsets.size(); idx++) {
-            if (chunk_sizes[idx] < this->num_pages_per_chunk) continue;
-            _empty_chunks.push(std::make_pair(chunk_offsets[idx] / this->unit_chunk_bytes, chunk_sizes[idx]));
-            _empty_sizes += chunk_sizes[idx];
+            if (chunk_psizes[idx] < this->num_pages_per_chunk) continue;
+            _empty_chunks.push(std::make_pair(chunk_offsets[idx] / this->unit_chunk_bytes, chunk_psizes[idx] / this->num_pages_per_chunk));
+            _num_empty_chunks += chunk_psizes[idx] / this->num_pages_per_chunk;
         }
     }
 

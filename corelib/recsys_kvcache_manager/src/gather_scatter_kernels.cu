@@ -162,7 +162,7 @@ cudaError_t ScatterPagedKVCache(DType* continuous_kv,
     uint32_t bdy = num_heads;
     uint32_t num_threads = bdx * bdy;
     uint32_t smem_size = 0;
-    auto kernel = GatherPagedKVCacheKernel<HEAD_DIM, vec_size, DType, IdType>;
+    auto kernel = ScatterPagedKVCacheKernel<HEAD_DIM, vec_size, DType, IdType>;
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
                                                   num_threads, smem_size);
     num_blocks_per_sm = min(num_blocks_per_sm, ((int(nnz) + num_sms - 1) / num_sms));

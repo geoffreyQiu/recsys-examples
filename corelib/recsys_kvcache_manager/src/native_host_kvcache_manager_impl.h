@@ -27,6 +27,7 @@
 #include <torch/extension.h>
 #include <torch/serialize/tensor.h>
 
+#include <atomic>
 #include <barrier>
 #include <iomanip>
 #include <iostream>
@@ -38,12 +39,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "nvcomp/ans.h"
-
 namespace kvcache {
-
-
-class HostKVStorageImpl;
 
 class KVOnloadHandle {
 public:
@@ -72,21 +68,33 @@ public:
     KVOffloadHandle(int num_layers);
     ~KVOffloadHandle();
 
-    void init();
-    void reset();
+    void init(
+        at::Tensor offload_user_ids,
+        at::Tensor offload_start_indices,
+        std::vector<int64_t>&& offload_lengths);
+    // void reset();
+    void complete_host(int layer_idx, cudaStream_t stream);
     void complete_host(int layer_idx, cudaStream_t stream, 
                        std::vector<std::pair< std::vector<int64_t>, std::vector<int64_t> >>&& chunks);
     bool try_wait_host(int layer_idx);
     float get_launch_time(void) { return this->time_stamp; }
     void set_launch_time(float time) { this->time_stamp = time; }
+public:
+    at::Tensor get_user_ids() const { return this->offload_user_ids; }
+    at::Tensor get_start_indices() const { return this->offload_start_indices; }
+    std::vector<int64_t> get_lengths() const { return this->offload_lengths; }
 
 public:
     int num_layers;
+    cudaEvent_t inference_event;
     std::vector<cudaEvent_t> ready_event;
     std::vector<cudaEvent_t> internal_gather_event;
     std::vector<std::atomic<int>> host_ready;
 
-    std::vector<std::pair<int32_t, int32_t>> pages;
+    at::Tensor offload_user_ids;
+    at::Tensor offload_start_indices;
+    std::vector<int64_t> offload_lengths;
+
     std::vector<std::pair< std::vector<int64_t>, std::vector<int64_t> >> chunks;
     
     bool inited;
@@ -103,52 +111,93 @@ public:
         int num_kv_heads,
         int kv_headdim,
         int num_tokens_per_page,
-        int64_t num_tokens_per_chunk
+        int64_t num_tokens_per_chunk,
+        int64_t capacity_per_layer,
+        int64_t max_batch_size,
+        int64_t max_sequence_length,
+        int device_idx
     );
     ~HostKVStorageImpl();
 
+    void register_gpu_cache_table(std::vector<at::Tensor> table);
+
+    at::Tensor lookup(at::Tensor user_ids);
+
     int64_t get_kvdata_length(int64_t user_id);
+    std::pair<std::vector<void*>, std::vector<int64_t>> get_kvdata(int64_t user_id, int64_t length, int64_t layer_idx);
+    std::vector<at::Tensor> get_kvdata_tensor(std::vector<int64_t> user_ids, bool with_concat = true);
 
-    void append_kvdata(
-        int64_t user_id, int64_t start_position, int64_t length, 
-        uint16_t *kvdata_buffer, size_t buffer_layer_stride);
-    void append_kvdata(
-        int64_t user_id, int64_t start_position, int64_t length, 
-        uint16_t *kvdata_buffer, size_t buffer_layer_stride,
-        size_t *kvdata_bytes, size_t bytes_layer_stride);
+    // public:
+    // void init_random_kvdata(int64_t user_id, size_t num_tokens);
 
-    std::vector<uint16_t*> get_kvdata(int64_t user_id, int64_t length, int64_t layer_idx);
-    std::vector<size_t> get_kvdata_bytes(int64_t user_id, int64_t length, int64_t layer_idx);
+private:
+    std::vector<std::pair< std::vector<int64_t>, std::vector<int64_t> >> get_empty_pinned_chunks(
+        at::Tensor& offload_user_ids, 
+        at::Tensor& offload_start_indices,
+        const std::vector<int32_t>& offload_num_pages_list);
 
 public:
-    std::vector<at::Tensor> get_kvdata_tensor(std::vector<int64_t> user_ids, bool with_concat = true);
-    void init_random_kvdata(int64_t user_id, size_t num_tokens);
+    void onload_kvcache(
+        at::Tensor onload_user_ids,  // on host
+        const std::vector<at::Tensor> onload_page_indices_list, // on gpu
+        KVOnloadHandle& onloadhandle);
+    bool offload_kvcache(
+        at::Tensor offload_user_ids, // on host
+        at::Tensor offload_start_indices,  // on host
+        const std::vector<at::Tensor>& offload_page_indices_list, // on host
+        KVOffloadHandle& offloadhandle);
+    bool finish_offload(KVOffloadHandle& offloadhandle);
+    bool cancel_offload(KVOffloadHandle& offloadhandle);
 
 public:
     const int num_layers;
     const int num_kv_heads;
     const int kv_headdim;
-    const int page_size;
+    const int num_tokens_per_page;
+    const int64_t num_tokens_per_chunk;
+    const int64_t capacity_per_layer;
 
-    const int64_t chunk_size;
-    size_t chunk_numel;
+    const int max_batch_size;
+    const int max_sequence_length;
+    size_t max_numel_per_layer_buffer;
+
+    size_t num_pages_per_chunk;
+
+    size_t unit_chunk_numel;
     size_t page_numel;
     size_t per_token_numel;
-    size_t layer_numel;
 
-    // all chunk sizes are measured as pages
+    size_t unit_chunk_bytes;
+    size_t page_bytes;
+
+    size_t inner_token_stride;
+    size_t k2v_stride;
+    size_t page_stride;
+
+public:
+    // device pointer for the cache table per layer (num_pages_per_layer, 2, num_tokens_per_page, num_kv_heads, kv_headdim)
+    int device_idx;
+    int device_num_sms;
+    std::vector<void*> gpu_cache_table;
+
+public:
+    // bookkeeper
     std::queue<std::pair<int64_t, int64_t>> _empty_chunks;  // <offset of buffer, size in pages>
-    int64_t _empty_sizes;
+    int64_t _num_empty_chunks;
     // std::list<int64_t> _lru_list;
     // std::unordered_map<int64_t, 
     //                 typename std::list<int64_t>::iterator> _lru_lookup_table;
-
     std::unordered_map<int64_t, std::pair<std::vector<int64_t>, std::vector<int64_t>>> _uid_to_chunks;
     std::unordered_map<int64_t, int64_t> _uid_to_length;
 
-    std::mutex host_kvcache_mutex_;
+public:
+    cudaStream_t onload_stream;
+    cudaStream_t offload_stream;
+    cudaStream_t scatter_stream;
+    cudaStream_t gather_stream;
 
 public:
+    // internal device buffer
     std::vector<void*> onload_gpu_buffers;
     std::vector<void*> offload_gpu_buffers;
     std::vector<void*> pinned_kvstorage_buffers;

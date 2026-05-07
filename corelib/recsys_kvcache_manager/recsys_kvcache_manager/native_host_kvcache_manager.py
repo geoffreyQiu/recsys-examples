@@ -96,12 +96,7 @@ class NativeHostKVCacheManager(SecondaryKVCacheManagerBase):
             offload_page_indices_list, 
             native_handle)
         if not ret:
-            return SecondaryTaskHandle(
-                backend="native",
-                handle=native_handle,
-                status=SecondaryTaskStatus.FAILED,
-                time_launched=time.time()
-        )
+            return None
         return SecondaryTaskHandle(
             backend="native",
             handle=native_handle,
