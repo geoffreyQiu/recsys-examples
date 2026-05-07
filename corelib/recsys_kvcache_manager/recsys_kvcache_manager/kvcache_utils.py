@@ -1,18 +1,14 @@
 import math
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
-from configs import KVCacheMetadata
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from typing import Any, List, Dict, Optional, Tuple, Union
-from uuid import uuid4
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
 from enum import Enum
-
 
 
 class KVCacheOffloadMode(Enum):
@@ -21,7 +17,6 @@ class KVCacheOffloadMode(Enum):
 
 @dataclass
 class KVLookupResult:
-    request_id: str
     # batch_size: int
     user_ids: torch.Tensor
     # total_history_lengths: torch.Tensor
@@ -37,8 +32,7 @@ class KVLookupResult:
     token_mask: Optional[torch.Tensor] = None
 
     @classmethod
-    def merge(lookup_res1, lookup_res2):
-        assert lookup_res1.request_id == lookup_res2.request_id
+    def merge(cls, lookup_res1, lookup_res2):
         assert torch.equal(lookup_res1.user_ids, lookup_res2.user_ids)
         if lookup_res1.gpu_cached_start_indices is not None and lookup_res1.gpu_cached_lengths is not None:
             assert lookup_res2.host_cached_start_indices is not None and lookup_res2.host_cached_lengths is not None
@@ -51,8 +45,8 @@ class KVLookupResult:
         
         # assume lookup_res1 is gpu lookup result, lookup_res2 is host lookup result
         batch_size = lookup_res1.user_ids.size(0)
-        cached_start_indices = []
-        cached_lengths = []
+        cached_start_indices = torch.empty_like(lookup_res1.gpu_cached_start_indices)
+        cached_lengths = torch.empty_like(lookup_res1.gpu_cached_lengths)
         for i in range(batch_size):
             cached_start_ind = 0
             cached_len = 0
@@ -70,11 +64,10 @@ class KVLookupResult:
                 assert lookup_res1.gpu_cached_start_indices[i] <= lookup_res2.host_cached_lengths[i], "No gaps allowed: GPU cache start index should be smaller than or equal to host cached length."
                 cached_len = max(lookup_res2.host_cached_lengths[i], lookup_res1.gpu_cached_start_indices[i] + lookup_res1.gpu_cached_lengths[i]).item()
             
-            cached_start_indices.append(cached_start_ind)
-            cached_lengths.append(cached_len)
+            cached_start_indices[i] = cached_start_ind
+            cached_lengths[i] = cached_len
 
-        merged_lookup_result = KVLookupResult(
-            request_id=str(uuid4()),
+        merged_lookup_result = cls(
             user_ids=lookup_res1.user_ids,
             # total_history_lengths=lookup_res1.total_history_lengths,
             cached_start_indices=cached_start_indices,
@@ -89,20 +82,5 @@ class KVLookupResult:
 
 @dataclass
 class KVIndexMeta:
-    request_id: str
-    batch_size: int
-    user_ids: List[int]
-    namespaces: List[str]
-    total_history_lengths: List[int]
-    old_cached_lengths: List[int]
-    seq_start_indices: List[int]
-    seq_lengths: List[int]
-    new_tokens: int
-    token_ids: Optional[torch.Tensor] = None
-    token_mask: Optional[torch.Tensor] = None
-    restore_slot_mapping: Optional[torch.Tensor] = None
-    append_slot_mapping: Optional[torch.Tensor] = None
-    append_slot_indptr: Optional[torch.Tensor] = None
-    secondary_hit_mask: Optional[torch.Tensor] = None
-    secondary_get_task_ids: Optional[List[int]] = None
-    secondary_matched_lengths: Optional[List[int]] = None
+    user_ids: torch.Tensor
+    seq_lengths: torch.Tensor

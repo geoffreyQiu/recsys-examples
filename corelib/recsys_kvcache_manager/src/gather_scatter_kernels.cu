@@ -290,3 +290,47 @@ cudaError_t GatherPagedKVCache<nv_bfloat16, int32_t>(
   uint32_t nnz,
   int num_sms,
   cudaStream_t stream);
+
+
+__global__ void GetPagedBatchIndicesPositionsKernel(
+  int32_t batch_size,
+  int32_t* append_indptr,
+  int32_t* seq_lens_ptr,
+  int32_t* batch_indices_ptr,
+  int32_t* positions_ptr) {
+
+  int32_t tx = threadIdx.x;
+  int32_t seq_idx = blockIdx.x;
+  int32_t seq_start = append_indptr[seq_idx];
+  int32_t total_seq_len = seq_lens_ptr[seq_idx];
+  int32_t append_per_seq = append_indptr[seq_idx + 1] - seq_start;
+
+  int32_t* batch_indices_ptr_per_seq = batch_indices_ptr + seq_start;
+  int32_t* positions_ptr_per_seq = positions_ptr + seq_start;
+  int32_t pos_start = total_seq_len - append_per_seq;
+
+#pragma unroll 4
+  for (int32_t i = tx; i < append_per_seq; i += blockDim.x) {
+    batch_indices_ptr_per_seq[i] = seq_idx;
+    positions_ptr_per_seq[i] = pos_start + i;
+  }
+}
+
+cudaError_t GetPagedBatchIndicesPositions(
+  int32_t batch_size,
+  int32_t* append_indptr,
+  int32_t* seq_lens_ptr,
+  int32_t* batch_indices_ptr,
+  int32_t* positions_ptr,
+  cudaStream_t stream
+)
+{
+  dim3 nblks(batch_size);
+  dim3 nthrs(128, 1);
+
+  void* args[] = {(void*)&batch_size,     (void*)&append_indptr,      (void*)&seq_lens_ptr,    
+                  (void*)&batch_indices_ptr,   (void*)&positions_ptr};
+  auto kernel = GetPagedBatchIndicesPositionsKernel;
+  cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream);
+  return cudaSuccess;
+}

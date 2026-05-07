@@ -41,7 +41,7 @@ cudaError_t GetPagedBatchIndicesPositions(
 
 namespace kvcache {
 
-GPUKVCacheMangerImpl::GPUKVCacheMangerImpl(
+GPUKVCacheManagerImpl::GPUKVCacheManagerImpl(
     int num_layers,
     int num_kv_heads,
     int kv_headdim,
@@ -78,12 +78,12 @@ GPUKVCacheMangerImpl::GPUKVCacheMangerImpl(
         (5 * max_batch_size + 4) * sizeof(int32_t) /* for new_history_nnz and new_history_offsets */));
 }    
 
-GPUKVCacheMangerImpl::~GPUKVCacheMangerImpl() {
+GPUKVCacheManagerImpl::~GPUKVCacheManagerImpl() {
     cudaCheck(cudaFreeHost(this->metadata_host_buffer));
     cudaCheck(cudaStreamDestroy(alloc_stream))
 }
 
-std::vector<at::Tensor> GPUKVCacheMangerImpl::lookup(at::Tensor uids) {
+std::vector<at::Tensor> GPUKVCacheManagerImpl::lookup(at::Tensor uids) {
     int batch_size = uids.size(0);
     int64_t *user_ids_ptr = uids.data_ptr<int64_t>();
     at::Tensor cached_startpos = at::empty({batch_size}, at::dtype(torch::kInt32).device(at::kCPU));
@@ -104,7 +104,7 @@ std::vector<at::Tensor> GPUKVCacheMangerImpl::lookup(at::Tensor uids) {
 };
 
 
-int64_t GPUKVCacheMangerImpl::getUIdToEvict(std::unordered_set<int64_t> extra_freezed_uids) {
+int64_t GPUKVCacheManagerImpl::getUIdToEvict(std::unordered_set<int64_t> extra_freezed_uids) {
     int num_offloading_uids = _uid_offload_lock.size();
     for (auto it = std::rbegin(_lru_list); it != std::rend(_lru_list); ++it) {
         if (_uid_offload_lock.find((int64_t)*it) != _uid_offload_lock.end())
@@ -118,7 +118,7 @@ int64_t GPUKVCacheMangerImpl::getUIdToEvict(std::unordered_set<int64_t> extra_fr
 };
 
 
-void GPUKVCacheMangerImpl::evict(int64_t uid)
+void GPUKVCacheManagerImpl::evict(int64_t uid)
 {
     auto const tableIt = _lru_lookup_table.find(uid);
     assert(_lru_lookup_table.end() != tableIt);
@@ -141,7 +141,7 @@ void GPUKVCacheMangerImpl::evict(int64_t uid)
     // }
 };
 
-void GPUKVCacheMangerImpl::evict_offloaded(int64_t uid)
+void GPUKVCacheManagerImpl::evict_offloaded(int64_t uid)
 {
     int num_offloaded_pages = std::max(0, 
         (_uid_to_offloaded_length[uid] - _uid_to_paged_cache_startpos[uid]) / this->num_tokens_per_page);
@@ -164,7 +164,7 @@ void GPUKVCacheMangerImpl::evict_offloaded(int64_t uid)
         
 };
 
-void GPUKVCacheMangerImpl::evict_all()
+void GPUKVCacheManagerImpl::evict_all()
 {
     std::queue<int64_t> empty_pages;
     std::swap(_empty_pages, empty_pages);
@@ -182,7 +182,7 @@ void GPUKVCacheMangerImpl::evict_all()
 
 };
 
-void GPUKVCacheMangerImpl::invalid(int64_t uid) {
+void GPUKVCacheManagerImpl::invalid(int64_t uid) {
     auto const tableIt = _lru_lookup_table.find(uid);
     if (_lru_lookup_table.end() != tableIt) {
         _lru_list.erase(tableIt->second);
@@ -201,7 +201,7 @@ void GPUKVCacheMangerImpl::invalid(int64_t uid) {
     }
 };
 
-bool GPUKVCacheMangerImpl::retain(int64_t uid)
+bool GPUKVCacheManagerImpl::retain(int64_t uid)
 {
     auto const tableIt = _lru_lookup_table.find(uid);
     bool found = (_lru_lookup_table.end() != tableIt);
@@ -213,7 +213,7 @@ bool GPUKVCacheMangerImpl::retain(int64_t uid)
     return found;
 };
 
-std::vector<int32_t>& GPUKVCacheMangerImpl::alloc_single_sequence(
+std::vector<int32_t>& GPUKVCacheManagerImpl::alloc_single_sequence(
     int64_t uid, 
     int new_total_length, 
     int host_cached_startpos, 
@@ -292,7 +292,7 @@ std::vector<int32_t>& GPUKVCacheMangerImpl::alloc_single_sequence(
     return _uid_to_page_id[uid];
 };
 
-void GPUKVCacheMangerImpl::allocate(
+void GPUKVCacheManagerImpl::allocate(
     at::Tensor user_ids,
     at::Tensor total_hist_lens,  // all histo w/o candi
     at::Tensor host_cached_lengths,
@@ -304,8 +304,8 @@ void GPUKVCacheMangerImpl::allocate(
     const c10::cuda::OptionalCUDAGuard device_guard(this->device);
 
     int batch_size = user_ids.size(0);
-    int64_t *user_ids_ptr = static_cast<int64_t*>(user_ids.data_ptr());
-    int32_t *host_cached_lengths_ptr = static_cast<int32_t*>(host_cached_lengths.data_ptr());
+    int64_t *user_ids_ptr = user_ids.data_ptr<int64_t>();
+    int32_t *host_cached_lengths_ptr = static_cast<int32_t*>(host_cached_lengths.data_ptr<int>());
 
     std::vector<int> page_indices;
     std::vector<int> offload_page_ids;
@@ -326,7 +326,7 @@ void GPUKVCacheMangerImpl::allocate(
     std::vector<int32_t> cached_lengths;
     for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
         int64_t uid = user_ids_ptr[seq_idx];
-        if (host_cached_lengths_ptr[seq_idx] < _uid_to_paged_cache_startpos[uid] + _uid_to_paged_cache_length[uid]) {
+        if (host_cached_lengths_ptr[seq_idx] < _uid_to_paged_cache_startpos[uid]) {
             // if there is gap, evict for re-calculation
             evict(uid);
         }
@@ -351,6 +351,7 @@ void GPUKVCacheMangerImpl::allocate(
         page_indices.insert(page_indices.end(), page_ids.begin(), page_ids.end());
         page_indptr[seq_idx + 1] = page_indptr[seq_idx] + page_ids.size();
         last_page_len[seq_idx] = this->_uid_to_paged_cache_length[uid] % this->num_tokens_per_page;  // NOT duplicated lookup, updated
+        if (last_page_len[seq_idx] == 0) last_page_len[seq_idx] = this->num_tokens_per_page;
         // int gpu_cache_startpos = this->_uid_to_paged_cache_startpos[uid];  // #1 -- NOT duplicated lookup, updated ; #2 -- assume to be zero after alloc and during inference
 
         // [history metadata]
@@ -360,17 +361,17 @@ void GPUKVCacheMangerImpl::allocate(
         // old_cached_lengths;  // used in [position encoding metadata]; from lookup results
     }
 
-    cudaCheck(cudaMemcpyAsync(page_ids_gpu_buffer.data_ptr(), page_indices.data(), page_indptr[batch_size] * sizeof(int32_t), cudaMemcpyHostToDevice, this->alloc_stream));
+    cudaCheck(cudaMemcpyAsync(page_ids_gpu_buffer.data_ptr<int>(), page_indices.data(), page_indptr[batch_size] * sizeof(int32_t), cudaMemcpyHostToDevice, this->alloc_stream));
 
     // [appending/put metadata; for cudagraph only]
     auto new_tokens = new_history_offsets[batch_size];
     *new_history_nnz_cuda = new_tokens;
 
     size_t host_buffer_d2h_size = (batch_size * 5 + 4) * sizeof(int32_t);
-    cudaCheck(cudaMemcpyAsync(metadata_gpu_buffer.data_ptr(), this->metadata_host_buffer, host_buffer_d2h_size, cudaMemcpyHostToDevice, this->alloc_stream));
+    cudaCheck(cudaMemcpyAsync(metadata_gpu_buffer.data_ptr<int>(), this->metadata_host_buffer, host_buffer_d2h_size, cudaMemcpyHostToDevice, this->alloc_stream));
     
     // [appending/put metadata]
-    int *gpu_bufptr = static_cast<int*>(metadata_gpu_buffer.data_ptr());
+    int *gpu_bufptr = static_cast<int*>(metadata_gpu_buffer.data_ptr<int>());
     int *total_history_lengths_dev = gpu_bufptr + batch_size * 2 + 1;
     int *new_history_offsets_dev = gpu_bufptr + batch_size * 4 + 3;
     int *batch_indices_dev = gpu_bufptr + batch_size * 5 + 4;
@@ -388,11 +389,12 @@ void GPUKVCacheMangerImpl::allocate(
     cudaCheck(cudaStreamSynchronize(this->alloc_stream));
 }
 
-at::Tensor GPUKVCacheMangerImpl::check_for_offload(
+at::Tensor GPUKVCacheManagerImpl::check_for_offload(
     at::Tensor& user_ids) {
     const auto batch_size = user_ids.size(0);
 
     std::vector<int64_t> offload_user_ids;
+    std::unordered_set<int64_t> offload_uids_set;
 
     int num_pages_to_offload = 0;
     for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
@@ -403,6 +405,7 @@ at::Tensor GPUKVCacheMangerImpl::check_for_offload(
         int cached_end_index = this->_uid_to_paged_cache_startpos[uid] + this->_uid_to_paged_cache_length[uid];
         if (cached_end_index - offloaded_length >= this->num_tokens_per_chunk) {
             offload_user_ids.push_back(uid);
+            offload_uids_set.insert(uid);
         }
 
         num_pages_to_offload += (cached_end_index - offloaded_length) / this->num_tokens_per_page;
@@ -412,6 +415,7 @@ at::Tensor GPUKVCacheMangerImpl::check_for_offload(
         if (this->total_offloaded_pages + num_pages_to_offload + this->_empty_pages.size() > this->num_primary_cache_pages - this->num_buffer_pages) {
             break;
         }
+        if (offload_uids_set.find(uid) != offload_uids_set.end()) continue;
 
         int offloaded_length = this->_uid_to_offloaded_length[uid];
         int cached_startpos = this->_uid_to_paged_cache_startpos[uid];
@@ -424,13 +428,17 @@ at::Tensor GPUKVCacheMangerImpl::check_for_offload(
                 break;
             }   
             offload_user_ids.push_back(uid);
+            offload_uids_set.insert(uid);
         }
     }
-    return at::from_blob(offload_user_ids.data(), {static_cast<int64_t>(offload_user_ids.size())}, at::dtype(at::kLong));
+    std::cout << "[DEBUG] Offload user_ids: [";
+    for (auto uid : offload_user_ids) std::cout << uid << ", ";
+    std::cout << "]" << std::endl;
+    return at::from_blob(offload_user_ids.data(), {offload_user_ids.size()}, at::dtype(torch::kInt64)).clone();
 }
 
 
-std::tuple<at::Tensor, at::Tensor, std::vector<at::Tensor>> GPUKVCacheMangerImpl::acquire_offload_pages(
+std::tuple<at::Tensor, at::Tensor, std::vector<at::Tensor>> GPUKVCacheManagerImpl::acquire_offload_pages(
     at::Tensor& user_ids,
     at::Tensor& offloaded_lengths) {
     const auto batch_size = user_ids.size(0);
@@ -470,21 +478,21 @@ std::tuple<at::Tensor, at::Tensor, std::vector<at::Tensor>> GPUKVCacheMangerImpl
                     this->_uid_to_page_id[uid].data() + pages_offload_start, 
                     {pages_offload_num}, 
                     at::dtype(torch::kInt32)
-                )
+                )  // this is a slice of the _uid_to_page_id[uid] in gpu_kvcache_mgr, which will be locked during offloading.
             );
         }
         this->_uid_offload_lock[uid] += 1;
     }
 
     return std::make_tuple(
-        at::from_blob(offload_user_ids.data(), {static_cast<int64_t>(offload_user_ids.size())}, at::dtype(torch::kInt64)),
-        at::from_blob(offload_startpos.data(), {static_cast<int64_t>(offload_startpos.size())}, at::dtype(torch::kInt32)),
+        at::from_blob(offload_user_ids.data(), {offload_user_ids.size()}, at::dtype(torch::kInt64)).clone(),
+        at::from_blob(offload_startpos.data(), {offload_startpos.size()}, at::dtype(torch::kInt32)).clone(),
         offload_page_ids_list
     );
 }
 
 
-void GPUKVCacheMangerImpl::release_offload_pages(
+void GPUKVCacheManagerImpl::release_offload_pages(
     at::Tensor user_ids,
     at::Tensor offload_start_indices,
     at::Tensor offload_lengths,

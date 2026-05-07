@@ -1,21 +1,21 @@
 import math
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor
+
+from kvcache_cpp import GPUKVCacheManagerImpl
 
 import numpy as np
 import torch
-from configs import KVCacheMetadata
-from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from typing import Any, List, Dict, Optional, Tuple, Union
-from uuid import uuid4
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
 from enum import Enum
 
+from .kvcache_config import KVCacheConfig
+from .kvcache_utils import KVCacheOffloadMode, KVLookupResult, KVIndexMeta
+from .kvcache_metadata import KVCacheMetadata, get_kvcache_metadata_buffer
 
 class GPUKVCacheManager:
-    # Refer: https://github.com/NVIDIA/recsys-examples/blob/main/examples/commons/ops/cuda_ops/csrc/paged_kvcache_ops_cuda.cpp#L285C30-L306C42
     def __init__(self, 
         num_layers: int,
         num_heads: int,
@@ -25,8 +25,9 @@ class GPUKVCacheManager:
         num_primary_cache_pages: int,
         num_buffer_pages: int,
         max_batch_size: int,
-        dtype: torch.dtype = torch.bfloat16,
-        device_idx: int = -1):
+        max_sequence_length: int,
+        dtype: torch.dtype,
+        device_idx: int):
         self.num_layers = num_layers
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -35,6 +36,7 @@ class GPUKVCacheManager:
         self.num_primary_cache_pages = num_primary_cache_pages
         self.num_buffer_pages = num_buffer_pages
         self.max_batch_size = max_batch_size
+        self.max_sequence_length = max_sequence_length
         self.dtype = dtype
         self.device_idx = device_idx
 
@@ -59,6 +61,7 @@ class GPUKVCacheManager:
             self.num_primary_cache_pages,
             self.num_buffer_pages,
             self.max_batch_size,
+            self.max_sequence_length,
             self.device_idx,
         )
 
@@ -66,9 +69,8 @@ class GPUKVCacheManager:
         self.num_sms = torch.cuda.get_device_properties(self.device_idx).multi_processor_count
     
     def lookup(self, uids: torch.Tensor) -> "LookupResults":
-        cached_start_indices, cached_lengths = self.kvcache_mananger_impl.lookup(uid)
+        cached_start_indices, cached_lengths = self.kvcache_mananger_impl.lookup(uids)
         return KVLookupResult(
-            request_id="",
             user_ids=uids,
             gpu_cached_start_indices=cached_start_indices,
             gpu_cached_lengths=cached_lengths,
@@ -76,31 +78,41 @@ class GPUKVCacheManager:
     
     def allocate(self, 
         uids: torch.Tensor, 
-        seq_history_lengths: torch.Tensor, 
+        seq_hist_lengths: torch.Tensor,  # total history lengths in the sequence of current batch
         lookup_results: KVLookupResult,
-        output_kvcache_metadata: KVCacheMetadata) -> KVCacheMetadata:
+        output_kvcache_metadata: Optional[KVCacheMetadata] = None
+    ) -> KVCacheMetadata:
+        new_hist_lengths = seq_hist_lengths - lookup_results.cached_lengths
+
         if output_kvcache_metadata is None:
             batch_size = uids.size(0)
-            num_total_pages = torch.sum(torch.ceil(seq_history_lengths / self.page_size), dtype=torch.int32).item()
-            output_kvcache_metadata = KVCacheMetadata(
-                page_ids_gpu_buffer=torch.empty((num_total_pages,), dtype=torch.int32, device=self.device_idx),
-                metadata_gpu_buffer=torch.empty((batch_size * 5 + 4,), dtype=torch.int32, device=self.device_idx),
+            num_new_tokens = torch.sum(new_hist_lengths, dtype=torch.int32).item()
+            print(f"[DEBUG] num_new_tokens: {num_new_tokens}")
+            num_total_pages = torch.sum(torch.ceil(seq_hist_lengths / self.page_size), dtype=torch.int32).item()
+            output_kvcache_metadata = get_kvcache_metadata_buffer(
+                batch_size,
+                num_new_tokens,
+                num_total_pages,
             )
+        output_kvcache_metadata.max_seqlen = max(seq_hist_lengths).item()
         self.kvcache_mananger_impl.allocate(
             uids, 
-            seq_history_lengths,
+            seq_hist_lengths,
             lookup_results.host_cached_lengths,
             output_kvcache_metadata.page_ids_gpu_buffer,
             output_kvcache_metadata.metadata_gpu_buffer)
         return output_kvcache_metadata
     
-    def evict(self, uids) -> None:
+    def evict(self, uids: torch.Tensor) -> None:
         for uid in uids.tolist():
             self.kvcache_mananger_impl.evict(uid)
     
-    def invalid(self, uids) -> None:
-        for uid in uids.tolist():
-            self.kvcache_mananger_impl.invalid(uid)
+    def evict_all(self) -> None:
+        self.kvcache_mananger_impl.evict_all()
+    
+    # def invalid(self, uids) -> None:
+    #     for uid in uids.tolist():
+    #         self.kvcache_mananger_impl.invalid(uid)
     
     def put(self, k, v, layer_idx, kvcache_metadata: KVCacheMetadata) -> None:
         assert k.shape == v.shape, f"key and value shape mismatch: {k.shape} vs {v.shape}"

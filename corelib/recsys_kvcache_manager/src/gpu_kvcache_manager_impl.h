@@ -40,10 +40,10 @@
 
 namespace kvcache {
 
-class GPUKVCacheMangerImpl
+class GPUKVCacheManagerImpl
 {
 public:
-    GPUKVCacheMangerImpl(
+    GPUKVCacheManagerImpl(
         int num_layers,
         int num_kv_heads,
         int kv_headdim,
@@ -54,7 +54,7 @@ public:
         int max_batch_size,
         int max_sequence_length,
         int device_idx);
-    ~GPUKVCacheMangerImpl();
+    ~GPUKVCacheManagerImpl();
 
     std::vector<at::Tensor> lookup(at::Tensor uids);
     

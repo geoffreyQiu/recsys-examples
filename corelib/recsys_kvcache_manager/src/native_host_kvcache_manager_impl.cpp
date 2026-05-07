@@ -122,7 +122,8 @@ KVOffloadHandle::KVOffloadHandle(
     int num_layers
 )
 : num_layers(num_layers)
-, ready_event(std::vector<cudaEvent_t>(num_layers))
+, internal_gather_event(num_layers)
+, ready_event(num_layers)
 , host_ready(num_layers)
 , inited(false)
 , no_offload(true) {
@@ -172,10 +173,28 @@ void KVOffloadHandle::complete_host(int layer_idx, cudaStream_t stream,
 }
 
 bool KVOffloadHandle::try_wait_host(int layer_idx) {
+    if (layer_idx == -1) layer_idx = this->host_ready.size() - 1;
     if (this->host_ready[layer_idx].load(std::memory_order_acquire) == 0) {
         return false;
     }
-    if (cudaEventQuery(this->ready_event[layer_idx]) == cudaSuccess) {
+    auto status = cudaEventQuery(this->ready_event[layer_idx]);
+    switch (status) {
+        case cudaSuccess:
+            std::cout << "cudaSuccess" << std::endl; break;
+        case cudaErrorNotReady:
+            std::cout << "cudaErrorNotReady" << std::endl; break;
+        case cudaErrorInitializationError: 
+            std::cout << "cudaErrorInitializationError" << std::endl; break;
+        case cudaErrorInvalidValue:
+            std::cout << "cudaErrorInvalidValue" << std::endl; break;
+        case cudaErrorInvalidResourceHandle:
+            std::cout << "cudaErrorInvalidResourceHandle" << std::endl; break;
+        case cudaErrorLaunchFailure:
+            std::cout << "cudaErrorLaunchFailure" << std::endl; break;
+        default:
+            std::cout << "unKnown" << std::endl;
+    }
+    if (status == cudaSuccess) {
         return true;
     }
     return false;
@@ -203,8 +222,11 @@ HostKVStorageImpl::HostKVStorageImpl(
     , device_idx(device_idx)
     , _uid_to_chunks()
 {
+    std::cout << "[DEBUG] max_batch_size: " << max_batch_size << std::endl;
+    std::cout << "[DEBUG] max_sequence_length: " << max_sequence_length << std::endl;
+    std::cout << "[DEBUG] max_sequence_length: " << max_sequence_length << std::endl;
     size_t padded_pages_per_seq = (max_sequence_length + num_tokens_per_page - 1) / num_tokens_per_page;
-    this->max_numel_per_layer_buffer = max_batch_size * padded_pages_per_seq * page_numel;
+    std::cout << "[DEBUG] padded_pages_per_seq: " << padded_pages_per_seq << std::endl;
 
     this->num_pages_per_chunk = num_tokens_per_chunk / num_tokens_per_page;
 
@@ -226,7 +248,9 @@ HostKVStorageImpl::HostKVStorageImpl(
     cudaCheck(cudaStreamCreateWithFlags(&offload_stream, cudaStreamNonBlocking));
     cudaCheck(cudaStreamCreateWithFlags(&scatter_stream, cudaStreamNonBlocking));
     cudaCheck(cudaStreamCreateWithFlags(&gather_stream, cudaStreamNonBlocking));
-        
+
+    this->max_numel_per_layer_buffer = max_batch_size * padded_pages_per_seq * page_numel;
+    std::cout << "[DEBUG] max_numel_per_layer_buffer: " << max_numel_per_layer_buffer << std::endl; 
     for (int i = 0; i < 2; i++) {
         void *ptr;
         cudaCheck(cudaMalloc(&ptr, max_numel_per_layer_buffer * sizeof(uint16_t)));
@@ -238,11 +262,16 @@ HostKVStorageImpl::HostKVStorageImpl(
         offload_gpu_buffers.push_back(ptr);
     }
 
+    std::cout << "[DEBUG] capacity_per_layer: " << capacity_per_layer << std::endl; 
+    std::cout << "[INFO] Allocating pinned memory for host kvcache manager ..." << std::endl;
     for (int i = 0; i < num_layers; i++) {
+        std::cout << "[DEBUG]  -- layer " << i << " ..." <<  std::endl; 
         void *ptr;
         cudaCheck(cudaMallocHost(&ptr, capacity_per_layer));
         pinned_kvstorage_buffers.push_back(ptr);
     }
+    std::cout << "[INFO] ... done." << std::endl;
+    std::cout << "[DEBUG] total_pinned_bytes: " << (capacity_per_layer * num_layers) / 1024. / 1024. / 1024 << " GiB" << std::endl; 
 
     _num_empty_chunks = capacity_per_layer / unit_chunk_bytes;
     _empty_chunks.push(
@@ -274,7 +303,7 @@ void HostKVStorageImpl::register_gpu_cache_table(
 {
     for (int layer_idx = 0; layer_idx < this->num_layers; layer_idx++) {
         this->gpu_cache_table.push_back(
-            reinterpret_cast<void*>(table[layer_idx].data_ptr<char*>())
+            table[layer_idx].data_ptr()
         );
     }
 }
@@ -339,7 +368,7 @@ std::vector<at::Tensor> HostKVStorageImpl::get_kvdata_tensor(std::vector<int64_t
         this->num_layers, num_total_pages, 2, this->num_tokens_per_page, this->num_kv_heads, this->kv_headdim}, torch::kBFloat16);
     
     int64_t seqlen_offset = 0;
-    uint16_t *raw_ptr = static_cast<uint16_t*>(tensor_res.data_ptr());
+    uint16_t *raw_ptr = reinterpret_cast<uint16_t*>(tensor_res.data_ptr<uint16_t>());
 
 
     for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
@@ -506,7 +535,7 @@ bool HostKVStorageImpl::offload_kvcache(
     KVOffloadHandle& offloadhandle) {
     const auto batch_size = offload_user_ids.size(0);
 
-    at::Device device = offload_page_indices_list[0].device();
+    at::Device device(torch::kCUDA, static_cast<c10::DeviceIndex>(this->device_idx));
     const c10::cuda::OptionalCUDAGuard device_guard(device);
     c10::cuda::CUDAStream c10_gather_stream =
         c10::cuda::getStreamFromExternal(this->gather_stream, device.index());
@@ -619,6 +648,32 @@ bool HostKVStorageImpl::cancel_offload(
     }
 
     return true;
+}
+
+
+void HostKVStorageImpl::evict(int64_t uid) {
+    if (_uid_to_chunks.find(uid) == _uid_to_chunks.end()) return;
+    const auto &chunk_offsets = _uid_to_chunks[uid].first;
+    const auto &chunk_psizes = _uid_to_chunks[uid].second;
+
+    for (size_t idx = 0; idx < chunk_offsets.size(); idx++) {
+        _empty_chunks.push(std::make_pair(chunk_offsets[idx] / this->unit_chunk_bytes, chunk_psizes[idx] / this->num_pages_per_chunk));
+        _num_empty_chunks += chunk_psizes[idx] / this->num_pages_per_chunk;
+    }
+
+    _uid_to_chunks.erase(uid);
+    _uid_to_length.erase(uid);
+}
+
+void HostKVStorageImpl::evict_all() {
+    _num_empty_chunks = capacity_per_layer / unit_chunk_bytes;
+
+    std::queue<std::pair<int64_t, int64_t>> chunks;
+    chunks.push(std::make_pair(0, _num_empty_chunks));
+    std::swap(_empty_chunks, chunks);
+
+    _uid_to_chunks.clear();
+    _uid_to_length.clear();
 }
 
 

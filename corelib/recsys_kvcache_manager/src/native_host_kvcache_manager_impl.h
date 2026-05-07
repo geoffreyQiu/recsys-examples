@@ -82,7 +82,9 @@ public:
 public:
     at::Tensor get_user_ids() const { return this->offload_user_ids; }
     at::Tensor get_start_indices() const { return this->offload_start_indices; }
-    std::vector<int64_t> get_lengths() const { return this->offload_lengths; }
+    at::Tensor get_lengths() { return 
+        at::from_blob(offload_lengths.data(), {offload_lengths.size()}, at::dtype(torch::kInt32)); 
+    }
 
 public:
     int num_layers;
@@ -148,6 +150,9 @@ public:
         KVOffloadHandle& offloadhandle);
     bool finish_offload(KVOffloadHandle& offloadhandle);
     bool cancel_offload(KVOffloadHandle& offloadhandle);
+
+    void evict(int64_t uid);
+    void evict_all();
 
 public:
     const int num_layers;
