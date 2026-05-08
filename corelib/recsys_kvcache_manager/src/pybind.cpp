@@ -40,6 +40,7 @@ PYBIND11_MODULE(kvcache_cpp, m) {
     .def("allocate", &kvcache::GPUKVCacheManagerImpl::allocate)
     .def("evict", &kvcache::GPUKVCacheManagerImpl::evict)
     .def("evict_all", &kvcache::GPUKVCacheManagerImpl::evict_all)
+    .def("revoke_onboard_pages", &kvcache::GPUKVCacheManagerImpl::revoke_onboard_pages)
     .def("check_for_offload", &kvcache::GPUKVCacheManagerImpl::check_for_offload)
     .def("acquire_offload_pages", &kvcache::GPUKVCacheManagerImpl::acquire_offload_pages)
     .def("release_offload_pages", &kvcache::GPUKVCacheManagerImpl::release_offload_pages)

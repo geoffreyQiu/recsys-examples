@@ -65,7 +65,7 @@ public:
     void invalid(int64_t uid);
     bool retain(int64_t uid);
 
-    std::vector<int32_t>& alloc_single_sequence(
+    std::vector<int>& alloc_single_sequence(
         int64_t uid, int new_total_length, int host_cached_startpos, int host_cached_length, std::unordered_set<int64_t> freezed_uids);
     void allocate(
         at::Tensor user_ids,
@@ -73,6 +73,10 @@ public:
         at::Tensor host_cached_lengths,
         at::Tensor page_ids_gpu_buffer,
         at::Tensor metadata_gpu_buffer);
+    void revoke_onboard_pages(
+        at::Tensor& user_ids,
+        at::Tensor& onboard_page_starts,
+        at::Tensor& num_onboard_pages);
 
     at::Tensor check_for_offload(at::Tensor& user_ids);
     std::tuple<at::Tensor, at::Tensor, std::vector<at::Tensor>> acquire_offload_pages(
@@ -107,10 +111,10 @@ public:
     std::unordered_map<int64_t, 
                        typename std::list<int64_t>::iterator> _lru_lookup_table;
     std::queue<int64_t> _empty_pages;
-    std::unordered_map<int64_t, std::vector<int32_t>> _uid_to_page_id;
-    std::unordered_map<int64_t, int32_t> _uid_to_paged_cache_startpos;
-    std::unordered_map<int64_t, int32_t> _uid_to_paged_cache_length;
-    std::unordered_map<int64_t, int32_t> _uid_to_offloaded_length;
+    std::unordered_map<int64_t, std::vector<int>> _uid_to_page_id;
+    std::unordered_map<int64_t, int> _uid_to_paged_cache_startpos;
+    std::unordered_map<int64_t, int> _uid_to_paged_cache_length;
+    std::unordered_map<int64_t, int> _uid_to_offloaded_length;
 
 public:
     // allocation related
@@ -118,7 +122,7 @@ public:
     void* metadata_host_buffer;   // preallocated pinned host buffer
 
 public:
-    std::unordered_map<int64_t, int32_t> _uid_offload_lock;
+    std::unordered_map<int64_t, int> _uid_offload_lock;
     std::unordered_set<int64_t> _uid_inference_lock;
 
 public:

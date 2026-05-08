@@ -3,6 +3,7 @@ import os
 import time
 
 from kvcache_cpp import GPUKVCacheManagerImpl
+import paged_kvcache_ops
 
 import numpy as np
 import torch
@@ -114,17 +115,18 @@ class GPUKVCacheManager:
     #     for uid in uids.tolist():
     #         self.kvcache_mananger_impl.invalid(uid)
     
-    def put(self, k, v, layer_idx, kvcache_metadata: KVCacheMetadata) -> None:
+    def put(self, k, v, layer_idx, kvcache_metadata: KVCacheMetadata, append_offsets: Optional[torch.Tensor] = None) -> None:
         assert k.shape == v.shape, f"key and value shape mismatch: {k.shape} vs {v.shape}"
         if k.size(0) == self.num_layers:
             raise NotImplementedError("Only support layer-wise in this implementation.")
         (paged_k_cache, paged_v_cache) = self.gpu_kvcache_table[layer_idx].unbind(dim=1)
-        assert k.shape == paged_k_cache.shape, f"input k/v shape {k.shape} mismatch with cache shape {paged_k_cache.shape}"
+        assert k.shape[-2:] == paged_k_cache.shape[-2:], f"input k/v shape {k.shape} mismatch with cache shape {paged_k_cache.shape}"
+        batch_size = kvcache_metadata.kv_indptr.size(0) - 1
         paged_kvcache_ops.append_kvcache(
             k, v, 
             kvcache_metadata.batch_indices,
             kvcache_metadata.position,
-            kvcache_metadata.append_offsets[: kvcache_metadata.batch_size + 1],
+            append_offsets if append_offsets is not None else torch.zeros((batch_size,), dtype=torch.int32, device=self.device_idx),
             kvcache_metadata.new_history_nnz_cuda,
             kvcache_metadata.new_history_nnz,
             paged_k_cache,
@@ -135,9 +137,18 @@ class GPUKVCacheManager:
             0,  # NHD layout
             self.num_sms)
     
-    def get(self, kvcache_metadata, user_ids, user_indices, layer_indices) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get(self, page_ids, last_page_lens, layer_idx) -> Tuple[torch.Tensor, torch.Tensor]:
         # Note: debug interface (for symmetry). Not used in inference pipeline.
-        pass
+        (paged_k_cache, paged_v_cache) = self.gpu_kvcache_table[layer_idx].unbind(dim=1)
+
+        k = paged_k_cache[page_ids].view(-1, self.num_heads, self.head_dim).clone()
+        v = paged_v_cache[page_ids].view(-1, self.num_heads, self.head_dim).clone()
+        k = k[ : k.size(0) - (self.page_size - int(last_page_lens)), ... ]
+        v = v[ : v.size(0) - (self.page_size - int(last_page_lens)), ... ]
+        return k, v
+
+    def revoke_onboard_pages(self, user_ids, onboard_page_starts, num_onboard_pages):
+        self.kvcache_mananger_impl.revoke_onboard_pages(user_ids, onboard_page_starts, num_onboard_pages)
     
     # [[ offload critirea ]]
     def check_for_offload(self, uids: Optional[torch.Tensor] = None) -> torch.Tensor:

@@ -55,7 +55,7 @@ class KVCacheManager:
             else KVCacheOffloadMode.LAZY
         )
         # self.secondary_fail_policy = secondary_fail_policy
-        self.ongoing_onboard_tasks: List[str, SecondaryTaskHandle] = list()
+        # self.ongoing_onboard_tasks: List[str, SecondaryTaskHandle] = list()
         self.ongoing_offload_tasks: List[str, SecondaryTaskHandle] = list()
     
     def lookup_kvcache(
@@ -93,7 +93,9 @@ class KVCacheManager:
             index_meta, lookup_result, kvcache_metadata,
         )
         kvcache_metadata.kv_onload_handle = task_handle
-        self.ongoing_onboard_tasks.append(task_handle)
+
+        # Skip recording the ongoing onboard tasks. For now there should be only one task.
+        # self.ongoing_onboard_tasks.append(task_handle)
         return task_handle
     
     def onboard_try_wait_kvcache_or_fail(
@@ -109,13 +111,17 @@ class KVCacheManager:
             SecondaryTaskStatus.TIMEOUT,
             SecondaryTaskStatus.CANCELLED,
         ):
-            pass
+            # Note: Either evict the total user or revoke affected pages
+            self.gpu_kvcache_mgr.revoke_onboard_pages(
+                kv_index_meta.user_ids,
+                task_handle.metadata["onboard_page_starts"],
+                task_handle.metadata["num_onboard_pages"],
+            )
             # if self.secondary_fail_policy == "fail_close":
+            #     self.gpu_kvcache_mgr.evict(kv_index_meta.user_ids)
             #     raise RuntimeError(
             #         f"onboard wait failed: status={wait_result.status.value}, msg={wait_result.message}"
             #     )
-        # elif wait_result.ready:
-            # pass
         return wait_result
 
     

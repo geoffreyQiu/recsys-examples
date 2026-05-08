@@ -96,15 +96,28 @@ class NativeHostKVCacheManager(SecondaryKVCacheManagerBase):
         kvcache_metadata: KVCacheMetadata
     ) -> SecondaryTaskHandle:
         native_handle = KVOnloadHandle(self.num_layers)
+
+        g_end_idxs = lookup_result.gpu_cached_start_indices + lookup_result.gpu_cached_lengths
+        h_longer = g_end_idxs < lookup_result.host_cached_lengths
+
+        onload_start_indices = torch.where(
+            torch.logical_and(lookup_result.gpu_cached_start_indices == 0, h_longer),
+            g_end_idxs,
+            0,
+        )
         onload_lengths = torch.where(
-            lookup_result.gpu_cached_lengths==0, lookup_result.host_cached_lengths, lookup_result.gpu_cached_start_indices
+            h_longer,
+            lookup_result.host_cached_lengths,
+            lookup_result.gpu_cached_start_indices,
         )
         print(f"[DEBUG] onload_lengths: {onload_lengths}")
+
         onload_paged_ids_list = [
             kvcache_metadata.kv_indices.narrow(
-                0,                                                  # dim
-                kvcache_metadata.kv_indptr[seq_idx],                # start: gpu, this is allowed to be Tensor. TODO(junyiq): check if there is d2h
-                onload_lengths[seq_idx].item() // self.page_size,   # length
+                0,                                                          # dim
+                kvcache_metadata.kv_indptr[seq_idx] 
+                + onload_start_indices[seq_idx].item() // self.page_size,   # start: gpu, this is allowed to be Tensor. TODO(junyiq): check if there is d2h
+                onload_lengths[seq_idx].item() // self.page_size,           # length
             ) for seq_idx in range(index_meta.user_ids.size(0))      
         ]
         if torch.sum(onload_lengths).item() == 0:
@@ -122,6 +135,10 @@ class NativeHostKVCacheManager(SecondaryKVCacheManagerBase):
             backend="native",
             handle=native_handle,
             status=SecondaryTaskStatus.LAUNCHED,
+            metadata={
+                "onload_page_starts": onload_start_indices,
+                "onload_lengths": onload_lengths,
+            },
         )
 
     def onboard_wait_kvcache(self, task_handle):

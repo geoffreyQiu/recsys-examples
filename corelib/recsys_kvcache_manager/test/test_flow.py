@@ -90,7 +90,7 @@ if __name__ == "__main__":
         print(f"  \t{kvcache_metadata.new_history_nnz_cuda}")
         print(f"  \t{kvcache_metadata.new_history_nnz}")
     
-    if True:
+    if False:
         user_ids = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
         sequence_lengths = torch.tensor([100, 64, 88, 97], dtype=torch.int32)
 
@@ -135,6 +135,8 @@ if __name__ == "__main__":
     if True:
         user_ids = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
         sequence_lengths = torch.tensor([100, 64, 88, 97], dtype=torch.int32)
+        key = torch.randn((3, torch.sum(sequence_lengths).item(), 4, 128), dtype=torch.bfloat16).cuda()
+        value = torch.randn((3, torch.sum(sequence_lengths).item(), 4, 128), dtype=torch.bfloat16).cuda()
 
         index_meta, lookup_res = kvcache_mgr.lookup_kvcache(
             user_ids, sequence_lengths)
@@ -158,6 +160,19 @@ if __name__ == "__main__":
         print(f"  \t{kvcache_metadata.new_history_nnz_cuda}")
         print(f"  \t{kvcache_metadata.new_history_nnz}")
 
+        for layer_idx in range(3):
+            kvcache_mgr.gpu_kvcache_mgr.put(key[layer_idx], value[layer_idx], layer_idx, kvcache_metadata)
+        torch.cuda.synchronize()
+        for i in range(len(user_ids)):
+            print(f"[DEBUG] Check for uid:{user_ids[i].item()} ...")
+            start, end = kvcache_metadata.total_history_offsets[i], kvcache_metadata.total_history_offsets[i+1]
+            k, v = key[:, start:end, ...], value[:, start:end, ...]
+            for layer_idx in range(3):
+                page_ids = kvcache_metadata.kv_indices[kvcache_metadata.kv_indptr[i]:kvcache_metadata.kv_indptr[i+1]]
+                last_page_lens = kvcache_metadata.kv_last_page_len[i].item()
+                cached_k, cached_v = kvcache_mgr.gpu_kvcache_mgr.get(page_ids, last_page_lens, layer_idx)
+                print(f"[DEBUG]   Layer_{layer_idx} keys: {torch.allclose(cached_k, k[layer_idx])} , values: {torch.allclose(cached_v, v[layer_idx])}")
+
         ret = kvcache_mgr.eager_offboard_kvcache(index_meta)
         assert ret == None, "[ERROR] Lazy mode does not trigger eager offload"
         offload_handle = kvcache_mgr.lazy_offload_kvcache(index_meta)
@@ -167,6 +182,20 @@ if __name__ == "__main__":
             if len(kvcache_mgr.ongoing_offload_tasks) == 0:
                 break
         
+        for i in range(len(user_ids)):
+            uid = user_ids[i].item()
+            print(f"[DEBUG] Check for uid:{user_ids[i].item()} ...")
+            start, end = kvcache_metadata.total_history_offsets[i], kvcache_metadata.total_history_offsets[i+1]
+            k, v = key[:, start:end, ...], value[:, start:end, ...]
+            
+            kvdata = kvcache_mgr.secondary_kvcache_manager.kvcache_mananger_impl.get_kvdata_tensor([uid,], False)[0]
+            cached_k, cached_v = kvdata.unbind(dim=2)
+            cached_k = cached_k.reshape(cached_k.size(0), -1, cached_k.size(3), cached_k.size(4))
+            cached_v = cached_v.reshape(cached_v.size(0), -1, cached_v.size(3), cached_v.size(4))
+            print(f"        \tK: {torch.allclose(cached_k.cuda(), k[:, :cached_k.size(1), ...])}")
+            print(f"        \tV: {torch.allclose(cached_v.cuda(), v[:, :cached_v.size(1), ...])}")
+
+
         index_meta, lookup_res = kvcache_mgr.lookup_kvcache(
             user_ids, sequence_lengths)
         print(f"[DEBUG] Lookup Results for {user_ids.tolist()}:")
@@ -175,10 +204,9 @@ if __name__ == "__main__":
         print(f"  \t{lookup_res.host_cached_start_indices}")
         print(f"  \t{lookup_res.host_cached_lengths}")
 
-
         print(f"[DEBUG] == Eviction for GPU ==")
         kvcache_mgr.evict(user_ids, for_gpu=True)
-        kvcache_mgr.evict_all(for_gpu=True)
+        # kvcache_mgr.evict_all(for_gpu=True)
 
         # sequence_lengths *= 2
         index_meta, lookup_res = kvcache_mgr.lookup_kvcache(
@@ -216,7 +244,23 @@ if __name__ == "__main__":
         for layer_idx in range(3):
             kvcache_metadata.kv_onload_handle.handle.wait_host(layer_idx)
             print(f"[DEBUG] Layer {layer_idx} event recorded.")
+        
+        # torch.cuda.synchronize()
 
+        for i in range(len(user_ids)):
+            uid = user_ids[i].item()
+            print(f"[DEBUG] Check for uid:{user_ids[i].item()} ...")
+            start = kvcache_metadata.total_history_offsets[i]
+            end = start + lookup_res.host_cached_lengths[i]
+            k, v = key[:, start:end, ...], value[:, start:end, ...]
+            
+            for layer_idx in range(3):
+                page_ids = kvcache_metadata.kv_indices[kvcache_metadata.kv_indptr[i]:kvcache_metadata.kv_indptr[i+1]]
+                last_page_lens = kvcache_metadata.kv_last_page_len[i].item()
+                cached_k, cached_v = kvcache_mgr.gpu_kvcache_mgr.get(page_ids, last_page_lens, layer_idx)
+                cached_k = cached_k[:lookup_res.host_cached_lengths[i], ...]
+                cached_v = cached_v[:lookup_res.host_cached_lengths[i], ...]
+                print(f"[DEBUG]   Layer_{layer_idx} keys: {torch.allclose(cached_k, k[layer_idx])} , values: {torch.allclose(cached_v, v[layer_idx])}")
         
 
 

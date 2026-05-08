@@ -136,7 +136,7 @@ private:
     std::vector<std::pair< std::vector<int64_t>, std::vector<int64_t> >> get_empty_pinned_chunks(
         at::Tensor& offload_user_ids, 
         at::Tensor& offload_start_indices,
-        const std::vector<int32_t>& offload_num_pages_list);
+        const std::vector<int>& offload_num_pages_list);
 
 public:
     void onload_kvcache(
