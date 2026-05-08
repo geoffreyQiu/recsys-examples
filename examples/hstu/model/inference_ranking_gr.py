@@ -210,10 +210,10 @@ class InferenceRankingGR(torch.nn.Module):
         total_history_lengths: torch.Tensor,
     ):
         with torch.inference_mode():
-            # lookup_token_ids, lookup_token_mask = self._build_lookup_tokens_from_batch(
-            #     batch=batch,
-            #     total_history_lengths=total_history_lengths,
-            # )
+            lookup_token_ids, lookup_token_mask = self._build_lookup_tokens_from_batch(
+                batch=batch,
+                total_history_lengths=total_history_lengths,
+            )
             lookup_result = self.dense_module.async_kvcache.lookup_kvcache(
                 user_ids,
                 total_history_lengths,

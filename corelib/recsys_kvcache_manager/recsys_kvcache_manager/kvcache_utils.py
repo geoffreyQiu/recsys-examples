@@ -5,8 +5,8 @@ import time
 import numpy as np
 import torch
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
-from typing import Any, List, Dict, Optional, Tuple, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 from abc import ABC, abstractmethod
 from enum import Enum
 
@@ -19,6 +19,7 @@ class KVCacheOffloadMode(Enum):
 class KVLookupResult:
     # batch_size: int
     user_ids: torch.Tensor
+    request_id: Optional[str] = None
     # total_history_lengths: torch.Tensor
     cached_start_indices: Optional[torch.Tensor] = None
     cached_lengths: Optional[torch.Tensor] = None
@@ -30,6 +31,8 @@ class KVLookupResult:
     # new_tokens_upper_bound: int
     token_ids: Optional[torch.Tensor] = None
     token_mask: Optional[torch.Tensor] = None
+
+    extra: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def merge(cls, lookup_res1, lookup_res2):
@@ -67,8 +70,14 @@ class KVLookupResult:
             cached_start_indices[i] = cached_start_ind
             cached_lengths[i] = cached_len
 
+        merged_extra = {}
+        merged_extra.update(getattr(lookup_res1, "extra", {}) or {})
+        merged_extra.update(getattr(lookup_res2, "extra", {}) or {})
+
+        request_id = lookup_res1.request_id or lookup_res2.request_id
         merged_lookup_result = cls(
             user_ids=lookup_res1.user_ids,
+            request_id=request_id,
             # total_history_lengths=lookup_res1.total_history_lengths,
             cached_start_indices=cached_start_indices,
             cached_lengths=cached_lengths,
@@ -76,6 +85,9 @@ class KVLookupResult:
             gpu_cached_lengths=lookup_res1.gpu_cached_lengths,
             host_cached_start_indices=lookup_res2.host_cached_start_indices,
             host_cached_lengths=lookup_res2.host_cached_lengths,
+            token_ids=lookup_res1.token_ids if lookup_res1.token_ids is not None else lookup_res2.token_ids,
+            token_mask=lookup_res1.token_mask if lookup_res1.token_mask is not None else lookup_res2.token_mask,
+            extra=merged_extra,
         )
         return merged_lookup_result
 
@@ -84,3 +96,20 @@ class KVLookupResult:
 class KVIndexMeta:
     user_ids: torch.Tensor
     seq_lengths: torch.Tensor
+
+
+@dataclass
+class FlexKVIndexMeta(KVIndexMeta):
+    batch_size: int = 0
+    request_id: str = ""
+
+    token_ids: Optional[torch.Tensor] = None
+    token_mask: Optional[torch.Tensor] = None
+    namespaces: Optional[List[str]] = None
+
+    old_cached_lengths: Optional[torch.Tensor] = None
+    secondary_get_task_ids: Optional[torch.Tensor] = None
+    secondary_matched_lengths: Optional[torch.Tensor] = None
+    secondary_hit_mask: Optional[torch.Tensor] = None
+
+    extra: Dict[str, Any] = field(default_factory=dict)

@@ -12,9 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from dataclasses import dataclass
 from enum import Enum, unique
-from typing import List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -59,6 +59,8 @@ class KVCacheConfig:
     offload_timeout_ms: float = 1000.0
     # secondary_fail_policy: str = "fail_open"
 
+    extra_configs: Dict[str, Any] = field(default_factory=dict)
+
 
 def get_kvcache_config(
     num_layers: int,
@@ -77,6 +79,7 @@ def get_kvcache_config(
     offload_mode: str = "lazy",
     offload_timeout_ms: float = 1000.0,
     # secondary_fail_policy: str = "fail_open",
+    extra_configs: Optional[Dict[str, Any]] = None,
 ) -> KVCacheConfig:
     """
     Create the HSTU KV cache configuration.
@@ -108,4 +111,5 @@ def get_kvcache_config(
         dtype=dtype,
         device=device,
         # secondary_fail_policy=secondary_fail_policy,
+        extra_configs=dict(extra_configs or {}),
     )

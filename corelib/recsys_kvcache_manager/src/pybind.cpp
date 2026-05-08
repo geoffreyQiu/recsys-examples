@@ -2,7 +2,7 @@
 #include "gpu_kvcache_manager_impl.h"
 
 PYBIND11_MODULE(kvcache_cpp, m) {
-  py::class_<kvcache::HostKVStorageImpl>(m, "HostKVStorageImpl")
+  py::class_<kvcache::HostKVStorageImpl>(m, "HostKVStorageImpl", py::module_local())
     .def(py::init<int, int, int, int, int64_t, int64_t, int64_t, int64_t, int>(), 
          py::arg("num_layers"),
          py::arg("num_kv_heads"),
@@ -24,7 +24,7 @@ PYBIND11_MODULE(kvcache_cpp, m) {
     .def("evict_all", &kvcache::HostKVStorageImpl::evict_all)
   ;
 
-  py::class_<kvcache::GPUKVCacheManagerImpl>(m, "GPUKVCacheManagerImpl")
+  py::class_<kvcache::GPUKVCacheManagerImpl>(m, "GPUKVCacheManagerImpl", py::module_local())
     .def(py::init<int, int, int, int, int, int, int, int, int, int>(),
          py::arg("num_layers"),
          py::arg("num_kv_heads"),
@@ -46,13 +46,13 @@ PYBIND11_MODULE(kvcache_cpp, m) {
     .def("release_offload_pages", &kvcache::GPUKVCacheManagerImpl::release_offload_pages)
   ;
 
-  py::class_<kvcache::KVOnloadHandle>(m, "KVOnloadHandle")
+  py::class_<kvcache::KVOnloadHandle>(m, "KVOnloadHandle", py::module_local())
     .def(py::init<int>(), py::arg("num_layers"))
     // .def("reset", &kvcache::KVOnloadHandle::reset)
     .def("wait_host", &kvcache::KVOnloadHandle::wait_host)
   ;
 
-  py::class_<kvcache::KVOffloadHandle>(m, "KVOffloadHandle")
+  py::class_<kvcache::KVOffloadHandle>(m, "KVOffloadHandle", py::module_local())
     .def(py::init<int>(), py::arg("num_layers"))
     // .def("reset", &kvcache::KVOffloadHandle::reset)
     .def("try_wait_host", &kvcache::KVOffloadHandle::try_wait_host)
