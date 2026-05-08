@@ -61,7 +61,7 @@ if __name__ == "__main__":
         print(f"[DEBUG] Created KVCache Manager") 
 
 
-        if False:
+        if True:
             user_ids = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
             sequence_lengths = torch.tensor([100, 64, 88, 97], dtype=torch.int32)
 
@@ -110,7 +110,7 @@ if __name__ == "__main__":
             print(f"  \t{kvcache_metadata.new_history_nnz_cuda}")
             print(f"  \t{kvcache_metadata.new_history_nnz}")
         
-        if True:
+        if False:
             user_ids = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
             sequence_lengths = torch.tensor([100, 64, 88, 97], dtype=torch.int32)
 

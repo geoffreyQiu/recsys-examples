@@ -109,7 +109,3 @@ class FlexKVIndexMeta(KVIndexMeta):
 
     old_cached_lengths: Optional[torch.Tensor] = None
     secondary_get_task_ids: Optional[torch.Tensor] = None
-    secondary_matched_lengths: Optional[torch.Tensor] = None
-    secondary_hit_mask: Optional[torch.Tensor] = None
-
-    extra: Dict[str, Any] = field(default_factory=dict)

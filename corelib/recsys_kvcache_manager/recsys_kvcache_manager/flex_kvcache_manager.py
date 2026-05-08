@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
-from typing import Any, List, Dict, Optional, Tuple, Union
+from typing import Any, Callable, List, Dict, Optional, Tuple, Union
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
 from enum import Enum
@@ -30,10 +30,22 @@ class _FlexKVOnloadHandle:
     mode: str
     task_ids: torch.Tensor
     slot_mappings: List[torch.Tensor]
+    wait_impl: Optional[Callable[[int], SecondaryWaitResult]] = None
     phase: str = "onboard"
 
     def wait_host(self, _layer_idx: int) -> None:
-        # FlexKV onboard path does not expose layer-wise native event handles.
+        # Keep native-compatible wait_host entry, but route to onboard polling.
+        if self.wait_impl is not None:
+            wait_result = self.wait_impl(_layer_idx)
+            if wait_result.status in (
+                SecondaryTaskStatus.FAILED,
+                SecondaryTaskStatus.TIMEOUT,
+                SecondaryTaskStatus.CANCELLED,
+            ):
+                raise RuntimeError(
+                    f"FlexKV onboard wait_host failed: {wait_result.status.value}, msg={wait_result.message}"
+                )
+            return None
         return None
 
     # Compatibility helpers for legacy dict-like access patterns.
@@ -106,6 +118,95 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
         self._adapter = FlexKVClientAdapter(mode, server_addr, server_port)
         self._client = None
         self._ready = False
+
+    def _is_fail_open(self) -> bool:
+        return str(self.secondary_fail_policy).strip().lower() != "fail_close"
+
+    def _fallback_or_keep_onboard_result(
+        self,
+        wait_result: SecondaryWaitResult,
+        task_key: str,
+        task_ids: Optional[List[int]] = None,
+    ) -> SecondaryWaitResult:
+        if wait_result.status not in (
+            SecondaryTaskStatus.FAILED,
+            SecondaryTaskStatus.TIMEOUT,
+            SecondaryTaskStatus.CANCELLED,
+        ):
+            return wait_result
+
+        # Cleanup failed onboard task state first.
+        if task_ids:
+            try:
+                self._client.cancel(task_ids=task_ids)
+            except Exception:
+                pass
+        self._tasks.pop(task_key, None)
+
+        if not self._is_fail_open():
+            return wait_result
+
+        # fail_open policy: degrade onboard failure into SKIPPED.
+        return SecondaryWaitResult(
+            status=SecondaryTaskStatus.SKIPPED,
+            ready=True,
+            error_code=wait_result.error_code,
+            message=f"fallback:{wait_result.message}",
+            failed_mask=wait_result.failed_mask,
+            failed_user_ids=wait_result.failed_user_ids,
+        )
+
+    def _wait_onboard_task_until_terminal(
+        self,
+        task_key: str,
+        user_ids: List[int],
+    ) -> SecondaryWaitResult:
+        state = self._tasks.get(task_key)
+        if state is None:
+            return SecondaryWaitResult(
+                status=SecondaryTaskStatus.SKIPPED,
+                ready=True,
+                message="onboard has no launched tasks",
+            )
+
+        task_ids = list(state.get("task_ids", []))
+        deadline = time.time() + (
+            float(self.secondary_wait_timeout_ms) / 1000.0
+            if self.secondary_wait_timeout_ms > 0
+            else 30.0
+        )
+        while True:
+            responses = self._wait_task_ids(task_ids)
+            wait_result = self._convert_wait_result(
+                responses=responses,
+                user_ids=user_ids,
+                timeout_code=SecondaryErrorCode.ONBOARD_TIMEOUT.value,
+                failed_code=SecondaryErrorCode.ONBOARD_WAIT_FAILED.value,
+            )
+            if wait_result.status == SecondaryTaskStatus.LAUNCHED:
+                if time.time() > deadline:
+                    timeout_result = SecondaryWaitResult(
+                        status=SecondaryTaskStatus.TIMEOUT,
+                        ready=False,
+                        error_code=SecondaryErrorCode.ONBOARD_TIMEOUT.value,
+                        message="onboard wait_host polling timeout",
+                        failed_user_ids=user_ids,
+                    )
+                    return self._fallback_or_keep_onboard_result(
+                        timeout_result,
+                        task_key=task_key,
+                        task_ids=task_ids,
+                    )
+                time.sleep(0.01)
+                continue
+            if wait_result.status == SecondaryTaskStatus.READY:
+                self._tasks.pop(task_key, None)
+                return wait_result
+            return self._fallback_or_keep_onboard_result(
+                wait_result,
+                task_key=task_key,
+                task_ids=task_ids,
+            )
 
     def _to_numpy_2d(self, tensor: Optional[torch.Tensor], np_dtype):
         if tensor is None:
@@ -286,18 +387,15 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
         device = index_meta.user_ids.device
         request_id = getattr(index_meta, "request_id", "")
         zeros_i32 = torch.zeros((bsz,), dtype=torch.int32, device=device)
-        zeros_i64 = torch.zeros((bsz,), dtype=torch.int64, device=device)
+        invalid_task_ids_i64 = torch.full((bsz,), -1, dtype=torch.int64, device=device)
 
         def _empty_lookup(error_code: Optional[str] = None, error_msg: str = "") -> KVLookupResult:
-            index_meta.secondary_get_task_ids = zeros_i64
-            index_meta.secondary_matched_lengths = zeros_i32
-            index_meta.secondary_hit_mask = None
-            index_meta.old_cached_lengths = zeros_i32
+            # Keep task ids for compatibility with downstream onboard.
+            index_meta.secondary_get_task_ids = invalid_task_ids_i64
             extra: Dict[str, Any] = {
                 "backend": "flexkv",
-                "task_ids": zeros_i64,
+                "task_ids": invalid_task_ids_i64,
                 "matched_lengths": zeros_i32,
-                "hit_mask": None,
             }
             if error_code is not None:
                 extra["error_code"] = error_code
@@ -305,9 +403,9 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
                 extra["error"] = error_msg
             return KVLookupResult(
                 request_id=request_id,
-                user_ids=index_meta.user_ids,
-                host_cached_start_indices=zeros_i32,
-                host_cached_lengths=zeros_i32,
+                user_ids=index_meta.user_ids,         #for onboard launch
+                host_cached_start_indices=zeros_i32,  #for KVLookupResult.merge
+                host_cached_lengths=zeros_i32,        #for KVLookupResult.merge
                 extra=extra,
             )
 
@@ -354,9 +452,6 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
                 hit_mask_t = None
 
             index_meta.secondary_get_task_ids = task_ids_t
-            index_meta.secondary_matched_lengths = matched_t
-            index_meta.secondary_hit_mask = hit_mask_t
-            index_meta.old_cached_lengths = matched_t
 
             return KVLookupResult(
                 request_id=request_id,
@@ -388,8 +483,10 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
             if page_ids.numel() == 0:
                 mappings.append(torch.empty((0,), dtype=torch.int64, device=kv_indices.device))
                 continue
-            # page_id -> token slot base
-            slot_mapping = torch.repeat_interleave(page_ids * self.page_size, repeats=self.page_size)
+            # page_ids -> token slots:
+            # cat([arange(pid * page_size, (pid + 1) * page_size) for pid in page_ids])
+            token_offsets = torch.arange(self.page_size, dtype=torch.int64, device=page_ids.device)
+            slot_mapping = (page_ids.unsqueeze(1) * self.page_size + token_offsets.unsqueeze(0)).reshape(-1)
             mappings.append(slot_mapping)
         return mappings
 
@@ -407,40 +504,168 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
         else:
             task_ids_t = torch.as_tensor(task_ids, dtype=torch.int64, device=index_meta.user_ids.device)
 
+        matched_lengths_raw = (lookup_result.extra or {}).get("matched_lengths")
+        if matched_lengths_raw is None:
+            matched_lengths_t = torch.zeros_like(task_ids_t, dtype=torch.int32)
+        elif isinstance(matched_lengths_raw, torch.Tensor):
+            matched_lengths_t = matched_lengths_raw.to(device=index_meta.user_ids.device, dtype=torch.int32)
+        else:
+            matched_lengths_t = torch.as_tensor(
+                matched_lengths_raw, dtype=torch.int32, device=index_meta.user_ids.device
+            )
+
         kvcache_metadata.onboard_task_ids = task_ids_t
         kvcache_metadata.onboard_slot_mappings = self._build_onboard_slot_mappings(kvcache_metadata)
 
+        valid_task_ids: List[int] = []
+        valid_slot_mappings: List[torch.Tensor] = []
+        valid_user_ids: List[int] = []
+        for i, tid_t in enumerate(task_ids_t.tolist()):
+            tid = int(tid_t)
+            if tid < 0:
+                continue
+            if i >= int(matched_lengths_t.numel()) or int(matched_lengths_t[i].item()) <= 0:
+                continue
+            if i >= len(kvcache_metadata.onboard_slot_mappings):
+                continue
+            slot_mapping = kvcache_metadata.onboard_slot_mappings[i]
+            if slot_mapping is None or int(slot_mapping.numel()) == 0:
+                continue
+            valid_task_ids.append(tid)
+            valid_slot_mappings.append(slot_mapping.to(dtype=torch.int64).detach().cpu())
+            valid_user_ids.append(int(index_meta.user_ids[i]))
+
         request_id = getattr(index_meta, "request_id", "")
-        return SecondaryTaskHandle(
-            backend="flexkv",
-            user_ids=index_meta.user_ids,
-            handle=_FlexKVOnloadHandle(
-                task_key=f"onboard:{request_id}",
-                request_id=request_id,
-                mode=self.mode,
-                task_ids=task_ids_t,
-                slot_mappings=kvcache_metadata.onboard_slot_mappings,
+        task_key = f"onboard:{request_id}"
+        onload_handle = _FlexKVOnloadHandle(
+            task_key=task_key,
+            request_id=request_id,
+            mode=self.mode,
+            task_ids=task_ids_t,
+            slot_mappings=kvcache_metadata.onboard_slot_mappings,
+            wait_impl=lambda _layer_idx: self._wait_onboard_task_until_terminal(
+                task_key=task_key,
+                user_ids=valid_user_ids,
             ),
-            status=SecondaryTaskStatus.LAUNCHED,
         )
+        if len(valid_task_ids) <= 0:
+            return SecondaryTaskHandle(
+                backend="flexkv",
+                user_ids=index_meta.user_ids,
+                handle=onload_handle,
+                status=SecondaryTaskStatus.SKIPPED,
+                metadata={"reason": "no valid get_match task_ids for onboard"},
+            )
+
+        try:
+            self._ensure_client_ready()
+            self._client.launch(valid_task_ids, valid_slot_mappings)
+            self._tasks[task_key] = {
+                "task_ids": valid_task_ids,
+                "kind": "onboard",
+                "user_ids": valid_user_ids,
+            }
+            return SecondaryTaskHandle(
+                backend="flexkv",
+                user_ids=index_meta.user_ids,
+                handle=onload_handle,
+                status=SecondaryTaskStatus.LAUNCHED,
+            )
+        except Exception as e:
+            if self._is_fail_open():
+                return SecondaryTaskHandle(
+                    backend="flexkv",
+                    user_ids=index_meta.user_ids,
+                    handle=onload_handle,
+                    status=SecondaryTaskStatus.SKIPPED,
+                    metadata={"reason": f"onboard launch fallback: {e}"},
+                )
+            return SecondaryTaskHandle(
+                backend="flexkv",
+                user_ids=index_meta.user_ids,
+                handle=onload_handle,
+                status=SecondaryTaskStatus.FAILED,
+                metadata={"error": f"onboard launch failed: {e}"},
+            )
 
     def onboard_wait_kvcache(self, task_handle: SecondaryTaskHandle) -> SecondaryWaitResult:
-        return SecondaryWaitResult(
-            status=SecondaryTaskStatus.READY,
-            ready=True,
-            message="flexkv onboard ready",
-        )
+        if task_handle is None or task_handle.handle is None:
+            return SecondaryWaitResult(
+                status=SecondaryTaskStatus.SKIPPED,
+                ready=True,
+                message="onboard task handle is empty",
+            )
+        try:
+            task_key = task_handle.handle.get("task_key")
+            state = self._tasks.get(task_key)
+            if state is None:
+                # No valid launch tasks (e.g. all task_ids < 0) is a valid no-op onboard.
+                return SecondaryWaitResult(
+                    status=SecondaryTaskStatus.SKIPPED,
+                    ready=True,
+                    message="onboard has no launched tasks",
+                )
+            responses = self._wait_task_ids(list(state.get("task_ids", [])))
+            wait_result = self._convert_wait_result(
+                responses=responses,
+                user_ids=list(state.get("user_ids", [])),
+                timeout_code=SecondaryErrorCode.ONBOARD_TIMEOUT.value,
+                failed_code=SecondaryErrorCode.ONBOARD_WAIT_FAILED.value,
+            )
+            if wait_result.status == SecondaryTaskStatus.READY:
+                self._tasks.pop(task_key, None)
+                return wait_result
+            return self._fallback_or_keep_onboard_result(
+                wait_result,
+                task_key=task_key,
+                task_ids=list(state.get("task_ids", [])),
+            )
+        except Exception as e:
+            failed = SecondaryWaitResult(
+                status=SecondaryTaskStatus.FAILED,
+                ready=False,
+                error_code=SecondaryErrorCode.ONBOARD_WAIT_FAILED.value,
+                message=f"onboard_wait exception: {e}",
+            )
+            if task_handle is None or task_handle.handle is None:
+                return failed
+            return self._fallback_or_keep_onboard_result(
+                failed,
+                task_key=task_handle.handle.get("task_key"),
+                task_ids=None,
+            )
+
+    def _build_flex_append_mapping(
+        self,
+        index_meta: KVIndexMeta,
+        kvcache_metadata: KVCacheMetadata,
+    ) -> List[torch.Tensor]:
+        kv_indices = kvcache_metadata.kv_indices.to(torch.int64)
+        kv_indptr = kvcache_metadata.kv_indptr.to(torch.int64)
+        seq_lengths = index_meta.seq_lengths.to(torch.int64)
+        page_size = int(self.page_size)
+        per_user_pages: List[torch.Tensor] = []
+        for i in range(int(index_meta.user_ids.numel())):
+            s = int(kv_indptr[i].item())
+            e = int(kv_indptr[i + 1].item())
+            seq_pages = kv_indices[s:e]
+            end_blk = (int(seq_lengths[i].item()) + page_size - 1) // page_size
+            append_pages = seq_pages[: min(end_blk, int(seq_pages.numel()))]
+            per_user_pages.append(append_pages)
+        return per_user_pages
 
     def offload_launch_kvcache(
         self,
         index_meta: KVIndexMeta,
-        append_slot_mapping: Optional[torch.Tensor],
-        append_slot_indptr: Optional[torch.Tensor] = None,
+        kvcache_metadata: KVCacheMetadata,
     ) -> SecondaryTaskHandle:
+        append_slot_mappings = self._build_flex_append_mapping(
+            index_meta=index_meta,
+            kvcache_metadata=kvcache_metadata,
+        )
         reqs = self._adapter.to_offload_requests(
             index_meta=index_meta,
-            append_slot_mapping=append_slot_mapping,
-            append_slot_indptr=append_slot_indptr,
+            append_slot_mappings=append_slot_mappings,
             tokens_per_block=self.page_size,
         )
         if len(reqs) == 0:
@@ -482,6 +707,8 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
             status=SecondaryTaskStatus.LAUNCHED,
             metadata={"request_id": request_id},
         )
+    
+    
     def offload_wait_kvcache(self, task_handle: SecondaryTaskHandle) -> SecondaryWaitResult:
         if task_handle is None or task_handle.handle is None:
             return SecondaryWaitResult(status=SecondaryTaskStatus.SKIPPED, ready=True)
@@ -509,6 +736,8 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
                 error_code=SecondaryErrorCode.OFFLOAD_WAIT_FAILED.value,
                 message=f"offload_wait exception: {e}",
             )
+    
+    
     def cancel_task(self, task_handle: SecondaryTaskHandle) -> None:
         if task_handle is None or task_handle.handle is None:
             return
@@ -529,7 +758,7 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
     def evict_all(self):
         return None
     def finish_task(self, task_handle: SecondaryTaskHandle) -> bool:
-        # FlexKV 场景下 wait 成功即视为完成
+        # FlexKV: wait success -> finish
         return True
 
 class FlexKVClientAdapter:
@@ -603,8 +832,6 @@ class FlexKVClientAdapter:
             "task_ids": task_ids,
             "matched_lengths": matched_lengths,
             "hit_mask": torch.from_numpy(hit_mask_2d).to(torch.bool) if max_len > 0 else None,
-            "restore_slot_mapping": None,
-            "append_slot_mapping": None,
         }
 
     def to_onboard_launch_payload(
@@ -630,62 +857,63 @@ class FlexKVClientAdapter:
     def to_offload_requests(
         self,
         index_meta: KVIndexMeta,
-        append_slot_mapping: Optional[torch.Tensor],
-        append_slot_indptr: Optional[torch.Tensor],
+        append_slot_mappings: Optional[List[torch.Tensor]],
         tokens_per_block: int,
     ) -> List[Dict[str, Any]]:
-        if append_slot_mapping is None or append_slot_indptr is None:
-            return []
-        if index_meta.token_ids is None or index_meta.token_mask is None:
-            return []
+        if append_slot_mappings is None:
+            raise ValueError("FlexKV offload requires append_slot_mappings")
+        if index_meta.token_ids is None:
+            raise ValueError("FlexKV offload requires token_ids")
 
-        page_ids = append_slot_mapping.to(torch.int64).detach().cpu().numpy()
-        indptr = append_slot_indptr.to(torch.int64).detach().cpu().numpy()
         token_ids_2d = index_meta.token_ids.to(torch.int64).detach().cpu().numpy()
-        token_mask_2d = index_meta.token_mask.to(torch.bool).detach().cpu().numpy()
-        if index_meta.secondary_matched_lengths is None:
-            matched_lengths = []
-        else:
-            matched_lengths = (
-                index_meta.secondary_matched_lengths
-                .to(torch.int64)
-                .detach()
-                .cpu()
-                .tolist()
-            )
+        seq_lengths = index_meta.seq_lengths.to(torch.int64).detach().cpu().tolist()
 
 
         reqs: List[Dict[str, Any]] = []
         for i in range(index_meta.batch_size):
-            p0 = int(indptr[i])
-            p1 = int(indptr[i + 1])
-            if p1 <= p0:
+            if i >= len(append_slot_mappings):
                 continue
-            req_pages = page_ids[p0:p1]
-            slot_mapping_full = np.repeat(req_pages * tokens_per_block, tokens_per_block).astype(np.int64)
+            req_pages_tensor = append_slot_mappings[i]
+            if req_pages_tensor is None or req_pages_tensor.numel() == 0:
+                continue
+            req_pages = req_pages_tensor.to(torch.int64).detach().cpu().numpy()
+            token_offsets = np.arange(tokens_per_block, dtype=np.int64)
+            slot_mapping_full = (
+                req_pages.reshape(-1, 1) * np.int64(tokens_per_block) + token_offsets.reshape(1, -1)
+            ).reshape(-1)
 
             row_ids = token_ids_2d[i]
-            row_mask = token_mask_2d[i]
-            valid_token_ids = row_ids[row_mask]
-
-            old_cached = int(index_meta.old_cached_lengths[i])
-            if i < len(matched_lengths):
-                old_cached = max(old_cached, int(matched_lengths[i]))
-
-            append_token_ids = valid_token_ids[old_cached:]
-        
-            aligned = (append_token_ids.size // tokens_per_block) * tokens_per_block
-            aligned = min(aligned, slot_mapping_full.size)
-            if aligned <= 0:
+            valid_len = min(int(seq_lengths[i]), int(row_ids.shape[0]))
+            if valid_len <= 0:
                 continue
+            req_len = int(slot_mapping_full.size)
+            if req_len <= 0:
+                continue
+            valid_token_ids = row_ids[:valid_len].astype(np.int64)
+            if valid_len >= req_len:
+                req_token_ids = valid_token_ids[:req_len]
+            else:
+                # Pad to full block-aligned length so FlexKV cache_engine won't drop tail tokens.
+                pad_value = int(valid_token_ids[-1]) if valid_len > 0 else 0
+                pad_tokens = np.full((req_len - valid_len,), pad_value, dtype=np.int64)
+                req_token_ids = np.concatenate([valid_token_ids, pad_tokens], axis=0)
+
+            if (
+                hasattr(index_meta, "namespaces")
+                and index_meta.namespaces is not None
+                and i < len(index_meta.namespaces)
+            ):
+                namespace = index_meta.namespaces[i]
+            else:
+                namespace = f"uid:{int(index_meta.user_ids[i])}"
 
             reqs.append(
                 {
                     "user_id": int(index_meta.user_ids[i]),
-                    "namespace": [index_meta.namespaces[i]],
-                    "token_ids": append_token_ids[:aligned].astype(np.int64),
-                    "token_mask": np.ones((aligned,), dtype=np.bool_),
-                    "slot_mapping": slot_mapping_full[:aligned].astype(np.int64),
+                    "namespace": [namespace],
+                    "token_ids": req_token_ids,
+                    "token_mask": None,
+                    "slot_mapping": slot_mapping_full,
                 }
             )
         return reqs

@@ -206,7 +206,7 @@ class NativeHostKVCacheManager(SecondaryKVCacheManagerBase):
             raise ValueError(f"Unknown task handle type: {type(task_handle.handle)}")
         return False
     
-    def register_gpu_cache_tensors(self, cache_table_list: Union[torch.Tensor, List[torch.Tensor]]):
+    def register_gpu_cache_table(self, cache_table_list: Union[torch.Tensor, List[torch.Tensor]]):
         # If the native backend also manages GPU KV cache, it can register the cache tensors here.
         # For example, it can pass the tensor pointers to the native library for direct GPU access.
         assert isinstance(cache_table_list, list), "Currently only support per-layer GPU cache tensor for native backend."
