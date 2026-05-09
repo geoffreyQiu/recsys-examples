@@ -109,6 +109,7 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
         self.num_tmp_cpu_blocks = int(num_tmp_cpu_blocks)
         self.enable_mps = bool(enable_mps)
         self._gpu_cache_table_list: Optional[List[torch.Tensor]] = None
+        self._flex_registered_kv_caches: Optional[List[torch.Tensor]] = None
         self._gpu_register_port: str = os.environ.get(
             "FLEXKV_GPU_REGISTER_PORT",
             "ipc:///tmp/flexkv_server_gpu_register",
@@ -200,6 +201,7 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
                 time.sleep(0.01)
                 continue
             if wait_result.status == SecondaryTaskStatus.READY:
+                self._sync_registered_to_live_cache()
                 self._tasks.pop(task_key, None)
                 return wait_result
             return self._fallback_or_keep_onboard_result(
@@ -238,7 +240,11 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
         except Exception as e:
             raise RuntimeError(f"FlexKV GPU registration import failed: {e}") from e
 
+        # FlexKV VLLM transfer backend assumes [kv, block, ...] contiguous
+        # strides. Our live cache is [block, kv, ...], so register a
+        # contiguous mirror buffer and synchronize at transfer boundaries.
         kv_caches = [layer.permute(1, 0, 2, 3, 4).contiguous() for layer in self._gpu_cache_table_list]
+        self._flex_registered_kv_caches = kv_caches
         first = kv_caches[0]
         device_id = int(first.device.index if first.device.index is not None else 0)
         gpu_layout = KVCacheLayout(
@@ -257,6 +263,32 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
         )
         tp_client.register_to_server(kv_caches=kv_caches, kv_layout=gpu_layout)
         self._registered = True
+
+    def _sync_live_cache_to_registered(self) -> None:
+        if (
+            self._gpu_cache_table_list is None
+            or self._flex_registered_kv_caches is None
+            or len(self._gpu_cache_table_list) != len(self._flex_registered_kv_caches)
+        ):
+            return
+        for i, live_layer in enumerate(self._gpu_cache_table_list):
+            self._flex_registered_kv_caches[i].copy_(
+                live_layer.permute(1, 0, 2, 3, 4),
+                non_blocking=False,
+            )
+
+    def _sync_registered_to_live_cache(self) -> None:
+        if (
+            self._gpu_cache_table_list is None
+            or self._flex_registered_kv_caches is None
+            or len(self._gpu_cache_table_list) != len(self._flex_registered_kv_caches)
+        ):
+            return
+        for i, reg_layer in enumerate(self._flex_registered_kv_caches):
+            self._gpu_cache_table_list[i].copy_(
+                reg_layer.permute(1, 0, 2, 3, 4),
+                non_blocking=False,
+            )
 
     def _ensure_client_ready(self) -> None:
         if self._ready and self._client is not None:
@@ -520,21 +552,31 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
         valid_task_ids: List[int] = []
         valid_slot_mappings: List[torch.Tensor] = []
         valid_user_ids: List[int] = []
+        launched_slot_mappings: List[torch.Tensor] = []
         for i, tid_t in enumerate(task_ids_t.tolist()):
             tid = int(tid_t)
             if tid < 0:
                 continue
-            if i >= int(matched_lengths_t.numel()) or int(matched_lengths_t[i].item()) <= 0:
+            if i >= int(matched_lengths_t.numel()):
+                continue
+            matched_len = int(matched_lengths_t[i].item())
+            if matched_len <= 0:
                 continue
             if i >= len(kvcache_metadata.onboard_slot_mappings):
                 continue
             slot_mapping = kvcache_metadata.onboard_slot_mappings[i]
             if slot_mapping is None or int(slot_mapping.numel()) == 0:
                 continue
+            # key change: clamp + truncate by matched_len
+            launch_len = min(matched_len, int(slot_mapping.numel()))
+            if launch_len <= 0:
+                continue
+            slot_mapping = slot_mapping[:launch_len]
+            slot_mapping_cpu = slot_mapping.to(dtype=torch.int64).contiguous().detach().cpu()
             valid_task_ids.append(tid)
-            valid_slot_mappings.append(slot_mapping.to(dtype=torch.int64).detach().cpu())
+            valid_slot_mappings.append(slot_mapping_cpu)
             valid_user_ids.append(int(index_meta.user_ids[i]))
-
+            launched_slot_mappings.append(slot_mapping_cpu)
         request_id = getattr(index_meta, "request_id", "")
         task_key = f"onboard:{request_id}"
         onload_handle = _FlexKVOnloadHandle(
@@ -542,7 +584,7 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
             request_id=request_id,
             mode=self.mode,
             task_ids=task_ids_t,
-            slot_mappings=kvcache_metadata.onboard_slot_mappings,
+            slot_mappings=launched_slot_mappings,
             wait_impl=lambda _layer_idx: self._wait_onboard_task_until_terminal(
                 task_key=task_key,
                 user_ids=valid_user_ids,
@@ -613,6 +655,7 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
                 failed_code=SecondaryErrorCode.ONBOARD_WAIT_FAILED.value,
             )
             if wait_result.status == SecondaryTaskStatus.READY:
+                self._sync_registered_to_live_cache()
                 self._tasks.pop(task_key, None)
                 return wait_result
             return self._fallback_or_keep_onboard_result(
@@ -676,6 +719,8 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
                 metadata={"reason": "no offload blocks"},
             )
         self._ensure_client_ready()
+        # FlexKV reads from registered GPU mirror buffers on D2H.
+        self._sync_live_cache_to_registered()
         task_ids: List[int] = []
         req_user_ids: List[int] = []
         for req in reqs:

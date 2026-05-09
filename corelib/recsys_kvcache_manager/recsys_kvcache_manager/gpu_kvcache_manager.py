@@ -195,11 +195,16 @@ class GPUKVCacheManager:
         (paged_k_cache, paged_v_cache) = self.gpu_kvcache_table[layer_idx].unbind(dim=1)
         paged_kvcache_ops = self._get_paged_kvcache_ops()
         assert k.shape[-2:] == paged_k_cache.shape[-2:], f"input k/v shape {k.shape} mismatch with cache shape {paged_k_cache.shape}"
+        source_offsets = (
+            kvcache_metadata.total_history_offsets[: batch_size + 1].to(dtype=torch.int32)
+            - append_offsets[: batch_size + 1].to(dtype=torch.int32)
+        ).contiguous()
         paged_kvcache_ops.append_kvcache(
             k, v, 
             kvcache_metadata.batch_indices,
             kvcache_metadata.position,
-            append_offsets[: batch_size + 1],
+            #append_offsets[: batch_size + 1],
+            source_offsets,
             kvcache_metadata.new_history_nnz_cuda,
             kvcache_metadata.new_history_nnz,
             paged_k_cache,
