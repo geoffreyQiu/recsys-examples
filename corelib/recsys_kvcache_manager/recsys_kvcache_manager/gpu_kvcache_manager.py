@@ -167,44 +167,14 @@ class GPUKVCacheManager:
         assert k.shape == v.shape, f"key and value shape mismatch: {k.shape} vs {v.shape}"
         if k.size(0) == self.num_layers:
             raise NotImplementedError("Only support layer-wise in this implementation.")
-        if k.dim() != 3:
-            raise ValueError(f"Expected 3D k/v tensor [N, H, D], got {k.shape}")
-        if int(k.size(1)) != self.num_heads or int(k.size(2)) != self.head_dim:
-            raise ValueError(
-                f"Input k/v shape {k.shape} incompatible with heads/head_dim "
-                f"{self.num_heads}/{self.head_dim}"
-            )
-
-        append_offsets = (
-            kvcache_metadata.append_offsets
-            if kvcache_metadata.append_offsets is not None
-            else kvcache_metadata.new_history_offsets
-        )
-        if append_offsets is None:
-            raise ValueError("KVCacheMetadata.append_offsets/new_history_offsets is required for put()")
-        batch_size = int(
-            kvcache_metadata.batch_size
-            if kvcache_metadata.batch_size > 0
-            else int(kvcache_metadata.kv_indptr.numel()) - 1
-        )
-        if int(append_offsets.numel()) < batch_size + 1:
-            raise ValueError(
-                f"append_offsets length {append_offsets.numel()} < batch_size+1 {batch_size + 1}"
-            )
-
         (paged_k_cache, paged_v_cache) = self.gpu_kvcache_table[layer_idx].unbind(dim=1)
-        paged_kvcache_ops = self._get_paged_kvcache_ops()
         assert k.shape[-2:] == paged_k_cache.shape[-2:], f"input k/v shape {k.shape} mismatch with cache shape {paged_k_cache.shape}"
-        source_offsets = (
-            kvcache_metadata.total_history_offsets[: batch_size + 1].to(dtype=torch.int32)
-            - append_offsets[: batch_size + 1].to(dtype=torch.int32)
-        ).contiguous()
+        batch_size = kvcache_metadata.kv_indptr.size(0) - 1
         paged_kvcache_ops.append_kvcache(
             k, v, 
             kvcache_metadata.batch_indices,
             kvcache_metadata.position,
-            #append_offsets[: batch_size + 1],
-            source_offsets,
+            append_offsets if append_offsets is not None else torch.zeros((batch_size,), dtype=torch.int32, device=self.device_idx),
             kvcache_metadata.new_history_nnz_cuda,
             kvcache_metadata.new_history_nnz,
             paged_k_cache,
@@ -213,7 +183,7 @@ class GPUKVCacheManager:
             kvcache_metadata.kv_indptr,
             kvcache_metadata.kv_last_page_len,
             0,  # NHD layout
-            self.num_sms)
+            self.num_sms)    
     
     def get(self, page_ids, last_page_lens, layer_idx) -> Tuple[torch.Tensor, torch.Tensor]:
         # Note: debug interface (for symmetry). Not used in inference pipeline.

@@ -61,7 +61,7 @@ if __name__ == "__main__":
     atexit.register(_shutdown_flexkv_client, kvcache_mgr)
 
 
-    if True:
+    if False:
         user_ids = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
         sequence_lengths = torch.tensor([100, 64, 88, 97], dtype=torch.int32)
 
@@ -136,20 +136,6 @@ if __name__ == "__main__":
         print(f"  \t{kvcache_metadata.new_history_nnz_cuda}")
         print(f"  \t{kvcache_metadata.new_history_nnz}")
 
-        # - token_ids: random int64 tokens per user
-        # - token_mask: valid token range by each sequence length
-        batch_size = int(user_ids.numel())
-        max_seq_len = int(sequence_lengths.max().item())
-        token_ids = torch.randint(
-            low=0,
-            high=100000,
-            size=(batch_size, max_seq_len),
-            dtype=torch.int64,
-        )
-        token_mask = torch.arange(max_seq_len, dtype=torch.int32).unsqueeze(0) < sequence_lengths.unsqueeze(1)
-        index_meta.token_ids = token_ids
-        index_meta.token_mask = token_mask
-
         ret = kvcache_mgr.eager_offboard_kvcache(index_meta)
         assert ret == None, "[ERROR] Lazy mode does not trigger eager offload"
         offload_handle = kvcache_mgr.lazy_offload_kvcache(index_meta, kvcache_metadata)
@@ -167,7 +153,7 @@ if __name__ == "__main__":
         print("offload status:", offload_handle.status if offload_handle else None)
         print("ongoing offload tasks:", len(kvcache_mgr.ongoing_offload_tasks))
 
-    if False:
+    if True:
         user_ids = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
         sequence_lengths = torch.tensor([100, 64, 88, 97], dtype=torch.int32)
         key = torch.randn((3, torch.sum(sequence_lengths).item(), 4, 128), dtype=torch.bfloat16).cuda()
@@ -207,19 +193,6 @@ if __name__ == "__main__":
                 last_page_lens = kvcache_metadata.kv_last_page_len[i].item()
                 cached_k, cached_v = kvcache_mgr.gpu_kvcache_mgr.get(page_ids, last_page_lens, layer_idx)
                 print(f"[DEBUG]   Layer_{layer_idx} keys: {torch.allclose(cached_k, k[layer_idx])} , values: {torch.allclose(cached_v, v[layer_idx])}")
-
-        # FlexKV offload input: prepare per-user tokens.
-        batch_size = int(user_ids.numel())
-        max_seq_len = int(sequence_lengths.max().item())
-        token_ids = torch.randint(
-            low=0,
-            high=100000,
-            size=(batch_size, max_seq_len),
-            dtype=torch.int64,
-        )
-        token_mask = torch.arange(max_seq_len, dtype=torch.int32).unsqueeze(0) < sequence_lengths.unsqueeze(1)
-        index_meta.token_ids = token_ids
-        index_meta.token_mask = token_mask
 
         ret = kvcache_mgr.eager_offboard_kvcache(index_meta)
         assert ret == None, "[ERROR] Lazy mode does not trigger eager offload"
@@ -262,10 +235,6 @@ if __name__ == "__main__":
                         user_ids[i : i + 1],
                         sequence_lengths[i : i + 1],
                     )
-                    if hasattr(sec_index_meta, "token_ids"):
-                        sec_index_meta.token_ids = token_ids[i : i + 1]
-                    if hasattr(sec_index_meta, "token_mask"):
-                        sec_index_meta.token_mask = token_mask[i : i + 1]
                     if hasattr(sec_index_meta, "namespaces"):
                         sec_index_meta.namespaces = [namespace]
                     flex_lookup = kvcache_mgr.secondary_kvcache_manager.lookup_kvcache(sec_index_meta)
