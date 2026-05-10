@@ -25,6 +25,16 @@
 #include <iostream>
 #include "vec_dtypes.cuh"
 
+#define cudaCheck(ans) { cudaSuccesAssert((ans), __FILE__, __LINE__); }
+inline void cudaSuccesAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess) 
+   {
+      fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
+
 #define DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, ...)       \
   switch (head_dim) {                                    \
     case 64: {                                           \
@@ -176,7 +186,7 @@ cudaError_t ScatterPagedKVCache(DType* continuous_kv,
                     (void*)&stride_page,   (void*)&stride_k2v,    (void*)&stride_n,
                     (void*)&stride_h,      (void*)&nnz,           (void*)&kv_cache,
                     (void*)&m,             (void*)&s,             (void*)&a};
-    cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream);
+    cudaCheck(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
   });
   return cudaSuccess;
 }
@@ -270,7 +280,7 @@ cudaError_t GatherPagedKVCache(DType* gather_kv,
                     (void*)&stride_page,   (void*)&stride_k2v,    (void*)&stride_n,
                     (void*)&stride_h,      (void*)&nnz,           (void*)&kv_cache,
                     (void*)&m,             (void*)&s,             (void*)&a};
-    cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream);
+    cudaCheck(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
   });
   return cudaSuccess;
 }
@@ -331,6 +341,6 @@ cudaError_t GetPagedBatchIndicesPositions(
   void* args[] = {(void*)&batch_size,     (void*)&append_indptr,      (void*)&seq_lens_ptr,    
                   (void*)&batch_indices_ptr,   (void*)&positions_ptr};
   auto kernel = GetPagedBatchIndicesPositionsKernel;
-  cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream);
+  cudaCheck(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
   return cudaSuccess;
 }

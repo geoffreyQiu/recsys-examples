@@ -144,7 +144,7 @@ KVOffloadHandle::~KVOffloadHandle() {
 void KVOffloadHandle::init(
     at::Tensor offload_user_ids,
     at::Tensor offload_start_indices,
-    std::vector<int64_t>&& offload_lengths
+    std::vector<int>&& offload_lengths
 ) {
     this->no_offload = false;
     if (!inited) {
@@ -178,22 +178,6 @@ bool KVOffloadHandle::try_wait_host(int layer_idx) {
         return false;
     }
     auto status = cudaEventQuery(this->ready_event[layer_idx]);
-    switch (status) {
-        case cudaSuccess:
-            std::cout << "cudaSuccess" << std::endl; break;
-        case cudaErrorNotReady:
-            std::cout << "cudaErrorNotReady" << std::endl; break;
-        case cudaErrorInitializationError: 
-            std::cout << "cudaErrorInitializationError" << std::endl; break;
-        case cudaErrorInvalidValue:
-            std::cout << "cudaErrorInvalidValue" << std::endl; break;
-        case cudaErrorInvalidResourceHandle:
-            std::cout << "cudaErrorInvalidResourceHandle" << std::endl; break;
-        case cudaErrorLaunchFailure:
-            std::cout << "cudaErrorLaunchFailure" << std::endl; break;
-        default:
-            std::cout << "unKnown" << std::endl;
-    }
     if (status == cudaSuccess) {
         return true;
     }
@@ -222,11 +206,7 @@ HostKVStorageImpl::HostKVStorageImpl(
     , device_idx(device_idx)
     , _uid_to_chunks()
 {
-    std::cout << "[DEBUG] max_batch_size: " << max_batch_size << std::endl;
-    std::cout << "[DEBUG] max_sequence_length: " << max_sequence_length << std::endl;
-    std::cout << "[DEBUG] max_sequence_length: " << max_sequence_length << std::endl;
     size_t padded_pages_per_seq = (max_sequence_length + num_tokens_per_page - 1) / num_tokens_per_page;
-    std::cout << "[DEBUG] padded_pages_per_seq: " << padded_pages_per_seq << std::endl;
 
     this->num_pages_per_chunk = num_tokens_per_chunk / num_tokens_per_page;
 
@@ -250,7 +230,6 @@ HostKVStorageImpl::HostKVStorageImpl(
     cudaCheck(cudaStreamCreateWithFlags(&gather_stream, cudaStreamNonBlocking));
 
     this->max_numel_per_layer_buffer = max_batch_size * padded_pages_per_seq * page_numel;
-    std::cout << "[DEBUG] max_numel_per_layer_buffer: " << max_numel_per_layer_buffer << std::endl; 
     for (int i = 0; i < 2; i++) {
         void *ptr;
         cudaCheck(cudaMalloc(&ptr, max_numel_per_layer_buffer * sizeof(uint16_t)));
@@ -262,7 +241,7 @@ HostKVStorageImpl::HostKVStorageImpl(
         offload_gpu_buffers.push_back(ptr);
     }
 
-    std::cout << "[DEBUG] capacity_per_layer: " << capacity_per_layer << std::endl; 
+    // std::cout << "[DEBUG] capacity_per_layer: " << capacity_per_layer << std::endl; 
     std::cout << "[INFO] Allocating pinned memory for host kvcache manager ..." << std::endl;
     for (int i = 0; i < num_layers; i++) {
         std::cout << "[DEBUG]  -- layer " << i << " ..." <<  std::endl; 
@@ -271,7 +250,7 @@ HostKVStorageImpl::HostKVStorageImpl(
         pinned_kvstorage_buffers.push_back(ptr);
     }
     std::cout << "[INFO] ... done." << std::endl;
-    std::cout << "[DEBUG] total_pinned_bytes: " << (capacity_per_layer * num_layers) / 1024. / 1024. / 1024 << " GiB" << std::endl; 
+    // std::cout << "[DEBUG] total_pinned_bytes: " << (capacity_per_layer * num_layers) / 1024. / 1024. / 1024 << " GiB" << std::endl; 
 
     _num_empty_chunks = capacity_per_layer / unit_chunk_bytes;
     _empty_chunks.push(
@@ -456,15 +435,15 @@ void HostKVStorageImpl::onload_kvcache(
             reinterpret_cast<uint16_t*>(gpu_onload_buffer), 
             onload_page_indices.data_ptr<int>(), 
             this->num_kv_heads, this->kv_headdim, this->num_tokens_per_page, this->page_stride, this->k2v_stride, 
-            this->inner_token_stride, this->kv_headdim, onload_page_indices.size(0) * this->num_tokens_per_page,
+            this->inner_token_stride, this->kv_headdim, onload_page_indices.size(0),
             this->device_num_sms, this->scatter_stream);
         onloadhandle.complete_host(layer_idx, this->scatter_stream);
     }
+    // For next onload, gather stream wait for current offload completion to gpu offload buffers are not in used.
+    cudaCheck(cudaStreamWaitEvent(this->onload_stream, onloadhandle.compl_event[this->num_layers-1], 0));
 }
-// 32 * 8192 * 2 * 8 * 256 * 2 = 1342177280 bytes = 1.25 GB per layer
 
 
-// TODO(junyiq): make it per single uid
 std::vector<std::pair< std::vector<int64_t>, std::vector<int64_t> >> HostKVStorageImpl::get_empty_pinned_chunks(
     at::Tensor& offload_user_ids, 
     at::Tensor& offload_start_indices,
@@ -472,7 +451,40 @@ std::vector<std::pair< std::vector<int64_t>, std::vector<int64_t> >> HostKVStora
     const auto batch_size = offload_user_ids.size(0);
 
     std::vector<std::pair< std::vector<int64_t>, std::vector<int64_t> >> empty_pinned_chunks;
+
+    // Check if have enough buffers and/or need eviction
+    int64_t num_pages_required = 0;
+    for (auto idx = 0; idx < batch_size; idx++) {
+        int64_t start_pos = offload_start_indices[idx].item<int64_t>();
+        int64_t num_unaligned_pages = (start_pos % this->num_tokens_per_chunk) / this->num_tokens_per_page;
+        num_unaligned_pages = (num_unaligned_pages == 0) ? this->num_pages_per_chunk : num_unaligned_pages;
+        num_pages_required += static_cast<int64_t>((
+            offload_num_pages_list[idx] + num_unaligned_pages - 1
+        ) / this->num_pages_per_chunk) * this->num_pages_per_chunk;
+    }
+
+    std::vector<int64_t> uids_to_evict;
+    std::unordered_set<int64_t> freezed_uids(offload_user_ids.data_ptr<int64_t>(), offload_user_ids.data_ptr<int64_t>() + batch_size);
+
+    int64_t num_available_pages = _num_empty_chunks * this->num_pages_per_chunk;
+    for (auto it = std::rbegin(_lru_list); it != std::rend(_lru_list); it++) {
+        if (num_pages_required <= num_available_pages) break;
+        
+        const int64_t uid_to_evict = *it;
+        if (freezed_uids.find(uid_to_evict) != freezed_uids.end()) continue;
+
+        const auto &chunk_psizes = _uid_to_chunks[uid_to_evict].second;
+        for (size_t idx = 0; idx < chunk_psizes.size(); idx++) {
+            num_available_pages += chunk_psizes[idx];
+        }
+        uids_to_evict.push_back(uid_to_evict);
+    }
+    if (num_available_pages < num_pages_required) return empty_pinned_chunks;
+
+    // Actual eviction
+    for (auto uid_to_evict : uids_to_evict) evict(uid_to_evict);
     
+    // Actual allocation
     for (auto idx = 0; idx < batch_size; idx++) {
         int64_t user_id = offload_user_ids[idx].item<int64_t>();
         int start_pos = offload_start_indices[idx].item<int64_t>();
@@ -484,9 +496,10 @@ std::vector<std::pair< std::vector<int64_t>, std::vector<int64_t> >> HostKVStora
         if (start_pos % num_tokens_per_chunk != 0)  {
             // if start_pos is not aligned to chunk size, reuse the last offloaded chunk.
             auto partial_num_pages = (start_pos % this->num_tokens_per_chunk) / this->num_tokens_per_page;
-            auto chunk_offset = _uid_to_chunks[user_id].first.back();
+            int64_t chunk_offset = _uid_to_chunks[user_id].first.back();
+            chunk_offset += _uid_to_chunks[user_id].second.back() * this->page_bytes;
+            chunk_offset -= this->unit_chunk_bytes - partial_num_pages * this->page_bytes;
             // assert();
-            chunk_offset = chunk_offset + partial_num_pages * this->page_bytes;
             chunk_offsets.push_back(chunk_offset);
             chunk_psizes.push_back(this->num_pages_per_chunk - partial_num_pages);
 
@@ -498,11 +511,7 @@ std::vector<std::pair< std::vector<int64_t>, std::vector<int64_t> >> HostKVStora
             std::ceil(static_cast<float>(offload_num_pages) / this->num_pages_per_chunk) * this->num_pages_per_chunk);
         size_t left_num_pages = padded_num_pages;
         while (left_num_pages > 0) {
-            if (_empty_chunks.empty() || _num_empty_chunks == 0) {
-                // abort if no empty chunk available
-                // TODO(junyiq): add LRU eviction
-                break;
-            }
+            // Should always have empty chunks
             auto [chunk_idx, num_unit_chunks] = _empty_chunks.front();
             if (num_unit_chunks * this->num_pages_per_chunk > left_num_pages) {
                 _empty_chunks.front().first += left_num_pages / this->num_pages_per_chunk;
@@ -541,7 +550,7 @@ bool HostKVStorageImpl::offload_kvcache(
 
     std::vector<int> num_pages_list(batch_size);
     std::vector<int> num_pages_offsets(batch_size);
-    std::vector<int64_t> offload_lengths(batch_size);
+    std::vector<int> offload_lengths(batch_size);
     for (int i = 0; i < batch_size; i++) {
         num_pages_list[i] = offload_page_indices_list[i].size(0);
         num_pages_offsets[i] = (i == 0) ? 0 : (num_pages_offsets[i - 1] + num_pages_list[i - 1]);
@@ -577,6 +586,10 @@ bool HostKVStorageImpl::offload_kvcache(
         num_pages_list
     );
 
+    // Launch fails if no enough space for offload, even after eviction.
+    // When return 0 chunks, no eviction or allocation really happened. 
+    if (empty_pinned_chunks.size() == 0) return false;  
+
     for (int layer_idx = 0; layer_idx < this->num_layers; layer_idx++) {
         void *gpu_offload_buffer = this->offload_gpu_buffers[layer_idx % 2];  // single layer for a max batch (multi-chunks)
         if (layer_idx >= 2) cudaCheck(cudaStreamWaitEvent(this->gather_stream, offloadhandle.ready_event[layer_idx - 2], 0));
@@ -604,53 +617,70 @@ bool HostKVStorageImpl::offload_kvcache(
         if (layer_idx < this->num_layers - 1) {
             offloadhandle.complete_host(layer_idx, this->offload_stream);
         } else {
-            offloadhandle.complete_host(layer_idx, this->offload_stream, std::move(empty_pinned_chunks));
-            // For next offload, gather stream wait for current offload completion to gpu offload buffers are not in used.
-            cudaCheck(cudaStreamWaitEvent(this->gather_stream, offloadhandle.ready_event[layer_idx], 0));
-        } 
+            offloadhandle.complete_host(layer_idx, this->offload_stream, std::move(empty_pinned_chunks));   
+        }
     }
+    // For next offload, gather stream wait for current offload completion to gpu offload buffers are not in used.
+    cudaCheck(cudaStreamWaitEvent(this->gather_stream, offloadhandle.ready_event[this->num_layers-1], 0));
     return true;
 }
 
-bool HostKVStorageImpl::finish_offload(
+std::vector<int> HostKVStorageImpl::finish_offload(
     KVOffloadHandle& offloadhandle) {
 
-    for (int seq_idx = 0; seq_idx < offloadhandle.offload_user_ids.size(0); seq_idx++) {
+    auto batch_size = offloadhandle.offload_user_ids.size(0);
+    std::vector<int> offload_sucess(batch_size, 1);
+    
+    for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
         int64_t user_id = offloadhandle.offload_user_ids[seq_idx].item<int64_t>();
+        auto [chunk_offsets, chunk_psizes] = offloadhandle.chunks[seq_idx];
+
         auto offload_start_index = offloadhandle.offload_start_indices[seq_idx].item<int64_t>();
         if (offload_start_index != _uid_to_length[user_id]) {
             // give a warning print
-            return false;
+            offload_sucess[seq_idx] = 0;
+            for (int idx = 0; idx < chunk_offsets.size(); idx++) {
+                if (chunk_psizes[idx] < this->num_pages_per_chunk) continue;
+                _empty_chunks.push(std::make_pair(chunk_offsets[idx] / this->unit_chunk_bytes, chunk_psizes[idx] / this->num_pages_per_chunk));
+                _num_empty_chunks += chunk_psizes[idx] / this->num_pages_per_chunk;
+            }
+            continue;
         }
 
-        auto [chunk_offsets, chunk_psizes] = offloadhandle.chunks[seq_idx];
         for (int idx = 0; idx < chunk_offsets.size(); idx++) {
             if (chunk_psizes[idx] < this->num_pages_per_chunk) continue;
             _uid_to_chunks[user_id].first.push_back(chunk_offsets[idx]);
             _uid_to_chunks[user_id].second.push_back(chunk_psizes[idx]);
         }
         _uid_to_length[user_id] = offload_start_index + offloadhandle.offload_lengths[seq_idx];
+        retain(user_id);
     }
 
-    return true;
+    return offload_sucess;
 }
 
-bool HostKVStorageImpl::cancel_offload(
+std::vector<int> HostKVStorageImpl::cancel_offload(
     KVOffloadHandle& offloadhandle) {
     // nop for canceling the launched kernels
 
-    auto & chunks = offloadhandle.chunks;
-    for (int seq_idx = 0; seq_idx < chunks.size(); seq_idx++) {
-        auto [chunk_offsets, chunk_psizes] = chunks[seq_idx];
+    auto batch_size = offloadhandle.offload_user_ids.size(0);
+    std::vector<int> offload_sucess(batch_size, 0);
+
+    for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
+        auto [chunk_offsets, chunk_psizes] = offloadhandle.chunks[seq_idx];
         if (chunk_offsets.size() == 0) continue;
         for (int idx = 0; idx < chunk_offsets.size(); idx++) {
             if (chunk_psizes[idx] < this->num_pages_per_chunk) continue;
             _empty_chunks.push(std::make_pair(chunk_offsets[idx] / this->unit_chunk_bytes, chunk_psizes[idx] / this->num_pages_per_chunk));
             _num_empty_chunks += chunk_psizes[idx] / this->num_pages_per_chunk;
         }
+        int64_t user_id = offloadhandle.offload_user_ids[seq_idx].item<int64_t>();
+        if (_uid_to_length.find(user_id) == _uid_to_length.end()) {
+            _uid_to_length.erase(user_id);
+        }
     }
 
-    return true;
+    return offload_sucess;
 }
 
 
@@ -666,6 +696,11 @@ void HostKVStorageImpl::evict(int64_t uid) {
 
     _uid_to_chunks.erase(uid);
     _uid_to_length.erase(uid);
+    
+    auto const tableIt = _lru_lookup_table.find(uid);
+    if (tableIt == _lru_lookup_table.end()) return;
+    _lru_list.erase(tableIt->second);
+    _lru_lookup_table.erase(tableIt);
 }
 
 void HostKVStorageImpl::evict_all() {
@@ -678,6 +713,18 @@ void HostKVStorageImpl::evict_all() {
     _uid_to_chunks.clear();
     _uid_to_length.clear();
 }
+
+bool HostKVStorageImpl::retain(int64_t uid)
+{
+    auto const tableIt = _lru_lookup_table.find(uid);
+    bool found = (_lru_lookup_table.end() != tableIt);
+    if (found) {
+        _lru_list.erase(tableIt->second);
+    }
+    _lru_list.push_front(uid);
+    _lru_lookup_table[uid] = _lru_list.begin();
+    return found;
+};
 
 
 }  // namespace kvcache

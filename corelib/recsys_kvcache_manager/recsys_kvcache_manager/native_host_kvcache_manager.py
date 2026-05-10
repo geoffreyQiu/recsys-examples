@@ -43,6 +43,8 @@ class NativeHostKVCacheManager(SecondaryKVCacheManagerBase):
         dtype: torch.dtype,
         device_idx: int,
     ):
+        self.backend_name = "native"
+
         self.num_layers = num_layers
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -110,7 +112,6 @@ class NativeHostKVCacheManager(SecondaryKVCacheManagerBase):
             lookup_result.host_cached_lengths,
             lookup_result.gpu_cached_start_indices,
         )
-        print(f"[DEBUG] onload_lengths: {onload_lengths}")
 
         onload_paged_ids_list = [
             kvcache_metadata.kv_indices.narrow(
@@ -180,7 +181,7 @@ class NativeHostKVCacheManager(SecondaryKVCacheManagerBase):
     def offload_wait_kvcache(self, task_handle):
         is_ready = task_handle.handle.try_wait_host(-1)
         elapsed_time = (time.perf_counter_ns() - task_handle.time_launched) / 1000_000.
-        print(f"[DEBUG] Offload elapsed time: {elapsed_time} ms")
+        # print(f"[DEBUG] Offload elapsed time: {elapsed_time} ms")
         return SecondaryWaitResult(
             status=SecondaryTaskStatus.READY if is_ready else 
                    SecondaryTaskStatus.TIMEOUT if elapsed_time > self._offload_timeout_ms else 

@@ -62,7 +62,6 @@ public:
     void evict(int64_t uid);
     void evict_offloaded(int64_t uid);
     void evict_all();
-    void invalid(int64_t uid);
     bool retain(int64_t uid);
 
     std::vector<int>& alloc_single_sequence(
@@ -87,7 +86,7 @@ public:
         at::Tensor user_ids,
         at::Tensor offload_start_indices,
         at::Tensor offload_lengths,
-        bool offloaded
+        const std::vector<int>& offloaded
     );
 
 public:

@@ -94,7 +94,7 @@ std::vector<at::Tensor> GPUKVCacheManagerImpl::lookup(at::Tensor uids) {
         int64_t uid = user_ids_ptr[seq_idx];
         if (_uid_to_paged_cache_startpos.find(uid) != _uid_to_paged_cache_startpos.end()) {
             cached_startpos_ptr[seq_idx] = _uid_to_paged_cache_startpos[uid];
-            cached_lengths_ptr[seq_idx] = _uid_to_paged_cache_startpos[uid] + _uid_to_paged_cache_length[uid];
+            cached_lengths_ptr[seq_idx] = _uid_to_paged_cache_length[uid];
         } else {
             cached_startpos_ptr[seq_idx] = 0;
             cached_lengths_ptr[seq_idx] = 0;
@@ -106,7 +106,7 @@ std::vector<at::Tensor> GPUKVCacheManagerImpl::lookup(at::Tensor uids) {
 
 int64_t GPUKVCacheManagerImpl::getUIdToEvict(std::unordered_set<int64_t> extra_freezed_uids) {
     int num_offloading_uids = _uid_offload_lock.size();
-    for (auto it = std::rbegin(_lru_list); it != std::rend(_lru_list); ++it) {
+    for (auto it = std::begin(_lru_list); it != std::end(_lru_list); ++it) {
         if (_uid_offload_lock.find((int64_t)*it) != _uid_offload_lock.end())
             continue;
         if (extra_freezed_uids.find((int64_t)*it) != extra_freezed_uids.end())
@@ -114,18 +114,14 @@ int64_t GPUKVCacheManagerImpl::getUIdToEvict(std::unordered_set<int64_t> extra_f
         return *it;
     }
     if (num_offloading_uids == 0) assert(false);
-    return _lru_list.back();
+    return _lru_list.front();
 };
 
-
-void GPUKVCacheManagerImpl::evict(int64_t uid)
-{
+void GPUKVCacheManagerImpl::evict(int64_t uid) {
     auto const tableIt = _lru_lookup_table.find(uid);
-    assert(_lru_lookup_table.end() != tableIt);
-    // if (_lru_lookup_table.end() != tableIt) {
+    if (_lru_lookup_table.end() != tableIt) {
         _lru_list.erase(tableIt->second);
         _lru_lookup_table.erase(tableIt);
-        // assert(_uid_to_page_id[uid].size() > 0);
 
         for (auto page_id : _uid_to_page_id[uid]) {
             _empty_pages.push(page_id);
@@ -138,7 +134,7 @@ void GPUKVCacheManagerImpl::evict(int64_t uid)
         _uid_to_paged_cache_startpos.erase(uid);
         _uid_to_paged_cache_length.erase(uid);
         _uid_to_offloaded_length.erase(uid);
-    // }
+    }
 };
 
 void GPUKVCacheManagerImpl::evict_offloaded(int64_t uid)
@@ -148,20 +144,15 @@ void GPUKVCacheManagerImpl::evict_offloaded(int64_t uid)
     if (num_offloaded_pages == 0) return;
 
     int num_pages = _uid_to_page_id[uid].size();
-    if (num_pages == num_offloaded_pages) {
-        evict(uid);
-    } else {
-        for (int i = 0; i < num_offloaded_pages; i++) {
-            _empty_pages.push(_uid_to_page_id[uid][i]);
-        }
-        _uid_to_page_id[uid].erase(
-            _uid_to_page_id[uid].begin(), 
-            _uid_to_page_id[uid].begin() + num_offloaded_pages);
-        _uid_to_paged_cache_startpos[uid] += num_offloaded_pages * this->num_tokens_per_page;
-        _uid_to_paged_cache_length[uid] -= num_offloaded_pages * this->num_tokens_per_page;
-        total_offloaded_pages -= num_offloaded_pages;
+    for (int i = 0; i < num_offloaded_pages; i++) {
+        _empty_pages.push(_uid_to_page_id[uid][i]);
     }
-        
+    _uid_to_page_id[uid].erase(
+        _uid_to_page_id[uid].begin(), 
+        _uid_to_page_id[uid].begin() + num_offloaded_pages);
+    _uid_to_paged_cache_startpos[uid] += num_offloaded_pages * this->num_tokens_per_page;
+    _uid_to_paged_cache_length[uid] -= num_offloaded_pages * this->num_tokens_per_page;
+    total_offloaded_pages -= num_offloaded_pages;
 };
 
 void GPUKVCacheManagerImpl::evict_all()
@@ -179,26 +170,6 @@ void GPUKVCacheManagerImpl::evict_all()
 
     for (int page_id = 0; page_id < this->num_primary_cache_pages; page_id++)
         _empty_pages.push(page_id);
-
-};
-
-void GPUKVCacheManagerImpl::invalid(int64_t uid) {
-    auto const tableIt = _lru_lookup_table.find(uid);
-    if (_lru_lookup_table.end() != tableIt) {
-        _lru_list.erase(tableIt->second);
-        _lru_lookup_table.erase(tableIt);
-
-        for (auto page_id : _uid_to_page_id[uid]) {
-            _empty_pages.push(page_id);
-        }
-
-        total_offloaded_pages -= std::max(0,
-            (_uid_to_offloaded_length[uid] - _uid_to_paged_cache_startpos[uid]) / this->num_tokens_per_page);
-        _uid_to_page_id.erase(uid);
-        _uid_to_paged_cache_startpos.erase(uid);
-        _uid_to_paged_cache_length.erase(uid);
-        _uid_to_offloaded_length.erase(uid);
-    }
 };
 
 bool GPUKVCacheManagerImpl::retain(int64_t uid)
@@ -208,8 +179,8 @@ bool GPUKVCacheManagerImpl::retain(int64_t uid)
     if (found) {
         _lru_list.erase(tableIt->second);
     }
-    _lru_list.push_front(uid);
-    _lru_lookup_table[uid] = _lru_list.begin();
+    _lru_list.push_back(uid);
+    _lru_lookup_table[uid] = std::prev(_lru_list.end());
     return found;
 };
 
@@ -258,17 +229,33 @@ std::vector<int>& GPUKVCacheManagerImpl::alloc_single_sequence(
     {
         // std::unique_lock<std::mutex> lock(offload_freezed_uids_mtx_);
 
-        for (auto it = std::rbegin(_lru_list); it != std::rend(_lru_list); ++it) {
-            if (this->_uid_offload_lock.find((int64_t)*it) != _uid_offload_lock.end())
-                continue;
-            if (freezed_uids.find((int64_t)*it) != freezed_uids.end())
-                continue;
-            evict_offloaded(*it);
+        for (auto it = std::begin(_lru_list); it != std::end(_lru_list); ) {
             if ((size_t)num_required_pages <= _empty_pages.size())
                 break;
+            if (this->_uid_offload_lock.find((int64_t)*it) != _uid_offload_lock.end()) {
+                ++it;
+                continue;
+            }
+            if (freezed_uids.find((int64_t)*it) != freezed_uids.end()) {
+                ++it;
+                continue;
+            }
+            evict_offloaded(*it);
+            if (_uid_to_paged_cache_length[*it] == 0) {
+                auto next_it = _lru_list.erase(it);
+                _lru_lookup_table.erase(*it);
+
+                _uid_to_page_id.erase(*it);
+                _uid_to_paged_cache_startpos.erase(*it);
+                _uid_to_paged_cache_length.erase(*it);
+                _uid_to_offloaded_length.erase(*it);
+                it = next_it;
+            } else {
+                ++it;
+            }
         }
     }
-    while ((size_t)num_required_pages > _empty_pages.size()) {
+    while (num_required_pages > _empty_pages.size()) {
         int64_t uid_to_evict = getUIdToEvict(freezed_uids);
         evict(uid_to_evict);
     }
@@ -405,15 +392,16 @@ at::Tensor GPUKVCacheManagerImpl::check_for_offload(
         num_pages_to_offload += (cached_end_index - offloaded_length) / this->num_tokens_per_page;
     }
 
-    for (auto uid : this->_lru_list) {
-        if (this->total_offloaded_pages + num_pages_to_offload + this->_empty_pages.size() > this->num_primary_cache_pages - this->num_buffer_pages) {
+    for (auto it = std::begin(_lru_list); it != std::end(_lru_list); ++it) {
+        int64_t uid = *it;
+        if (this->total_offloaded_pages + num_pages_to_offload + this->_empty_pages.size() > this->num_buffer_pages) {
             break;
         }
         if (offload_uids_set.find(uid) != offload_uids_set.end()) continue;
 
         int offloaded_length = this->_uid_to_offloaded_length[uid];
         int cached_startpos = this->_uid_to_paged_cache_startpos[uid];
-        if (offloaded_length < cached_startpos) continue;
+        if (offloaded_length < cached_startpos) continue;  // should not happen
 
         int cached_end_index = cached_startpos + this->_uid_to_paged_cache_length[uid];
         if (cached_end_index - offloaded_length >= this->num_tokens_per_chunk) {
@@ -425,9 +413,6 @@ at::Tensor GPUKVCacheManagerImpl::check_for_offload(
             offload_uids_set.insert(uid);
         }
     }
-    std::cout << "[DEBUG] Offload user_ids: [";
-    for (auto uid : offload_user_ids) std::cout << uid << ", ";
-    std::cout << "]" << std::endl;
     return at::from_blob(offload_user_ids.data(), {offload_user_ids.size()}, at::dtype(torch::kInt64)).clone();
 }
 
@@ -441,6 +426,9 @@ void GPUKVCacheManagerImpl::revoke_onboard_pages(
         int64_t uid = user_ids[seq_idx].item<int64_t>();
         int page_start = onboard_page_starts[seq_idx].item<int>();
         int onboard_pages = num_onboard_pages[seq_idx].item<int>();
+        for (int jdx = page_start; jdx < page_start + onboard_pages; jdx++) {
+            _empty_pages.push(_uid_to_page_id[uid][jdx]);
+        }
         _uid_to_page_id[uid].erase(
             _uid_to_page_id[uid].begin() + page_start, 
             _uid_to_page_id[uid].begin() + page_start + onboard_pages);
@@ -458,13 +446,10 @@ std::tuple<at::Tensor, at::Tensor, std::vector<at::Tensor>> GPUKVCacheManagerImp
 
     for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
         int64_t uid = user_ids[seq_idx].item<int64_t>();
-        int64_t offloaded_length = offloaded_lengths[seq_idx].item<int64_t>();
-
-        if (this->_uid_to_offloaded_length.find(uid) == this->_uid_to_offloaded_length.end()) {
-            this->_uid_to_offloaded_length[uid] = 0;
+        if (offloaded_lengths.size(0) == batch_size) {
+            this->_uid_to_offloaded_length[uid] = offloaded_lengths[seq_idx].item<int>();
         }
-
-        this->_uid_to_offloaded_length[uid] = offloaded_length;
+        int offloaded_length = this->_uid_to_offloaded_length[uid];
 
         int cached_startpos = this->_uid_to_paged_cache_startpos[uid];
         // if (offloaded_length < cached_startpos) continue;  // Should not have gap
@@ -499,17 +484,17 @@ void GPUKVCacheManagerImpl::release_offload_pages(
     at::Tensor user_ids,
     at::Tensor offload_start_indices,
     at::Tensor offload_lengths,
-    bool offloaded) {
+    const std::vector<int>& offloaded) {
     for (auto idx = 0; idx < user_ids.size(0); idx++) {
         int64_t uid = user_ids[idx].item<int64_t>();
         this->_uid_offload_lock[uid] -= 1;
         if (this->_uid_offload_lock[uid] == 0) {
             this->_uid_offload_lock.erase(uid);
         }
-        if (offloaded) {
+        if (offloaded[idx]) {
             total_offloaded_pages -= std::max(0,
                 (_uid_to_offloaded_length[uid] - _uid_to_paged_cache_startpos[uid]) / this->num_tokens_per_page);
-            _uid_to_offloaded_length[uid] = offload_start_indices[idx].item<int64_t>() + offload_lengths[idx].item<int64_t>();
+            _uid_to_offloaded_length[uid] = offload_start_indices[idx].item<int>() + offload_lengths[idx].item<int>();
             total_offloaded_pages += std::max(0,
                 (_uid_to_offloaded_length[uid] - _uid_to_paged_cache_startpos[uid]) / this->num_tokens_per_page);
         }

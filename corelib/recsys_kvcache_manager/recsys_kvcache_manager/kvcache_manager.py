@@ -130,25 +130,24 @@ class KVCacheManager:
         index_meta: KVIndexMeta,
     ):
         # 1. Get the maximum batch for offloading from GPU
-        uids_to_offload = self.gpu_kvcache_mgr.check_for_offload(index_meta.user_ids)
-        print(f"[DEBUG] Offload uids: {uids_to_offload}")
-
         # 2. Lookup host again in case of multi-GPU instances
-        offloaded_lengths = self.secondary_kvcache_manager.lookup_kvcache(index_meta).host_cached_lengths
-        print(f"[DEBUG] Offloaded len (another host lookup): {offloaded_lengths}")
+        if self.secondary_kvcache_manager.backend_name == "native":
+            uids_to_offload = self.gpu_kvcache_mgr.check_for_offload(index_meta.user_ids)
+            _index_meta = self.secondary_kvcache_manager.build_index_meta(uids_to_offload, None)
+            offloaded_lengths = self.secondary_kvcache_manager.lookup_kvcache(_index_meta).host_cached_lengths
+        else:
+            uids_to_offload = index_meta.user_ids
+            offloaded_lengths = self.dummy_empty_tensor
 
         # 3. Acquire and lock GPU cache pages
         (offload_user_ids, 
          offload_start_indices, 
          offload_page_indices_list, 
         ) = self.gpu_kvcache_mgr.acquire_offload_pages(uids_to_offload, offloaded_lengths)
-        # returned with cache pages locked (per-uid). TODO(junyiq): per-(uid, lock_start, lock_end)
-        # Note: all pages from offload_page_indicesa are required to offload. duplication will be resolved when finished.
+        # returned with cache pages locked (per user).
+        # Note: all pages from offload_page_indices are required to offload. duplication will be resolved when finished.
         if offload_user_ids.size(0) == 0:
             return None
-        print(f"[DEBUG] Offload uids: {offload_user_ids}")
-        print(f"[DEBUG] Offload startpos: {offload_start_indices}")
-        print(f"[DEBUG] Offload lens: {offload_page_indices_list}")
 
         # 4. Launch the offloading thru Host
         task_handle = self.secondary_kvcache_manager.offload_launch_kvcache(
@@ -190,19 +189,17 @@ class KVCacheManager:
                 SecondaryTaskStatus.LAUNCHED,
             ):
                 remain_tasks.append(task_handle)
-                print(f"[DEBUG] {wait_result.status}")
                 continue
 
             if wait_result.status == SecondaryTaskStatus.READY:
                 offload_success = self.secondary_kvcache_manager.finish_task(task_handle)
-                print(f"[DEBUG] {wait_result.status}")
             elif wait_result.status in (
                 SecondaryTaskStatus.FAILED,
                 SecondaryTaskStatus.TIMEOUT,
                 SecondaryTaskStatus.CANCELLED,
             ):
                 should_raise = False  # self.secondary_fail_policy == "fail_close"
-                offload_success = False
+                offload_success = [ 0 for _ in range(task_handle.get_user_ids().size(0)) ]
                 self.secondary_kvcache_manager.cancel_task(task_handle)
                 if should_raise:
                     raise RuntimeError(f"{wait_result.status}")
@@ -272,6 +269,8 @@ class KVCacheManager:
     @classmethod
     def from_config(cls, kvcache_config):
 
+        assert kvcache_config.offload_chunksize % kvcache_config.page_size == 0, \
+               "Require offload_chunksize to be multiple of page_size"
         gpu_kvcache_mgr = GPUKVCacheManager(
             kvcache_config.num_layers,
             kvcache_config.num_heads,

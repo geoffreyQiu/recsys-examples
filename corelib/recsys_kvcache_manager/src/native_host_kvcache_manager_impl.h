@@ -71,7 +71,7 @@ public:
     void init(
         at::Tensor offload_user_ids,
         at::Tensor offload_start_indices,
-        std::vector<int64_t>&& offload_lengths);
+        std::vector<int>&& offload_lengths);
     // void reset();
     void complete_host(int layer_idx, cudaStream_t stream);
     void complete_host(int layer_idx, cudaStream_t stream, 
@@ -95,7 +95,7 @@ public:
 
     at::Tensor offload_user_ids;
     at::Tensor offload_start_indices;
-    std::vector<int64_t> offload_lengths;
+    std::vector<int> offload_lengths;
 
     std::vector<std::pair< std::vector<int64_t>, std::vector<int64_t> >> chunks;
     
@@ -148,11 +148,12 @@ public:
         at::Tensor offload_start_indices,  // on host
         const std::vector<at::Tensor>& offload_page_indices_list, // on host
         KVOffloadHandle& offloadhandle);
-    bool finish_offload(KVOffloadHandle& offloadhandle);
-    bool cancel_offload(KVOffloadHandle& offloadhandle);
+    std::vector<int> finish_offload(KVOffloadHandle& offloadhandle);
+    std::vector<int> cancel_offload(KVOffloadHandle& offloadhandle);
 
     void evict(int64_t uid);
     void evict_all();
+    bool retain(int64_t uid);
 
 public:
     const int num_layers;
@@ -187,6 +188,9 @@ public:
 
 public:
     // bookkeeper
+    std::list<int64_t> _lru_list;
+    std::unordered_map<int64_t, 
+                       typename std::list<int64_t>::iterator> _lru_lookup_table;
     std::queue<std::pair<int64_t, int64_t>> _empty_chunks;  // <offset of buffer, size in pages>
     int64_t _num_empty_chunks;
     // std::list<int64_t> _lru_list;

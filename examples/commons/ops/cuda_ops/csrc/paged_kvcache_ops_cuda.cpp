@@ -270,7 +270,7 @@ void gather_paged_kv_cache_all_layers(uint16_t *gather_kv_gpu_buffer,
 PYBIND11_MODULE(paged_kvcache_ops, m) {
   m.def("append_kvcache", &append_paged_kv_cache, "append paged kv cache on GPU", py::call_guard<py::gil_scoped_release>());
   m.def("gather_kvcache", &gather_paged_kv_cache, "gather paged kv cache on GPU", py::call_guard<py::gil_scoped_release>());
-
+#if 0
   py::class_<kvcache::HostKVStorageImpl>(m, "HostKVStorageImpl")
     .def(py::init<int, int, int, int, int64_t>(), 
          py::arg("num_layers"),
@@ -326,4 +326,5 @@ PYBIND11_MODULE(paged_kvcache_ops, m) {
   ;
 
   m.def("prepare_kvcache", &kvcache::prepare_kvcache, "prepare_kvcache", py::call_guard<py::gil_scoped_release>());
+#endif
 }
