@@ -1,7 +1,4 @@
-import time
-
 import torch
-import kvcache_cpp
 
 from recsys_kvcache_manager.kvcache_manager import KVCacheManager
 from recsys_kvcache_manager.kvcache_config import get_kvcache_config
