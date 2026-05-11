@@ -79,9 +79,9 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
         self._client = None
         self._ready = False
 
-    def register_gpu_cache_table(self, cache_table_list: List[torch.Tensor]) -> None:
-        assert isinstance(cache_table_list, list), "cache_table_list should be a list of tensors"
-        assert len(cache_table_list) == self.num_layers, f"cache_table_list length {len(cache_table_list)} does not match num_layers {self.num_layers}"
+    def register_gpu_cache_table(self, cache_table: torch.Tensor) -> None:
+        assert cache_table.size(0) == self.num_layers, f"cache_table first dimension {cache_table.size(0)} does not match num_layers {self.num_layers}"
+        cache_table_list = [ cache_table[idx] for idx in range(self.num_layers) ]
 
         # Use fake view (2, #block, blocksize, #head, headdim) for flexKV registration.
         # Actual data will be organized in the original GPU cache tensors shape (#block, 2, blocksize, #head, headdim).

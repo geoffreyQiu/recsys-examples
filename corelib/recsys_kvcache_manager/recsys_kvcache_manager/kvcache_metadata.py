@@ -107,7 +107,6 @@ def get_kvcache_metadata_buffer(
         new_history_offsets=new_history_offsets,
         batch_indices=batch_indices_buffer,
         position=position_buffer,
-        batch_size=batch_size,
         new_history_nnz=num_new_tokens,
         new_history_nnz_cuda=new_history_nnz_cuda,
     )

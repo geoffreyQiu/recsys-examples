@@ -150,9 +150,9 @@ if __name__ == "__main__":
                 assert torch.allclose(cached_v, v[layer_idx]), f"Layer {layer_idx} value mismatch for uid {user_ids[i].item()}"
         
 
-        offload_handle = kvcache_mgr.lazy_offload_kvcache(index_meta)
+        offload_handle = kvcache_mgr.offload_launch(index_meta)
         while True:
-            kvcache_mgr.finish_or_cancel_kvcache_ops()
+            kvcache_mgr.offload_try_wait()
             if len(kvcache_mgr.ongoing_offload_tasks) == 0:
                 break
         
@@ -253,9 +253,9 @@ if __name__ == "__main__":
                 assert torch.allclose(cached_v, v[layer_idx]), f"Layer {layer_idx} value mismatch for uid {user_ids[i].item()}"
         
 
-        offload_handle = kvcache_mgr.lazy_offload_kvcache(index_meta)
+        offload_handle = kvcache_mgr.offload_launch(index_meta)
         while True:
-            kvcache_mgr.finish_or_cancel_kvcache_ops()
+            kvcache_mgr.offload_try_wait()
             if len(kvcache_mgr.ongoing_offload_tasks) == 0:
                 break
         
@@ -358,9 +358,9 @@ if __name__ == "__main__":
                 assert torch.allclose(cached_k, k[layer_idx]), f"Layer {layer_idx} key mismatch for uid {user_ids[i].item()}"
                 assert torch.allclose(cached_v, v[layer_idx]), f"Layer {layer_idx} value mismatch for uid {user_ids[i].item()}"
 
-        offload_handle = kvcache_mgr.lazy_offload_kvcache(index_meta)
+        offload_handle = kvcache_mgr.offload_launch(index_meta)
         while True:
-            kvcache_mgr.finish_or_cancel_kvcache_ops()
+            kvcache_mgr.offload_try_wait()
             if len(kvcache_mgr.ongoing_offload_tasks) == 0:
                 break
         
@@ -460,9 +460,9 @@ if __name__ == "__main__":
                 assert torch.allclose(cached_k, k[layer_idx]), f"Layer {layer_idx} key mismatch for uid {user_ids[i].item()}"
                 assert torch.allclose(cached_v, v[layer_idx]), f"Layer {layer_idx} value mismatch for uid {user_ids[i].item()}"
 
-        offload_handle = kvcache_mgr.lazy_offload_kvcache(index_meta)
+        offload_handle = kvcache_mgr.offload_launch(index_meta)
         while True:
-            kvcache_mgr.finish_or_cancel_kvcache_ops()
+            kvcache_mgr.offload_try_wait()
             if len(kvcache_mgr.ongoing_offload_tasks) == 0:
                 break
         
@@ -567,9 +567,9 @@ if __name__ == "__main__":
                 assert torch.allclose(cached_k, k[layer_idx]), f"Layer {layer_idx} key mismatch for uid {user_ids[i].item()}"
                 assert torch.allclose(cached_v, v[layer_idx]), f"Layer {layer_idx} value mismatch for uid {user_ids[i].item()}"
 
-        offload_handle = kvcache_mgr.lazy_offload_kvcache(index_meta)
+        offload_handle = kvcache_mgr.offload_launch(index_meta)
         while True:
-            kvcache_mgr.finish_or_cancel_kvcache_ops()
+            kvcache_mgr.offload_try_wait()
             if len(kvcache_mgr.ongoing_offload_tasks) == 0:
                 break
         

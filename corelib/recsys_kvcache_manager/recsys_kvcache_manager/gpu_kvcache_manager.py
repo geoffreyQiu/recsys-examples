@@ -153,8 +153,8 @@ class GPUKVCacheManager:
         return self.kvcache_manager_impl.check_for_offload(
             uids if uids is not None else torch.tensor([], dtype=torch.int64))
     
-    def acquire_offload_pages(self, uids: torch.Tensor, offloaded_lengths: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
-        return self.kvcache_manager_impl.acquire_offload_pages(uids, offloaded_lengths)
+    def acquire_offload_pages(self, uids: torch.Tensor, offloaded_lengths: torch.Tensor, always_offload: bool = False) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        return self.kvcache_manager_impl.acquire_offload_pages(uids, offloaded_lengths, always_offload)
     
     def release_offload_pages(self, 
         uids: torch.Tensor, 
