@@ -97,8 +97,6 @@ class NativeHostKVCacheManager(SecondaryKVCacheManagerBase):
         lookup_result: KVLookupResult,
         kvcache_metadata: KVCacheMetadata
     ) -> SecondaryTaskHandle:
-        native_handle = KVOnloadHandle(self.num_layers)
-
         g_end_idxs = lookup_result.gpu_cached_start_indices + lookup_result.gpu_cached_lengths
         h_longer = g_end_idxs < lookup_result.host_cached_lengths
 
@@ -125,9 +123,11 @@ class NativeHostKVCacheManager(SecondaryKVCacheManagerBase):
             # No data to onboard, skip the task.
             return SecondaryTaskHandle(
                 backend="native",
-                handle=native_handle,
+                handle=None,
                 status=SecondaryTaskStatus.SKIPPED,
             )
+
+        native_handle = KVOnloadHandle(self.num_layers)
         self.kvcache_mananger_impl.onload_kvcache(
             index_meta.user_ids,
             onload_paged_ids_list,
@@ -137,8 +137,8 @@ class NativeHostKVCacheManager(SecondaryKVCacheManagerBase):
             handle=native_handle,
             status=SecondaryTaskStatus.LAUNCHED,
             metadata={
-                "onload_page_starts": onload_start_indices,
-                "onload_lengths": onload_lengths,
+                "onboard_start_indices": onload_start_indices,
+                "onboard_lengths": onload_lengths,
             },
         )
 
@@ -207,10 +207,11 @@ class NativeHostKVCacheManager(SecondaryKVCacheManagerBase):
             raise ValueError(f"Unknown task handle type: {type(task_handle.handle)}")
         return False
     
-    def register_gpu_cache_tensors(self, cache_table_list: Union[torch.Tensor, List[torch.Tensor]]):
+    def register_gpu_cache_table(self, cache_table_list: Union[torch.Tensor, List[torch.Tensor]]):
         # If the native backend also manages GPU KV cache, it can register the cache tensors here.
         # For example, it can pass the tensor pointers to the native library for direct GPU access.
         assert isinstance(cache_table_list, list), "Currently only support per-layer GPU cache tensor for native backend."
+        assert len(cache_table_list) == self.num_layers, f"cache_table_list length {len(cache_table_list)} does not match num_layers {self.num_layers}"
         self.kvcache_mananger_impl.set_gpu_kvcache_table(cache_table_list)
     
     def evict(self, user_ids: torch.Tensor):

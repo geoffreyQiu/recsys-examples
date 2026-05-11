@@ -381,7 +381,7 @@ def test_lookup_returns_task_ids_and_matched_lengths():
             )
             for _ in range(storage_mgr.num_layers)
         ]
-        storage_mgr.register_gpu_cache_tensors(cache_tables)
+        storage_mgr.register_gpu_cache_table(cache_tables)
 
         index_meta = KVIndexMeta(
             request_id="req-lookup-fields",

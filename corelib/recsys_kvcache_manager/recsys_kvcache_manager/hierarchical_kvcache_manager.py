@@ -40,7 +40,7 @@ class SecondaryErrorCode(str, Enum):
 @dataclass
 class SecondaryTaskHandle:
     backend: str
-    user_ids: Optional[torch.Tensor] = None
+    user_ids: Optional[torch.Tensor] = None  # TODO(junyiq): check if needed
     handle: Optional[Any] = None
     status: SecondaryTaskStatus = SecondaryTaskStatus.UNINITIALIZED
     metadata: Optional[Dict[str, Any]] = None
@@ -50,7 +50,6 @@ class SecondaryTaskHandle:
 class SecondaryWaitResult:
     status: SecondaryTaskStatus
     ready: bool
-    error_code: Optional[str] = None
     message: str = ""
     failed_mask: Optional[torch.Tensor] = None
     failed_user_ids: Optional[List[int]] = None

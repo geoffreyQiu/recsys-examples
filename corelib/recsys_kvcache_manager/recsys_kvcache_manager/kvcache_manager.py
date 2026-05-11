@@ -13,14 +13,15 @@ from enum import Enum
 from .gpu_kvcache_manager import GPUKVCacheManager
 from .hierarchical_kvcache_manager import (
     SecondaryKVCacheManagerBase,
-    SecondaryErrorCode,
-    SecondaryTaskStatus,
     SecondaryTaskHandle,
+    SecondaryTaskStatus,
     SecondaryWaitResult,
+    SecondaryErrorCode,
 )
 from .native_host_kvcache_manager import (
     NativeHostKVCacheManager
 )
+from .flex_kvcache_manager import FlexKVStorageManager
 from .kvcache_config import KVCacheConfig
 from .kvcache_utils import KVCacheOffloadMode, KVLookupResult, KVIndexMeta
 from .kvcache_metadata import KVCacheMetadata
@@ -55,9 +56,9 @@ class KVCacheManager:
             else KVCacheOffloadMode.LAZY
         )
         # self.secondary_fail_policy = secondary_fail_policy
-        # self.ongoing_onboard_tasks: List[str, SecondaryTaskHandle] = list()
-        self.ongoing_offload_tasks: List[str, SecondaryTaskHandle] = list()
-    
+        self.ongoing_onboard_tasks: List[SecondaryTaskHandle] = []
+        self.ongoing_offload_tasks: List[SecondaryTaskHandle] = []
+
     def lookup_kvcache(
         self,
         user_ids: torch.Tensor,
@@ -97,38 +98,63 @@ class KVCacheManager:
         # Skip recording the ongoing onboard tasks. For now there should be only one task.
         # self.ongoing_onboard_tasks.append(task_handle)
         return task_handle
-    
-    def onboard_try_wait_kvcache_or_fail(
+
+    def onboard_try_wait(
         self,
         kv_index_meta: KVIndexMeta,
         task_handle: Optional[SecondaryTaskHandle],
     ) -> Optional[SecondaryWaitResult]:
-        if task_handle is None:
-            return SecondaryWaitResult(status=SecondaryTaskStatus.READY, ready=True)
+        if self.secondary_kvcache_manager.backend_name == "native":
+            return self.secondary_kvcache_manager.onboard_wait_kvcache(task_handle)
+        elif self.secondary_kvcache_manager.backend_name == "flexkv":
+            print("[WARNING] onboard_try_wait is not implemented for flexkv backend. Calling onboard_wait instead.")
+            return self.onboard_wait(kv_index_meta, task_handle)
+    
+    def onboard_wait(
+        self,
+        kv_index_meta: KVIndexMeta,
+        task_handle: Optional[SecondaryTaskHandle],
+    ) -> Optional[SecondaryWaitResult]:
+        if task_handle is None or task_handle.handle is None or task_handle.status == SecondaryTaskStatus.SKIPPED:
+            return SecondaryWaitResult(
+                status=SecondaryTaskStatus.UNINITIALIZED,
+                ready=False,
+            )
         wait_result = self.secondary_kvcache_manager.onboard_wait_kvcache(task_handle)
+        # Note: wait_result.status == SKIPPED means waiting/sync here is not supported with backend in use.
+
         if wait_result.status in (
             SecondaryTaskStatus.FAILED,
             SecondaryTaskStatus.TIMEOUT,
             SecondaryTaskStatus.CANCELLED,
         ):
-            # Note: Either evict the total user or revoke affected pages
+            if task_handle.backend == "flexkv":
+                fail_policy = getattr(self.secondary_kvcache_manager, "secondary_fail_policy", "fail_open")
+                if fail_policy == "fail_close":
+                    raise RuntimeError(f"Onboarding failed for {wait_result.failed_user_ids}")
+            metadata = task_handle.metadata or {}
+            
+            # Revoke affected pages on onboard failure.
             self.gpu_kvcache_mgr.revoke_onboard_pages(
                 kv_index_meta.user_ids,
-                task_handle.metadata["onboard_page_starts"],
-                task_handle.metadata["num_onboard_pages"],
+                metadata["onboard_start_indices"],
+                metadata["onboard_lengths"],
             )
-            # if self.secondary_fail_policy == "fail_close":
-            #     self.gpu_kvcache_mgr.evict(kv_index_meta.user_ids)
-            #     raise RuntimeError(
-            #         f"onboard wait failed: status={wait_result.status.value}, msg={wait_result.message}"
-            #     )
+
+            raise RuntimeError(
+                f"onboard wait failed: status={wait_result.status.value}, msg={wait_result.message}"
+            )
         return wait_result
 
     
-    def _offload_kvcache_impl(
+    def offload_launch(
         self,
         index_meta: KVIndexMeta,
+        kvcache_metadata: Optional[KVCacheMetadata] = None,
     ):
+        if self.secondary_kvcache_manager.backend_name == "flexkv":
+            assert kvcache_metadata is not None, "flexkv offload requires kvcache_metadata"
+
         # 1. Get the maximum batch for offloading from GPU
         # 2. Lookup host again in case of multi-GPU instances
         if self.secondary_kvcache_manager.backend_name == "native":
@@ -143,76 +169,63 @@ class KVCacheManager:
         (offload_user_ids, 
          offload_start_indices, 
          offload_page_indices_list, 
-        ) = self.gpu_kvcache_mgr.acquire_offload_pages(uids_to_offload, offloaded_lengths)
+        ) = self.gpu_kvcache_mgr.acquire_offload_pages(
+            uids_to_offload, 
+            offloaded_lengths,
+            True if self.secondary_kvcache_manager.backend_name == "flexkv" else False,
+        )
         # returned with cache pages locked (per user).
-        # Note: all pages from offload_page_indices are required to offload. duplication will be resolved when finished.
         if offload_user_ids.size(0) == 0:
             return None
 
         # 4. Launch the offloading thru Host
         task_handle = self.secondary_kvcache_manager.offload_launch_kvcache(
             offload_user_ids, offload_start_indices, offload_page_indices_list,
+            index_meta=index_meta,
+            kvcache_metadata=kvcache_metadata,
         )
-        if task_handle is None:
+        if task_handle is None or task_handle.handle is None or task_handle.status == SecondaryTaskStatus.SKIPPED:
             # offload is rejected on the host side (e.g., due to overload), release the locks immediately.
             self.gpu_kvcache_mgr.release_offload_pages(
                 offload_user_ids, offload_start_indices, self.dummy_empty_tensor,
-                offloaded=False)
+                offloaded=[0 for _ in range(offload_user_ids.size(0))])
             return None
         
+        # Launch failure is not resolved here
         self.ongoing_offload_tasks.append(task_handle)
         return task_handle
     
-    def eager_offboard_kvcache(
-        self,
-        index_meta: KVIndexMeta,
-    ) -> Optional[SecondaryTaskHandle]:
-        if self.offload_mode != KVCacheOffloadMode.EAGER:
-            return None
-        return self._offload_kvcache_impl(index_meta)
-
-
-    def lazy_offload_kvcache(
-        self,
-        index_meta: KVIndexMeta,
-    ) -> Optional[SecondaryTaskHandle]:
-        if self.offload_mode != KVCacheOffloadMode.LAZY:
-            return None
-        return self._offload_kvcache_impl(index_meta)
-        
-
-    def finish_or_cancel_kvcache_ops(self) -> None:
+    def offload_try_wait(self) -> None:
         remain_tasks = list()
-        for idx, task_handle in enumerate(self.ongoing_offload_tasks):
+        for task_handle in self.ongoing_offload_tasks:
             wait_result = self.secondary_kvcache_manager.offload_wait_kvcache(task_handle)
-            if wait_result.status in (
-                SecondaryTaskStatus.LAUNCHED,
-            ):
+            if wait_result.status == SecondaryTaskStatus.LAUNCHED:
                 remain_tasks.append(task_handle)
                 continue
-
             if wait_result.status == SecondaryTaskStatus.READY:
                 offload_success = self.secondary_kvcache_manager.finish_task(task_handle)
+            elif wait_result.status == SecondaryTaskStatus.SKIPPED:
+                # No need to release GPU pages since offload is skipped
+                continue
             elif wait_result.status in (
                 SecondaryTaskStatus.FAILED,
                 SecondaryTaskStatus.TIMEOUT,
                 SecondaryTaskStatus.CANCELLED,
             ):
-                should_raise = False  # self.secondary_fail_policy == "fail_close"
+                should_raise = self.secondary_fail_policy == "fail_close"
                 offload_success = [ 0 for _ in range(task_handle.get_user_ids().size(0)) ]
-                self.secondary_kvcache_manager.cancel_task(task_handle)
                 if should_raise:
-                    raise RuntimeError(f"{wait_result.status}")
-                    pass
+                    if self.secondary_kvcache_manager.backend_name == "flexkv":
+                        raise RuntimeError(f"Offloading failed for {wait_result.failed_user_ids}, fail_policy={self.secondary_fail_policy}")
+                self.secondary_kvcache_manager.cancel_task(task_handle)
             else:
                 raise RuntimeError(
                     f"Unexpected offload wait result status: {wait_result.status.value}, msg={wait_result.message}"
                 )
-            
             self.gpu_kvcache_mgr.release_offload_pages(
                 *(self.secondary_kvcache_manager.get_offload_handle_metadata(task_handle)),
-                offloaded=offload_success)
-            
+                offloaded=offload_success,
+            )
         self.ongoing_offload_tasks = remain_tasks
     
 
@@ -248,22 +261,42 @@ class KVCacheManager:
                 kvcache_config.dtype,
                 kvcache_config.device,
             )
-        # elif kvcache_config.secondary_backend == "flexkv":
-        #     return FlexKVStorageManager(
-        #         mode=flexkv_mode,
-        #         server_addr=flexkv_server_addr,
-        #         server_port=flexkv_server_port,
-        #         num_layers=num_layers,
-        #         num_heads=num_heads,
-        #         head_dim=head_dim,
-        #         page_size=page_size,
-        #         secondary_wait_timeout_ms=secondary_wait_timeout_ms,
-        #         secondary_fail_policy=secondary_fail_policy,
-        #     )
+        elif kvcache_config.secondary_backend == "flexkv":
+            extra = getattr(kvcache_config, "extra_configs", {}) or {}
+            flexkv_mode = extra.get("flexkv_mode", "direct")
+            flexkv_server_addr = extra.get("flexkv_server_addr", "")
+            flexkv_server_port = int(extra.get("flexkv_server_port", 0))
+            flexkv_num_cpu_blocks = int(extra.get("flexkv_num_cpu_blocks", 4096))
+            flexkv_num_local_blocks = int(extra.get("flexkv_num_local_blocks", 4096))
+            flexkv_num_tmp_cpu_blocks = int(extra.get("flexkv_num_tmp_cpu_blocks", 256))
+            flexkv_secondary_fail_policy = str(extra.get("flexkv_secondary_fail_policy", "fail_open"))
+            flexkv_enable_mps_raw = extra.get("flexkv_enable_mps", 0)
+            if isinstance(flexkv_enable_mps_raw, str):
+                flexkv_enable_mps = flexkv_enable_mps_raw.strip().lower() in {"1", "true", "yes", "on"}
+            else:
+                flexkv_enable_mps = bool(flexkv_enable_mps_raw)
+            
+            return FlexKVStorageManager(
+                mode=flexkv_mode,
+                server_addr=flexkv_server_addr,
+                server_port=flexkv_server_port,
+                num_layers=kvcache_config.num_layers,
+                num_heads=kvcache_config.num_heads,
+                head_dim=kvcache_config.head_dim,
+                page_size=kvcache_config.page_size,
+                secondary_wait_timeout_ms=int(kvcache_config.offload_timeout_ms),
+                secondary_fail_policy=flexkv_secondary_fail_policy,
+                num_cpu_blocks=flexkv_num_cpu_blocks,
+                num_local_blocks=flexkv_num_local_blocks,
+                num_tmp_cpu_blocks=flexkv_num_tmp_cpu_blocks,
+                enable_mps=flexkv_enable_mps,
+                # secondary_wait_timeout_ms=secondary_wait_timeout_ms,
+                # secondary_fail_policy=secondary_fail_policy,
+            )
         else:
-            print(f"Unknown host kvcache backend {secondary_backend}")
+            raise NotImplementedError(f"Unknown host kvcache backend {kvcache_config.secondary_backend}")
         
-        return NopSecondaryKVCacheManager()
+        return None
         
 
     @classmethod

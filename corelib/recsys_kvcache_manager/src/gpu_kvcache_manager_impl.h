@@ -74,13 +74,14 @@ public:
         at::Tensor metadata_gpu_buffer);
     void revoke_onboard_pages(
         at::Tensor& user_ids,
-        at::Tensor& onboard_page_starts,
-        at::Tensor& num_onboard_pages);
+        at::Tensor& onboard_start_indices,
+        at::Tensor& onboard_lengths);
 
     at::Tensor check_for_offload(at::Tensor& user_ids);
     std::tuple<at::Tensor, at::Tensor, std::vector<at::Tensor>> acquire_offload_pages(
         at::Tensor& user_ids,
-        at::Tensor& offloaded_lengths
+        at::Tensor& offloaded_lengths,
+        bool always_offload
     );
     void release_offload_pages(
         at::Tensor user_ids,

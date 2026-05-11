@@ -153,6 +153,10 @@ void GPUKVCacheManagerImpl::evict_offloaded(int64_t uid)
     _uid_to_paged_cache_startpos[uid] += num_offloaded_pages * this->num_tokens_per_page;
     _uid_to_paged_cache_length[uid] -= num_offloaded_pages * this->num_tokens_per_page;
     total_offloaded_pages -= num_offloaded_pages;
+
+    // CAVEAT: If _uid_to_page_id[uid].size() == 0 after evict_offloaded, a manual explicit 
+    //         eviction of uid is required from the caller. No eviction here for flexible
+    //         support for iteration on _lru_list with deletion.
 };
 
 void GPUKVCacheManagerImpl::evict_all()
@@ -418,27 +422,65 @@ at::Tensor GPUKVCacheManagerImpl::check_for_offload(
 
 void GPUKVCacheManagerImpl::revoke_onboard_pages(
     at::Tensor& user_ids,
-    at::Tensor& onboard_page_starts,
-    at::Tensor& num_onboard_pages
+    at::Tensor& onboard_start_indices,
+    at::Tensor& onboard_lengths
 ) {
     const auto batch_size = user_ids.size(0);
     for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
         int64_t uid = user_ids[seq_idx].item<int64_t>();
-        int page_start = onboard_page_starts[seq_idx].item<int>();
-        int onboard_pages = num_onboard_pages[seq_idx].item<int>();
-        for (int jdx = page_start; jdx < page_start + onboard_pages; jdx++) {
+        int onboard_startpos = onboard_start_indices[seq_idx].item<int>();
+        int onboard_length = onboard_lengths[seq_idx].item<int>();
+
+        // Simplified impl. 
+        // Assume: _uid_to_paged_cache_startpos[uid] is always 0, 
+        //         onboard_startpos is always 0, and onboard_length are always aligned.
+        // In this case, revoke_page_start is zero, and there will be no gap in cached pages.
+        int revoke_page_start = onboard_startpos / this->num_tokens_per_page;
+        int revoke_page_end = (onboard_startpos + onboard_length) / this->num_tokens_per_page;
+        int num_revoke_pages = revoke_page_end - revoke_page_start;
+
+        for (int jdx = revoke_page_start; jdx < revoke_page_end; jdx++) {
             _empty_pages.push(_uid_to_page_id[uid][jdx]);
         }
+        _uid_to_paged_cache_startpos[uid] += num_revoke_pages * this->num_tokens_per_page;
+        _uid_to_paged_cache_length[uid] -= num_revoke_pages * this->num_tokens_per_page;
         _uid_to_page_id[uid].erase(
-            _uid_to_page_id[uid].begin() + page_start, 
-            _uid_to_page_id[uid].begin() + page_start + onboard_pages);
+            _uid_to_page_id[uid].begin() + revoke_page_start, 
+            _uid_to_page_id[uid].begin() + revoke_page_start + num_revoke_pages);
+        if (_uid_to_page_id[uid].size() == 0) {
+            evict(uid);
+        }
     }
 }
 
 std::tuple<at::Tensor, at::Tensor, std::vector<at::Tensor>> GPUKVCacheManagerImpl::acquire_offload_pages(
     at::Tensor& user_ids,
-    at::Tensor& offloaded_lengths) {
+    at::Tensor& offloaded_lengths,
+    bool always_offload) {
     const auto batch_size = user_ids.size(0);
+
+    if (always_offload) {
+        std::vector<int> offload_startpos(user_ids.size(0), 0);
+        std::vector<at::Tensor> offload_page_ids_list;
+        for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
+            int64_t uid = user_ids[seq_idx].item<int64_t>();
+            if (this->_uid_to_page_id.find(uid) == this->_uid_to_page_id.end()) {
+                offload_page_ids_list.push_back(at::empty({0}, at::dtype(torch::kInt32)));
+                continue;
+            }
+
+            offload_page_ids_list.push_back(at::from_blob(
+                this->_uid_to_page_id[uid].data(), {this->_uid_to_page_id[uid].size()}, at::dtype(torch::kInt32)
+            ));
+            this->_uid_offload_lock[uid] += 1;
+        }
+        return std::make_tuple(
+            user_ids.clone(),
+            at::from_blob(offload_startpos.data(), {offload_startpos.size()}, at::dtype(torch::kInt32)).clone(),
+            offload_page_ids_list
+        );
+    }
+
 
     std::vector<int64_t> offload_user_ids;
     std::vector<int> offload_startpos;
@@ -487,8 +529,11 @@ void GPUKVCacheManagerImpl::release_offload_pages(
     const std::vector<int>& offloaded) {
     for (auto idx = 0; idx < user_ids.size(0); idx++) {
         int64_t uid = user_ids[idx].item<int64_t>();
+        if (this->_uid_offload_lock.find(uid) == this->_uid_offload_lock.end())
+            continue;
+        
         this->_uid_offload_lock[uid] -= 1;
-        if (this->_uid_offload_lock[uid] == 0) {
+        if (this->_uid_offload_lock[uid] <= 0) {
             this->_uid_offload_lock.erase(uid);
         }
         if (offloaded[idx]) {

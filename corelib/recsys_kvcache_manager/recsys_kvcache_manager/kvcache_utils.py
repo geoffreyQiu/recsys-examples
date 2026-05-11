@@ -5,8 +5,8 @@ import time
 import numpy as np
 import torch
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
-from typing import Any, List, Dict, Optional, Tuple, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 from abc import ABC, abstractmethod
 from enum import Enum
 
@@ -30,6 +30,8 @@ class KVLookupResult:
     # new_tokens_upper_bound: int
     token_ids: Optional[torch.Tensor] = None
     token_mask: Optional[torch.Tensor] = None
+
+    extra: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def merge(cls, lookup_res1, lookup_res2):
@@ -67,15 +69,20 @@ class KVLookupResult:
             cached_start_indices[i] = cached_start_ind
             cached_lengths[i] = cached_len
 
+        assert (getattr(lookup_res1, "extra", {}) or {}) == {}, "GPU lookup results should not have extra fields."
+        merged_extra = (getattr(lookup_res2, "extra", {}) or {})
+
         merged_lookup_result = cls(
             user_ids=lookup_res1.user_ids,
-            # total_history_lengths=lookup_res1.total_history_lengths,
             cached_start_indices=cached_start_indices,
             cached_lengths=cached_lengths,
             gpu_cached_start_indices=lookup_res1.gpu_cached_start_indices,
             gpu_cached_lengths=lookup_res1.gpu_cached_lengths,
             host_cached_start_indices=lookup_res2.host_cached_start_indices,
             host_cached_lengths=lookup_res2.host_cached_lengths,
+            # token_ids=lookup_res1.token_ids if lookup_res1.token_ids is not None else lookup_res2.token_ids,
+            # token_mask=lookup_res1.token_mask if lookup_res1.token_mask is not None else lookup_res2.token_mask,
+            extra=merged_extra,
         )
         return merged_lookup_result
 
@@ -84,3 +91,12 @@ class KVLookupResult:
 class KVIndexMeta:
     user_ids: torch.Tensor
     seq_lengths: torch.Tensor
+
+
+@dataclass
+class FlexKVIndexMeta(KVIndexMeta):
+    batch_size: int = 0
+
+    token_ids: Optional[torch.Tensor] = None
+    token_mask: Optional[torch.Tensor] = None
+    namespaces: Optional[List[str]] = None

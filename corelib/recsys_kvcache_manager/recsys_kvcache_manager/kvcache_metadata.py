@@ -50,6 +50,9 @@ class KVCacheMetadata:
 
     max_seqlen: Optional[int] = 0
 
+    onboard_slot_mappings: Optional[List[torch.Tensor]] = None
+    onboard_task_ids: Optional[torch.Tensor] = None
+
 
 def get_kvcache_metadata_buffer(
     batch_size: int, 
@@ -57,8 +60,11 @@ def get_kvcache_metadata_buffer(
     num_pages: int,
     page_ids_gpu_buffer: Optional[torch.Tensor] = None,
     metadata_gpu_buffer: Optional[torch.Tensor] = None,
-    device: Optional[int] = torch.cuda.current_device(),
+    device: Optional[int] = None,
 ):
+    if device is None:
+        device = torch.cuda.current_device()
+        
     page_ids_gpu_buffer = torch.empty(
         (num_pages,),
         dtype=torch.int32,
@@ -101,6 +107,7 @@ def get_kvcache_metadata_buffer(
         new_history_offsets=new_history_offsets,
         batch_indices=batch_indices_buffer,
         position=position_buffer,
+        batch_size=batch_size,
         new_history_nnz=num_new_tokens,
         new_history_nnz_cuda=new_history_nnz_cuda,
     )
@@ -122,6 +129,7 @@ def copy_kvcache_metadata(dst_metadata: KVCacheMetadata, src_metata: KVCacheMeta
     copy_tensor(dst_metadata.position, src_metata.position)
     copy_tensor(dst_metadata.new_history_nnz_cuda, src_metata.new_history_nnz_cuda)
     copy_offsets(dst_metadata.total_history_offsets, src_metata.total_history_offsets)
+    copy_offsets(dst_metadata.new_history_offsets, src_metata.new_history_offsets)
 
     dst_metadata.new_history_nnz = src_metata.new_history_nnz
 
