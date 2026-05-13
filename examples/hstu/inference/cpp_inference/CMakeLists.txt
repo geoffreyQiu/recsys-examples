@@ -17,7 +17,7 @@ find_library(FBGEMM_HSTU_EXPERIMENTAL_LIB fbgemm_gpu_experimental_hstu
   PATH_SUFFIXES lib lib64
   NO_DEFAULT_PATH)
 
-find_library(NVE_TORCH_OPS_LIB nve_torch_ops
+find_library(NVE_TORCH_OPS_LIB nve-torch-ops
   PATHS /usr/local/lib/python3.12/dist-packages/pynve
   PATH_SUFFIXES lib lib64
   NO_DEFAULT_PATH REQUIRED)

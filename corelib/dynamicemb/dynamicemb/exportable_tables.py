@@ -654,14 +654,14 @@ def apply_inference_embedding_collection(
 
         embedding_configs = None
         for parent_name, parent_module in model.named_modules():
-            if parent_name == name.strip("embeddings")[:-1]:
+            if parent_name == name.removesuffix(".embeddings"):
                 embedding_configs = parent_module.embedding_configs()
                 break
         assert (
             embedding_configs is not None
-        ), f"Cannot find embedding configs from parent module {name.strip('embeddings')[:-1]}"
+        ), f"Cannot find embedding configs from parent module {name.removesuffix('.embeddings')}"
 
-        parent_name = name.strip("embeddings")[:-1]
+        parent_name = name.removesuffix(".embeddings")
         check_modules.add(name)
         check_modules.add(parent_name)
 
@@ -686,7 +686,7 @@ def apply_inference_embedding_collection(
             len(use_dynamic) > 0
         ), "At least one table in the embedding collection module should have a config in dynamic_table_configs."
         assert (
-            len({use_dynamic.values()}) == 1
+            len(set(use_dynamic.values())) == 1
         ), f"All tables in the same embedding collection module should have the same config in dynamic_table_configs. Got:\n{use_dynamic}"
         use_dynamic = list(use_dynamic.values())[0]
 

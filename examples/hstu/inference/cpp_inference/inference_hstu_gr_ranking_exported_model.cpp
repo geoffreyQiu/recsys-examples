@@ -280,7 +280,7 @@ bool run_one_round(
     auto end = std::chrono::steady_clock::now();
 
     std::chrono::duration<double> elapsed_seconds = end-start;
-    std::cout << "elapsed time: " << elapsed_seconds.count() << "s\n";
+    std::cout << "[INFO] C++ inference elapsed time: " << elapsed_seconds.count() << "s\n";
   }
 
   return true;
@@ -344,15 +344,17 @@ int main(int argc, char** argv) {
 
     int passed = 0;
     int total = 0;
-    // for (int idx : batch_indices) {
-    //   ++total;
-    //   if (run_one_batch(loader, cfg.dump_dir, idx, device)) {
-    //     ++passed;
-    //   }
-    // }
+    for (int idx : batch_indices) {
+      ++total;
+      if (run_one_batch(loader, cfg.dump_dir, idx, device)) {
+        ++passed;
+      }
+    }
+    std::cout << "[INFO] max_abs_diff<=0.0625 passed " << passed << "/" << total << " batches.\n";
+
+    // Benchmark with all batches in a single run.
     run_one_round(loader, cfg.dump_dir, batch_indices, device);
 
-    std::cout << "[INFO] max_abs_diff<=0.0625 passed " << passed << "/" << total << " batches.\n";
     return (passed == total) ? 0 : 2;
   } catch (const c10::Error& e) {
     std::cerr << "PyTorch error: " << e.what() << std::endl;

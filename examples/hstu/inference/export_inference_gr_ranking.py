@@ -306,7 +306,7 @@ def export_inference_gr_ranking(
             debug_print_flattened_export_args(batch, embeddings)
 
         # export & aoti_compile_and_package
-        export_dir = os.path.join(os.path.dirname(__file__), "hstu_gr_ranking_modelxxx")
+        export_dir = os.path.join(os.path.dirname(__file__), "hstu_gr_ranking_model")
         export_aot(model, (batch,), export_dir, dynamic_shapes=dynamic_shapes)
         print(f"[INFO] Exported and packaged the model to:")
         print(f"       {export_dir}/")
@@ -409,9 +409,9 @@ def export_inference_gr_ranking(
                 for b in inputs:
                     logits = compiled_model(
                         (
-                            batch.features.values(),
-                            batch.features.lengths(),
-                            batch.num_candidates,
+                            b.features.values(),
+                            b.features.lengths(),
+                            b.num_candidates,
                         )
                     )
                     results.append(logits)
@@ -434,7 +434,7 @@ def export_inference_gr_ranking(
             start = time.perf_counter()
             with torch.inference_mode():
                 for b in inputs:
-                    ref_logits = model(batch)
+                    ref_logits = model(b)
                     results.append(ref_logits)
             torch.cuda.synchronize()
             end = time.perf_counter()

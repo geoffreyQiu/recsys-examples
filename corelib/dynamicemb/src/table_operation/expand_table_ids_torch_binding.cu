@@ -101,7 +101,7 @@ at::Tensor expand_table_ids_cuda_impl(
 at::Tensor expand_table_ids_meta_impl(
     at::Tensor offsets, at::Tensor indices, c10::optional<at::Tensor> table_offsets_in_feature,
     int64_t num_tables, int64_t local_batch_size) {
-    return at::empty_like(indices);
+    return at::empty_like(indices, at::TensorOptions().dtype(at::kLong));
 }
 
 } // namespace dyn_emb

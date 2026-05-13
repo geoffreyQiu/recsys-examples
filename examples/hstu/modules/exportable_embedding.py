@@ -130,10 +130,10 @@ class ExportableEmbedding(torch.nn.Module):
     ):
         super(ExportableEmbedding, self).__init__()
         assert (
-            len({type(config) for config in static_embedding_configs}) == 1
+            len({type(config) for config in static_embedding_configs}) <= 1
         ), "All embedding configs should be of the same type, either EmbeddingConfig or RecsysEmbeddingConfig"
         assert (
-            len({type(config) for config in dynamic_embedding_configs}) == 1
+            len({type(config) for config in dynamic_embedding_configs}) <= 1
         ), "All embedding configs should be of the same type, either EmbeddingConfig or RecsysEmbeddingConfig"
 
         for idx, config in enumerate(static_embedding_configs):

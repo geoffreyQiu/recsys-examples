@@ -44,9 +44,6 @@ def _expand_table_ids_fake(
             "INFERENCE_EMB::expand_table_ids expects local_batch_size > 0"
         )
 
-    if num_elements < 0:
-        raise RuntimeError("INFERENCE_EMB::expand_table_ids expects num_elements >= 0")
-
     return torch.empty_like(indices, dtype=torch.int64)
 
 
