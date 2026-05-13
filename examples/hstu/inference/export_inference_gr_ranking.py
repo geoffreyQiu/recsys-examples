@@ -26,11 +26,9 @@ from commons.datasets import get_data_loader
 from commons.datasets.hstu_sequence_dataset import get_dataset
 from commons.hstu_data_preprocessor import get_common_preprocessors
 from commons.utils.stringify import stringify_dict
-from configs import InferenceEmbeddingConfig
 from megatron.core import parallel_state
 from model import get_ranking_model
-from model.inference_ranking_gr import InferenceRankingGR
-from modules.exportable_embedding import apply_inference_embedding
+from model.inference_ranking_gr import InferenceRankingGR, apply_inference
 from modules.inference_dense_module import InferenceDenseModule
 from modules.metrics import get_multi_event_metric_module
 from pynve.torch.nve_export import export_aot
@@ -109,73 +107,48 @@ def debug_print_flattened_export_args(batch, embeddings=None) -> None:
 def get_inference_dataset_and_embedding_configs(
     disable_contextual_features: bool = False,
 ):
-    dataset_args = DatasetArgs()
-    embedding_dim = NetworkArgs().hidden_size
-    HASH_SIZE = 1000_064
+    sys.path.append("./training/")
+    from trainer.utils import get_dataset_and_embedding_args, create_embedding_configs
+
+    dataset_args, embedding_args = get_dataset_and_embedding_args()
+    embedding_configs = create_embedding_configs(
+        dataset_args,
+        NetworkArgs(),
+        embedding_args,
+    )
+
     if dataset_args.dataset_name == "kuairand-1k":
-        embedding_configs = [
-            InferenceEmbeddingConfig(
-                feature_names=["user_id"],
-                table_name="user_id",
-                vocab_size=1000,
-                dim=embedding_dim,
-                use_dynamicemb=True,
-            ),
-            InferenceEmbeddingConfig(
-                feature_names=["user_active_degree"],
-                table_name="user_active_degree",
-                vocab_size=8,
-                dim=embedding_dim,
-                use_dynamicemb=False,
-            ),
-            InferenceEmbeddingConfig(
-                feature_names=["follow_user_num_range"],
-                table_name="follow_user_num_range",
-                vocab_size=9,
-                dim=embedding_dim,
-                use_dynamicemb=False,
-            ),
-            InferenceEmbeddingConfig(
-                feature_names=["fans_user_num_range"],
-                table_name="fans_user_num_range",
-                vocab_size=9,
-                dim=embedding_dim,
-                use_dynamicemb=False,
-            ),
-            InferenceEmbeddingConfig(
-                feature_names=["friend_user_num_range"],
-                table_name="friend_user_num_range",
-                vocab_size=8,
-                dim=embedding_dim,
-                use_dynamicemb=False,
-            ),
-            InferenceEmbeddingConfig(
-                feature_names=["register_days_range"],
-                table_name="register_days_range",
-                vocab_size=8,
-                dim=embedding_dim,
-                use_dynamicemb=False,
-            ),
-            InferenceEmbeddingConfig(
-                feature_names=["video_id"],
-                table_name="video_id",
-                vocab_size=HASH_SIZE,
-                dim=embedding_dim,
-                use_dynamicemb=True,
-            ),
-            InferenceEmbeddingConfig(
-                feature_names=["action_weights"],
-                table_name="action_weights",
-                vocab_size=256,
-                dim=embedding_dim,
-                use_dynamicemb=False,
-            ),
-        ]
+        HASH_SIZE = 1000_064
+        dynamic_table_configs = {
+            "user_id":                  True,
+            "user_active_degree":       False,
+            "follow_user_num_range":    False,
+            "fans_user_num_range":      False,
+            "friend_user_num_range":    False,
+            "register_days_range":      False,
+            "video_id":                 True,
+            "action_weights":           False,
+        }
+        trained_emb_table_sizes = {
+            "user_id":                  1000,
+            "user_active_degree":       8,
+            "follow_user_num_range":    9,
+            "fans_user_num_range":      9,
+            "friend_user_num_range":    8,
+            "register_days_range":      8,
+            "video_id":                 HASH_SIZE,
+            "action_weights":           233,
+        }
+        for idx, config in enumerate(embedding_configs):
+            config.vocab_size = trained_emb_table_sizes[config.table_name]
+            config.use_dynamic = dynamic_table_configs[config.table_name]
         return (
             dataset_args,
             embedding_configs
             if not disable_contextual_features
             else embedding_configs[-2:],
+            dynamic_table_configs,
+            trained_emb_table_sizes,
         )
 
     raise ValueError(f"dataset {dataset_args.dataset_name} is not supported")
@@ -194,56 +167,16 @@ def get_training_gr_model():
     return model
 
 
-def apply_inference(
-    training_model: torch.nn.Module,
-    inference_emb_table_order: List[str],
-    trained_emb_table_sizes: Dict[str, int],
-    checkpoint_dir: str,
-):
-    model = apply_inference_embedding(
-        training_model,
-        table_order=inference_emb_table_order,
-        trained_emb_table_sizes=trained_emb_table_sizes,
-    )
-
-    dense_module = InferenceDenseModule(
-        hstu_config=model._hstu_config,
-        kvcache_config=None,  # kvcache_config is not needed for export
-        task_config=model._task_config,
-        use_exportable=True,
-        hstu_block=model._hstu_block,
-        mlp=model._mlp,
-    )
-    dense_module.eval()
-
-    inference_model = InferenceRankingGR(
-        model._embedding_collection,
-        dense_module,
-    )
-    if model._hstu_config.bf16:
-        inference_model.bfloat16()
-    elif model._hstu_config.fp16:
-        inference_model.half()
-
-    inference_model.load_checkpoint(checkpoint_dir)
-    inference_model = inference_model.eval()
-
-    return inference_model
-
-
 def get_exportable_model_for_inference(
-    inference_emb_configs,
+    dynamic_table_configs,
+    trained_emb_table_sizes,
     checkpoint_dir,
 ):
     model = get_training_gr_model()
     inference_model = apply_inference(
         model,
-        inference_emb_table_order=[
-            config.table_name for config in inference_emb_configs
-        ],
-        trained_emb_table_sizes={
-            config.table_name: config.vocab_size for config in inference_emb_configs
-        },
+        dynamic_table_configs=dynamic_table_configs,
+        trained_emb_table_sizes=trained_emb_table_sizes,
         checkpoint_dir=checkpoint_dir,
     )
     return inference_model
@@ -269,7 +202,12 @@ def export_inference_gr_ranking(
         wrapper = _TensorWrapper(tensor)
         torch.jit.script(wrapper).save(path)
 
-    dataset_args, inference_emb_configs = get_inference_dataset_and_embedding_configs()
+    (
+        dataset_args, 
+        _,
+        dynamic_table_configs, 
+        trained_emb_table_sizes,
+    ) = get_inference_dataset_and_embedding_configs()
 
     dataproc = get_common_preprocessors("")[dataset_args.dataset_name]
     num_contextual_features = len(dataproc._contextual_feature_names)
@@ -300,7 +238,8 @@ def export_inference_gr_ranking(
         register_hstu_export_pytrees()
 
         model = get_exportable_model_for_inference(
-            inference_emb_configs,
+            dynamic_table_configs,
+            trained_emb_table_sizes,    
             checkpoint_dir,
         )
 
@@ -357,8 +296,9 @@ def export_inference_gr_ranking(
         sc = ShapesCollection()
         dim_batch = Dim("batch_size", min=1, max=8)
 
+        num_features = len(batch.features.keys())
         sc[batch.features.values()] = {0: Dim("tokens", min=1, max=40000)}
-        sc[batch.features.lengths()] = {0: dim_batch * len(inference_emb_configs)}
+        sc[batch.features.lengths()] = {0: dim_batch * num_features}
         sc[batch.num_candidates] = {0: dim_batch}
         dynamic_shapes = sc.dynamic_shapes(model, (batch,))
         print(f"[INFO] Dynamic shapes: {dynamic_shapes}")
@@ -368,7 +308,7 @@ def export_inference_gr_ranking(
             debug_print_flattened_export_args(batch, embeddings)
 
         # export & aoti_compile_and_package
-        export_dir = os.path.join(os.path.dirname(__file__), "hstu_gr_ranking_model")
+        export_dir = os.path.join(os.path.dirname(__file__), "hstu_gr_ranking_modelxxx")
         export_aot(model, (batch,), export_dir, dynamic_shapes=dynamic_shapes)
         print(f"[INFO] Exported and packaged the model to:")
         print(f"       {export_dir}/")

@@ -39,3 +39,25 @@ def _lengths_reduce_dim1_fake(lengths_1d, num_splits: int):
 
     # num_splits is static at export time.
     return lengths_1d.new_empty((num_splits,))
+
+
+@torch.library.register_fake("hstu_cuda_ops::permute_and_split")
+def _permute_and_split_fake(jagged_features, jagged_lengths, jagged_offsets, num_static_features: int, num_dynamic_features: int, features_order: list):
+    # num_static_features and num_dynamic_features are static at export time.
+
+    torch._check(jagged_features.dim() == 1)
+    torch._check(jagged_lengths.dim() == 1)
+    torch._check(num_static_features > 0)
+    torch._check(num_dynamic_features > 0)
+
+    num_features = num_static_features + num_dynamic_features
+    ctx = torch.library.get_ctx()
+    static_output_len = ctx.new_dynamic_size()
+    dynamic_output_len = ctx.new_dynamic_size()
+    out = [
+        jagged_features.new_empty((static_output_len,)),
+        jagged_features.new_empty((dynamic_output_len,)),
+        jagged_lengths.new_empty(((jagged_lengths.size(0) // num_features) * num_static_features,)),
+        jagged_lengths.new_empty(((jagged_lengths.size(0) // num_features) * num_dynamic_features,)),
+    ]
+    return out

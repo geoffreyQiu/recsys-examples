@@ -491,3 +491,20 @@ def get_inference_dense_model(
         cudagraph_configs,
         use_exportable,
     )
+
+def apply_inference_hstu_dense(
+    hstu_config: Union[HSTUConfig, InferenceHSTUConfig],
+    kvcache_config: Optional[KVCacheConfig],
+    task_config: RankingConfig,
+    hstu_block: torch.nn.Module,
+    mlp: torch.nn.Module,
+    use_exportable: bool,
+):
+    return InferenceDenseModule(
+        hstu_config,
+        kvcache_config,
+        task_config,
+        use_exportable=use_exportable,
+        hstu_block=hstu_block,
+        mlp=mlp,
+    )
