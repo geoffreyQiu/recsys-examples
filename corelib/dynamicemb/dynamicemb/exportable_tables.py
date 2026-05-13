@@ -9,29 +9,27 @@ This module owns:
 3. The `InferenceLinearBucketTable` and `InferenceEmbeddingTable` implementations
 """
 
-import os
-from typing import Dict, List, Optional, Union
-from dataclasses import dataclass
 import itertools
+import os
+from typing import Dict, List, Optional
 
 import pynve.torch.nve_layers as nve_layers
 import torch
-from dynamicemb.batched_dynamicemb_tables import (
-    encode_meta_json_file_path,
-    get_loading_files,
-)
 from dynamicemb import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
     DynamicEmbTableOptions,
 )
+from dynamicemb.batched_dynamicemb_tables import (
+    encode_meta_json_file_path,
+    get_loading_files,
+)
 from dynamicemb.key_value_table import _iter_batches_from_files, load_from_json
 from dynamicemb.scored_hashtable import ScorePolicy
 from dynamicemb_extensions import table_insert
-from torchrec.modules.embedding_configs import (
-    EmbeddingConfig,
-)
 from torch.nn import ModuleDict
+from torchrec.modules.embedding_configs import EmbeddingConfig
+
 # ---------------------------------------------------------------------------
 # Helpers for InferenceEmbeddingTable construction
 # ---------------------------------------------------------------------------
@@ -215,7 +213,7 @@ class InferenceEmbeddingCollection(torch.nn.Module):
         key_type: torch.dtype = torch.int64,
     ):
         super().__init__()
-        self.embedding_configs : List[EmbeddingConfig] = table_options
+        self.embedding_configs: List[EmbeddingConfig] = table_options
 
         if pooling_mode not in (-1, 1, 2):
             raise ValueError(
@@ -238,7 +236,7 @@ class InferenceEmbeddingCollection(torch.nn.Module):
             table_names = [f"table_{i}" for i in range(num_tables)]
         if len(table_names) != num_tables:
             raise ValueError("table_names size must match table_options")
-        
+
         if feature_table_map is None:
             feature_table_map = list(range(num_tables))
         if not isinstance(feature_table_map, list) or len(feature_table_map) == 0:
@@ -333,7 +331,7 @@ class InferenceEmbeddingCollection(torch.nn.Module):
                 optimize_for_training=False,
                 device=device,
             )
-    
+
     def load_from_embedding_table(self, table_weights: torch.Tensor) -> None:
         """Load embedding weights from a pre-extracted table tensor.
 
@@ -343,27 +341,39 @@ class InferenceEmbeddingCollection(torch.nn.Module):
         Args:
             table_weights: (sum of all table capacities, emb_dim) float tensor containing the embedding weights for all tables, ordered by table and then by row within each table.
         """
-        assert table_weights.size(0) <= self.nve_embedding_.weight.size(0) - self.num_tables_, (
-            f"Provided table_weights has more rows ({table_weights.size(0)}) than the NVE embedding capacity ({self.nve_embedding_.weight.size(0) - self.num_tables_} excluding for reserved 'not found' rows)"
-        )
-        assert table_weights.size(1) == self.emb_dim_, (
-            f"Provided table_weights has embedding dim {table_weights.size(1)}, expected {self.emb_dim_}"
-        )
-        
+        assert (
+            table_weights.size(0)
+            <= self.nve_embedding_.weight.size(0) - self.num_tables_
+        ), f"Provided table_weights has more rows ({table_weights.size(0)}) than the NVE embedding capacity ({self.nve_embedding_.weight.size(0) - self.num_tables_} excluding for reserved 'not found' rows)"
+        assert (
+            table_weights.size(1) == self.emb_dim_
+        ), f"Provided table_weights has embedding dim {table_weights.size(1)}, expected {self.emb_dim_}"
+
         self.nve_embedding_.weight.data.zero_()  # zero out the "not found" row in each table
         for table_id in range(self.num_tables_):
-            self.nve_embedding_.weight.data[self.table_offsets_[table_id].item(), :].zero_()  
+            self.nve_embedding_.weight.data[
+                self.table_offsets_[table_id].item(), :
+            ].zero_()
 
-            current_offsets = self.table_offsets_[table_id].item()  # table_offsets_ already skipped the reserved row
+            current_offsets = self.table_offsets_[
+                table_id
+            ].item()  # table_offsets_ already skipped the reserved row
             original_offsets = self.table_offsets_[table_id].item() - table_id - 1
-            num_rows = int(self.capacity_list_[table_id].item()) - 1  # exclude reserved row
+            num_rows = (
+                int(self.capacity_list_[table_id].item()) - 1
+            )  # exclude reserved row
             if table_id == self.num_tables_ - 1:
-                num_rows = table_weights.size(0) - original_offsets  # use remaining rows for the last table
+                num_rows = (
+                    table_weights.size(0) - original_offsets
+                )  # use remaining rows for the last table
 
-            self.nve_embedding_.weight.data[current_offsets : current_offsets + num_rows, :].copy_(
-                table_weights[original_offsets : original_offsets + num_rows, :].to(self.nve_embedding_.weight.dtype)
+            self.nve_embedding_.weight.data[
+                current_offsets : current_offsets + num_rows, :
+            ].copy_(
+                table_weights[original_offsets : original_offsets + num_rows, :].to(
+                    self.nve_embedding_.weight.dtype
+                )
             )
-
 
     def load_from_dynamicemb_file(
         self,
@@ -560,10 +570,17 @@ def create_inference_embedding_collection(
     use_dynamic: bool = True,
 ) -> InferenceEmbeddingCollection:
     table_names = [config.name for config in embedding_configs]
-    feature_names = list(itertools.chain(*[config.feature_names for config in embedding_configs]))
-    feature_table_map = list(itertools.chain(*[
-        [idx] * len(config.feature_names) for idx, config in enumerate(embedding_configs)
-    ]))
+    feature_names = list(
+        itertools.chain(*[config.feature_names for config in embedding_configs])
+    )
+    feature_table_map = list(
+        itertools.chain(
+            *[
+                [idx] * len(config.feature_names)
+                for idx, config in enumerate(embedding_configs)
+            ]
+        )
+    )
     table_options = [
         DynamicEmbTableOptions(
             embedding_dtype=torch.float32,
@@ -608,14 +625,25 @@ def apply_inference_embedding_collection(
 
     check_modules = set()
     while True:
+        name = None
         for name, module in model.named_modules():
             if isinstance(module, ModuleDict):
-                submodules = [ submodule for name, submodule in module.named_modules() if name != "" ]
+                submodules = [
+                    submodule
+                    for name, submodule in module.named_modules()
+                    if name != ""
+                ]
                 # skip if not torchrec.EmbeddingCollection
-                if len({ type(m) for m in submodules }) != 1 or not isinstance(submodules[0], Embedding):
+                if len({type(m) for m in submodules}) != 1 or not isinstance(
+                    submodules[0], Embedding
+                ):
                     continue
                 # skip if already converted
-                if isinstance(module, nve_layers.NVEmbedding) or isinstance(module, nve_layers.NVEmbeddingBag) or isinstance(module, InferenceEmbeddingCollection):
+                if (
+                    isinstance(module, nve_layers.NVEmbedding)
+                    or isinstance(module, nve_layers.NVEmbeddingBag)
+                    or isinstance(module, InferenceEmbeddingCollection)
+                ):
                     continue
                 # skip if already checked
                 if name in check_modules:
@@ -623,13 +651,15 @@ def apply_inference_embedding_collection(
                 break
         else:
             break
-        
+
         embedding_configs = None
         for parent_name, parent_module in model.named_modules():
             if parent_name == name.strip("embeddings")[:-1]:
                 embedding_configs = parent_module.embedding_configs()
                 break
-        assert embedding_configs is not None, f"Cannot find embedding configs from parent module {name.strip("embeddings")[:-1]}"
+        assert (
+            embedding_configs is not None
+        ), f"Cannot find embedding configs from parent module {name.strip('embeddings')[:-1]}"
 
         parent_name = name.strip("embeddings")[:-1]
         check_modules.add(name)
@@ -639,13 +669,25 @@ def apply_inference_embedding_collection(
         # TODO(junyiq): Try exact the freezed vocab size from embedding files/model states.
         for config in embedding_configs:
             if config.name not in trained_emb_table_sizes:
-                print(f"[WARNING] Table {config.name} in module {name} is missing the trained vocab size for inference.\n"
-                    + f"          Using {config.vocab_size} rows from the training config.")
-            config.num_embeddings = trained_emb_table_sizes.get(config.name, config.num_embeddings)
+                print(
+                    f"[WARNING] Table {config.name} in module {name} is missing the trained vocab size for inference.\n"
+                    + f"          Using {config.vocab_size} rows from the training config."
+                )
+            config.num_embeddings = trained_emb_table_sizes.get(
+                config.name, config.num_embeddings
+            )
 
-        use_dynamic = { config.name: dynamic_table_configs[config.name] for config in embedding_configs if config.name in dynamic_table_configs }
-        assert len(use_dynamic) > 0, "At least one table in the embedding collection module should have a config in dynamic_table_configs."
-        assert len({use_dynamic.values()}) == 1, f"All tables in the same embedding collection module should have the same config in dynamic_table_configs. Got:\n{use_dynamic}"
+        use_dynamic = {
+            config.name: dynamic_table_configs[config.name]
+            for config in embedding_configs
+            if config.name in dynamic_table_configs
+        }
+        assert (
+            len(use_dynamic) > 0
+        ), "At least one table in the embedding collection module should have a config in dynamic_table_configs."
+        assert (
+            len({use_dynamic.values()}) == 1
+        ), f"All tables in the same embedding collection module should have the same config in dynamic_table_configs. Got:\n{use_dynamic}"
         use_dynamic = list(use_dynamic.values())[0]
 
         pooling_config = getattr(embedding_configs[0], "pooling", "NONE")
@@ -666,7 +708,9 @@ def apply_inference_embedding_collection(
         assert isinstance(embedding_collection, InferenceEmbeddingCollection)
         embedding_collection.embedding_configs = embedding_configs
 
-        exec("model."+parent_name+"=embedding_collection")
-        print(f"[INFO] converting {parent_name} to InferenceEmbeddingCollection with use_dynamic={use_dynamic} and tables={embedding_collection.table_names_}")
+        exec("model." + parent_name + "=embedding_collection")
+        print(
+            f"[INFO] converting {parent_name} to InferenceEmbeddingCollection with use_dynamic={use_dynamic} and tables={embedding_collection.table_names_}"
+        )
 
     return model

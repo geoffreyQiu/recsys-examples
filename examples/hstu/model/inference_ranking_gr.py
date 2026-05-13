@@ -13,15 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-from typing import Dict, List
+from typing import Dict
 
 import torch
 from commons.datasets.hstu_batch import HSTUBatch
 from configs import InferenceHSTUConfig, KVCacheConfig, RankingConfig
-from modules.inference_dense_module import InferenceDenseModule, apply_inference_hstu_dense
-from modules.inference_embedding import InferenceEmbedding
 from dynamicemb.exportable_tables import apply_inference_embedding_collection
 from modules.exportable_embedding import apply_inference_sparse
+from modules.inference_dense_module import (
+    InferenceDenseModule,
+    apply_inference_hstu_dense,
+)
+from modules.inference_embedding import InferenceEmbedding
+
 
 class InferenceRankingGR(torch.nn.Module):
     """

@@ -492,6 +492,7 @@ def get_inference_dense_model(
         use_exportable,
     )
 
+
 def apply_inference_hstu_dense(
     hstu_config: Union[HSTUConfig, InferenceHSTUConfig],
     kvcache_config: Optional[KVCacheConfig],

@@ -14,10 +14,10 @@
 # limitations under the License.
 
 import os
+from dataclasses import dataclass
 
 # pyre-strict
-from typing import Any, Dict, List, Optional, Union
-from dataclasses import dataclass
+from typing import Dict, List, Optional, Union
 
 import torch
 
@@ -73,10 +73,12 @@ import commons.ops.cuda_ops.fake_hstu_cuda_ops  # noqa: F401 – registers fake 
 # ---------------------------------------------------------------------------
 
 
-from commons.modules.embedding import ShardedEmbeddingConfig, ShardedEmbedding
-
+from commons.modules.embedding import ShardedEmbedding, ShardedEmbeddingConfig
+from dynamicemb.exportable_tables import (
+    InferenceEmbeddingCollection,
+    create_inference_embedding_collection,
+)
 from torchrec.modules.embedding_configs import EmbeddingConfig
-from dynamicemb.exportable_tables import InferenceEmbeddingCollection
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 
@@ -91,13 +93,19 @@ def _f(keys, layer_id):
 class InferenceEmbeddingConfig(ShardedEmbeddingConfig):
     use_dynamic: bool = False
 
-    def __init__(self, config: ShardedEmbeddingConfig):
+    def __init__(
+        self, config: ShardedEmbeddingConfig, use_dynamic: Optional[bool] = None
+    ):
         self.feature_names = config.feature_names
         self.table_name = config.table_name
         self.vocab_size = config.vocab_size
         self.dim = config.dim
         self.sharding_type = config.sharding_type
-        self.use_dynamic = (self.sharding_type == "model_parallel") if use_dynamic is None else use_dynamic
+        self.use_dynamic = (
+            (self.sharding_type == "model_parallel")
+            if use_dynamic is None
+            else use_dynamic
+        )
 
 
 class ExportableEmbedding(torch.nn.Module):
@@ -111,14 +119,22 @@ class ExportableEmbedding(torch.nn.Module):
 
     def __init__(
         self,
-        static_embedding_configs: Union[List[EmbeddingConfig], List[InferenceEmbeddingConfig]],
-        dynamic_embedding_configs: Union[List[EmbeddingConfig], List[InferenceEmbeddingConfig]],
+        static_embedding_configs: Union[
+            List[EmbeddingConfig], List[InferenceEmbeddingConfig]
+        ],
+        dynamic_embedding_configs: Union[
+            List[EmbeddingConfig], List[InferenceEmbeddingConfig]
+        ],
         static_embedding_collection: Optional[InferenceEmbeddingCollection] = None,
         dynamic_embedding_collection: Optional[InferenceEmbeddingCollection] = None,
     ):
         super(ExportableEmbedding, self).__init__()
-        assert len({type(config) for config in static_embedding_configs}) == 1, "All embedding configs should be of the same type, either EmbeddingConfig or RecsysEmbeddingConfig"
-        assert len({type(config) for config in dynamic_embedding_configs}) == 1, "All embedding configs should be of the same type, either EmbeddingConfig or RecsysEmbeddingConfig"
+        assert (
+            len({type(config) for config in static_embedding_configs}) == 1
+        ), "All embedding configs should be of the same type, either EmbeddingConfig or RecsysEmbeddingConfig"
+        assert (
+            len({type(config) for config in dynamic_embedding_configs}) == 1
+        ), "All embedding configs should be of the same type, either EmbeddingConfig or RecsysEmbeddingConfig"
 
         for idx, config in enumerate(static_embedding_configs):
             if isinstance(config, InferenceEmbeddingConfig):
@@ -139,7 +155,6 @@ class ExportableEmbedding(torch.nn.Module):
 
         self._static_embedding_configs = static_embedding_configs
         self._dynamic_embedding_configs = dynamic_embedding_configs
-        
 
         if static_embedding_collection is None:
             static_embedding_collection = create_inference_embedding_collection(
@@ -152,16 +167,23 @@ class ExportableEmbedding(torch.nn.Module):
         self._static_embedding_collection = static_embedding_collection
         self._dynamic_embedding_collection = dynamic_embedding_collection
 
-        
-        self._feature_names = self._static_embedding_collection.feature_names_ + self._dynamic_embedding_collection.feature_names_
+        self._feature_names = (
+            self._static_embedding_collection.feature_names_
+            + self._dynamic_embedding_collection.feature_names_
+        )
         # per collection feature name to index mapping for splitting the output embeddings
         self._static_feature_to_index = {
-            fea_name: idx for idx, fea_name in enumerate(self._static_embedding_collection.feature_names_)
-        } 
-        self._dynamic_feature_to_index = {
-            fea_name: idx for idx, fea_name in enumerate(self._dynamic_embedding_collection.feature_names_)
+            fea_name: idx
+            for idx, fea_name in enumerate(
+                self._static_embedding_collection.feature_names_
+            )
         }
-        
+        self._dynamic_feature_to_index = {
+            fea_name: idx
+            for idx, fea_name in enumerate(
+                self._dynamic_embedding_collection.feature_names_
+            )
+        }
 
         self._has_uninitialized_input_dist = True
         self._need_features_permute = False
@@ -181,45 +203,74 @@ class ExportableEmbedding(torch.nn.Module):
             persistent=False,
         )
         if self._features_order != list(range(len(input_feature_names))):
-            print(f"[WARNING] The input feature order {input_feature_names} is different from the order in the model.")
-            print(f"          Permuting the input features to match the model order may degrade performance.")
-            print(f"          Consider changing the input feature order to {self._feature_names} to avoid unnecessary permutation.")
+            print(
+                f"[WARNING] The input feature order {input_feature_names} is different from the order in the model."
+            )
+            print(
+                f"          Permuting the input features to match the model order may degrade performance."
+            )
+            print(
+                f"          Consider changing the input feature order to {self._feature_names} to avoid unnecessary permutation."
+            )
             self._need_features_permute = True
         self._has_uninitialized_input_dist = False
 
-
-    def load_checkpoint(self, 
-        checkpoint_dir: Optional[str], 
-        model_state_dict: Optional[Any], 
+    def load_checkpoint(
+        self,
+        checkpoint_dir: Optional[str],
+        model_state_dict: Dict[str, torch.Tensor],
         static_module_name: Optional[str] = None,
         dynamic_module_name: Optional[str] = None,
     ) -> None:
         if checkpoint_dir is None:
             return
-        
-        if static_module_name is None:
-            static_module_name = "_embedding_collection._data_parallel_embedding_collection"
-        if dynamic_module_name is None:
-            dynamic_module_name = "_embedding_collection._model_parallel_embedding_collection"
-        
 
-        param_name = static_module_name + ".embeddings." + "/".join(self._static_embedding_collection.table_names_) + "_weights"
-        assert param_name in model_state_dict, "Cannot find static embedding table weights from model_state_dict"
+        if static_module_name is None:
+            static_module_name = (
+                "_embedding_collection._data_parallel_embedding_collection"
+            )
+        if dynamic_module_name is None:
+            dynamic_module_name = (
+                "_embedding_collection._model_parallel_embedding_collection"
+            )
+
+        param_name = (
+            static_module_name
+            + ".embeddings."
+            + "/".join(self._static_embedding_collection.table_names_)
+            + "_weights"
+        )
+        if param_name not in model_state_dict:
+            raise ValueError(
+                "Cannot find static embedding table weights from model_state_dict"
+            )
         static_emb_table_weights = model_state_dict[param_name].view(
             -1, self._static_embedding_collection.emb_dim_
         )
-        self._static_embedding_collection.load_from_embedding_table(static_emb_table_weights)
+        self._static_embedding_collection.load_from_embedding_table(
+            static_emb_table_weights
+        )
 
         self._dynamic_embedding_collection.load_from_dynamicemb_file(
-            os.path.join(checkpoint_dir, "dynamicemb_module", "model." + dynamic_module_name), 
-            self._dynamic_embedding_collection.table_names_
+            os.path.join(
+                checkpoint_dir, "dynamicemb_module", "model." + dynamic_module_name
+            ),
+            self._dynamic_embedding_collection.table_names_,
         )
         print(f"[INFO] Loaded embedding tables from {checkpoint_dir}")
 
-    def get_embedding_dict(self, features, lengths, use_dynamic = False):
-        feature_to_index = self._dynamic_feature_to_index if use_dynamic else self._static_feature_to_index
+    def get_embedding_dict(self, features, lengths, use_dynamic=False):
+        feature_to_index = (
+            self._dynamic_feature_to_index
+            if use_dynamic
+            else self._static_feature_to_index
+        )
         num_features = len(feature_to_index)
-        embedding_collection = self._dynamic_embedding_collection if use_dynamic else self._static_embedding_collection
+        embedding_collection = (
+            self._dynamic_embedding_collection
+            if use_dynamic
+            else self._static_embedding_collection
+        )
 
         reduce_lengths = torch.ops.hstu_cuda_ops.lengths_reduce_dim1(
             lengths, num_features
@@ -230,7 +281,7 @@ class ExportableEmbedding(torch.nn.Module):
             device=reduce_lengths.device,
         )
         offsets[1:] = torch.cumsum(reduce_lengths, dim=0)
-            
+
         total_embeddings = embedding_collection(features, offsets)
         torch._check(total_embeddings.size(1) == embedding_collection.emb_dim_)
         split_embeddings = torch.ops.hstu_cuda_ops.split_by_lengths(
@@ -262,10 +313,12 @@ class ExportableEmbedding(torch.nn.Module):
             if self._has_uninitialized_input_dist:
                 self._create_input_dist(kjt.keys(), kjt.values().device)
         else:
-            assert not self._has_uninitialized_input_dist, "Input distribution should have been initialized before compilation."
+            assert (
+                not self._has_uninitialized_input_dist
+            ), "Input distribution should have been initialized before compilation."
 
         # if self._need_features_permute:
-        #     
+        #
 
         # Step.2 split features and lengths by embedding collections
         # Using cpp bind to avoid dynamic shape tracing failure in torch.export
@@ -294,7 +347,12 @@ class ExportableEmbedding(torch.nn.Module):
             static_features_lengths,
             dynamic_features_lengths,
         ) = torch.ops.hstu_cuda_ops.permute_and_split(
-            kjt.values(), kjt.lengths(), jagged_offsets, num_static_fea, num_dynamic_fea, self._features_order
+            kjt.values(),
+            kjt.lengths(),
+            jagged_offsets,
+            num_static_fea,
+            num_dynamic_fea,
+            self._features_order,
         )
 
         # Step.4 perform embedding lookup for each collection and split the output embeddings
@@ -322,8 +380,9 @@ def get_exportable_embedding(
         static_embedding_configs,
         dynamic_embedding_configs,
         static_embedding_collection,
-        dynamic_embedding_collection
+        dynamic_embedding_collection,
     )
+
 
 def apply_inference_sparse(
     training_embedding: ShardedEmbedding,

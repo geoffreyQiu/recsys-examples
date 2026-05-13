@@ -17,7 +17,6 @@ import enum
 import os
 import sys
 import warnings
-from typing import Dict, List
 
 import gin
 import torch
@@ -28,13 +27,12 @@ from commons.hstu_data_preprocessor import get_common_preprocessors
 from commons.utils.stringify import stringify_dict
 from megatron.core import parallel_state
 from model import get_ranking_model
-from model.inference_ranking_gr import InferenceRankingGR, apply_inference
-from modules.inference_dense_module import InferenceDenseModule
+from model.inference_ranking_gr import apply_inference
 from modules.metrics import get_multi_event_metric_module
 from pynve.torch.nve_export import export_aot
 from torch.export import Dim, ShapesCollection
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
-from utils import DatasetArgs, NetworkArgs, TensorModelParallelArgs
+from utils import NetworkArgs, TensorModelParallelArgs
 
 sys.path.append("./training/")
 from pretrain_gr_ranking import create_ranking_config
@@ -108,7 +106,7 @@ def get_inference_dataset_and_embedding_configs(
     disable_contextual_features: bool = False,
 ):
     sys.path.append("./training/")
-    from trainer.utils import get_dataset_and_embedding_args, create_embedding_configs
+    from trainer.utils import create_embedding_configs, get_dataset_and_embedding_args
 
     dataset_args, embedding_args = get_dataset_and_embedding_args()
     embedding_configs = create_embedding_configs(
@@ -120,24 +118,24 @@ def get_inference_dataset_and_embedding_configs(
     if dataset_args.dataset_name == "kuairand-1k":
         HASH_SIZE = 1000_064
         dynamic_table_configs = {
-            "user_id":                  True,
-            "user_active_degree":       False,
-            "follow_user_num_range":    False,
-            "fans_user_num_range":      False,
-            "friend_user_num_range":    False,
-            "register_days_range":      False,
-            "video_id":                 True,
-            "action_weights":           False,
+            "user_id": True,
+            "user_active_degree": False,
+            "follow_user_num_range": False,
+            "fans_user_num_range": False,
+            "friend_user_num_range": False,
+            "register_days_range": False,
+            "video_id": True,
+            "action_weights": False,
         }
         trained_emb_table_sizes = {
-            "user_id":                  1000,
-            "user_active_degree":       8,
-            "follow_user_num_range":    9,
-            "fans_user_num_range":      9,
-            "friend_user_num_range":    8,
-            "register_days_range":      8,
-            "video_id":                 HASH_SIZE,
-            "action_weights":           233,
+            "user_id": 1000,
+            "user_active_degree": 8,
+            "follow_user_num_range": 9,
+            "fans_user_num_range": 9,
+            "friend_user_num_range": 8,
+            "register_days_range": 8,
+            "video_id": HASH_SIZE,
+            "action_weights": 233,
         }
         for idx, config in enumerate(embedding_configs):
             config.vocab_size = trained_emb_table_sizes[config.table_name]
@@ -203,9 +201,9 @@ def export_inference_gr_ranking(
         torch.jit.script(wrapper).save(path)
 
     (
-        dataset_args, 
+        dataset_args,
         _,
-        dynamic_table_configs, 
+        dynamic_table_configs,
         trained_emb_table_sizes,
     ) = get_inference_dataset_and_embedding_configs()
 
@@ -239,7 +237,7 @@ def export_inference_gr_ranking(
 
         model = get_exportable_model_for_inference(
             dynamic_table_configs,
-            trained_emb_table_sizes,    
+            trained_emb_table_sizes,
             checkpoint_dir,
         )
 
