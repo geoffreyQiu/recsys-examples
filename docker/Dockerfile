@@ -79,7 +79,8 @@ RUN git clone --recursive https://github.com/taco-project/FlexKV.git FlexKV && \
     git clone --recursive https://github.com/NVIDIA/nv-embedding-cache.git nve && \
     cd nve && git submodule update --init --recursive && \
     cd third_party/ && git clone https://github.com/NVIDIA/NVTX.git NVTX && cd .. && \
-    PYNVE_WITH_TORCH_BINDINGS=1 PYNVE_DISABLE_AVX512=1 CPLUS_INCLUDE_PATH=$(realpath ./third_party/NVTX/c/include/):${CPLUS_INCLUDE_PATH} pip install --no-deps . && \
+    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" PYNVE_WITH_TORCH_BINDINGS=1 PYNVE_DISABLE_AVX512=1 \
+    CPLUS_INCLUDE_PATH=$(realpath ./third_party/NVTX/c/include/):${CPLUS_INCLUDE_PATH} pip install --no-deps . && \
     ln -s /workspace/deps/nve/ /workspace/nve
 
 # Install fbgemm_gpu_hstu (package: fbgemm_gpu_hstu, import: hstu) from submodule
