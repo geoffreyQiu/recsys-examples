@@ -26,14 +26,16 @@ class _JaggedTensorOpFunction(torch.autograd.Function):
                     f"Invalid batch_size: {batch_size}. offsets tensor size: {offsets_list[0].size()}"
                 )
         else:
-            # Note: 1. During torch.compile/export with dynamic shapes, we cannot get the value from 
+            # Note: 1. During torch.compile/export with dynamic shapes, we cannot get the value from
             #       the tensor shape which is SymInt. In order to keep tensors in the `offsets_list`
             #       dynamic in shape, we make `batch_size`, `total_blocks`, `GRID_SIZE`, and `blocks`
             #       cpu tensors, and pass to kernel wrapper `concat_2D_jagged_tensors_fwd_exportable`
-            #       which interface is defined to accept tensors for dynamic shape support. The c++ 
+            #       which interface is defined to accept tensors for dynamic shape support. The c++
             #       kernel will read the value from the tensor at runtime.
             #       2. The original interface with int is kept to avoid extra sync in training.
-            batch_size = (offsets_list[0].size(0) - 1) * torch.ones((1,), dtype=torch.int32)
+            batch_size = (offsets_list[0].size(0) - 1) * torch.ones(
+                (1,), dtype=torch.int32
+            )
 
         if len(offsets_list) == 1:
             single_offsets = offsets_list[0]
@@ -73,7 +75,7 @@ class _JaggedTensorOpFunction(torch.autograd.Function):
             * (device_properties.max_threads_per_multi_processor / BLOCK_SIZE)
         )
         if is_compiling:
-            GRID_SIZE = torch.tensor([ GRID_SIZE ], dtype=torch.int32)
+            GRID_SIZE = torch.tensor([GRID_SIZE], dtype=torch.int32)
 
         with torch.cuda.nvtx.range("calculate seqlen_per_block", color="purple"):
             # the larger hidden_dim is, the smaller seqlen_per_block becomes
@@ -97,7 +99,9 @@ class _JaggedTensorOpFunction(torch.autograd.Function):
             # warp configuration: ensure not exceeding 1024 threads, each warp processes 1 sequence
             target_warps = min(32, max(1, seqlen_per_block))
             threads = min(BLOCK_SIZE, target_warps * 32)
-            blocks = min(GRID_SIZE, total_blocks)  # returns a tensor when both inputs are tensor
+            blocks = min(
+                GRID_SIZE, total_blocks
+            )  # returns a tensor when both inputs are tensor
 
         # Handle max_seqlen == 0 case to prevent division by zero in CUDA kernel
         if max_seqlen == 0:
