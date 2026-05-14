@@ -18,12 +18,7 @@ from typing import Dict
 import torch
 from commons.datasets.hstu_batch import HSTUBatch
 from configs import InferenceHSTUConfig, KVCacheConfig, RankingConfig
-from dynamicemb.exportable_tables import apply_inference_embedding_collection
-from modules.exportable_embedding import apply_inference_sparse
-from modules.inference_dense_module import (
-    InferenceDenseModule,
-    apply_inference_hstu_dense,
-)
+from modules.inference_dense_module import InferenceDenseModule
 from modules.inference_embedding import InferenceEmbedding
 
 
@@ -186,6 +181,10 @@ def apply_inference(
     trained_emb_table_sizes: Dict[str, int],
     checkpoint_dir: str,
 ):
+    from dynamicemb.exportable_tables import apply_inference_embedding_collection
+    from modules.exportable_embedding import apply_inference_sparse
+    from modules.inference_dense_module import apply_inference_hstu_dense
+
     # Step.1 - [General] Convert ModuleDict[Embedding] to InferenceEmbeddingCollection
     model = apply_inference_embedding_collection(
         training_model,

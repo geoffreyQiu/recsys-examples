@@ -452,11 +452,18 @@ if __name__ == "__main__":
     parser.add_argument("--gin_config_file", type=str, required=True)
     parser.add_argument("--checkpoint_dir", type=str, required=True)
     parser.add_argument("--disable_auc", action="store_true")
-    parser.add_argument("--max_bs", type=int, default=1)
+    parser.add_argument("--max_bs", type=int, default=2)
     parser.add_argument("--debug_flattened_inputs", action="store_true")
 
     args = parser.parse_args()
     gin.parse_config_file(args.gin_config_file)
+
+    if args.max_bs <= 1:
+        print(
+            "[WARNING] Max batch size (max_bs) is set to 1, which causes the torch compiler fails to capture the dynamic shapes.\n"
+            "          Adjusted max_bs to 2 for successful export."
+        )
+        args.max_bs = 2
 
     export_inference_gr_ranking(
         checkpoint_dir=args.checkpoint_dir,
