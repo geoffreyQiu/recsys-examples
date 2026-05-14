@@ -12,7 +12,7 @@ RUN apt-get update -y --fix-missing && apt-get install -y liburing-dev libxxhash
     if [ "${TRITONSERVER_BUILD}" = "1" ]; then \
       ln /bin/python3 /bin/python && \
       apt-get install -y cmake patchelf && \
-      pip3 install pandas rich cloudpickle psutil && \
+      pip3 install pandas rich cloudpickle psutil cython && \
       pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130; \
     fi && \
     ARCH=$([ "${TARGETPLATFORM}" = "linux/arm64" ] && echo "aarch64" || echo "x86_64") && \
