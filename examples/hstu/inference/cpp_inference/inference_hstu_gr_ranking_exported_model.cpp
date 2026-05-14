@@ -267,7 +267,7 @@ bool run_one_round(
   for (int i = 0; i < 3; i++) {
     cudaDeviceSynchronize();
     auto start = std::chrono::steady_clock::now();
-    for (int idx : batch_indices) {
+    for (int idx = 0; idx < batch_indices.size(); idx++) {
       auto & values = values_list[idx];
       auto & lengths = lengths_list[idx];
       auto & num_candidates = num_candidates_list[idx];
