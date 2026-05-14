@@ -27,8 +27,6 @@
 #include <torch/extension.h>
 #include <torch/serialize/tensor.h>
 
-#include "kvcache_manager_impl.h"
-
 template <typename DType, typename IdType>
 cudaError_t AppendPagedKVCache(DType* k_data,
                                DType* v_data,
