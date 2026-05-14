@@ -80,7 +80,7 @@ GPUKVCacheManagerImpl::GPUKVCacheManagerImpl(
 
 GPUKVCacheManagerImpl::~GPUKVCacheManagerImpl() {
     cudaCheck(cudaFreeHost(this->metadata_host_buffer));
-    cudaCheck(cudaStreamDestroy(alloc_stream))
+    cudaCheck(cudaStreamDestroy(alloc_stream));
 }
 
 std::vector<at::Tensor> GPUKVCacheManagerImpl::lookup(at::Tensor uids) {
@@ -246,13 +246,14 @@ std::vector<int>& GPUKVCacheManagerImpl::alloc_single_sequence(
             }
             evict_offloaded(*it);
             if (_uid_to_paged_cache_length[*it] == 0) {
+                auto uid_to_evict = *it;
                 auto next_it = _lru_list.erase(it);
-                _lru_lookup_table.erase(*it);
+                _lru_lookup_table.erase(uid_to_evict);
 
-                _uid_to_page_id.erase(*it);
-                _uid_to_paged_cache_startpos.erase(*it);
-                _uid_to_paged_cache_length.erase(*it);
-                _uid_to_offloaded_length.erase(*it);
+                _uid_to_page_id.erase(uid_to_evict);
+                _uid_to_paged_cache_startpos.erase(uid_to_evict);
+                _uid_to_paged_cache_length.erase(uid_to_evict);
+                _uid_to_offloaded_length.erase(uid_to_evict);
                 it = next_it;
             } else {
                 ++it;
@@ -545,7 +546,7 @@ void GPUKVCacheManagerImpl::release_offload_pages(
         }
     }
     // TODO(junyiq): in future acq and rls pages by per-page lock.
-    // When offloaded == true, offload_start_indices + offload_lengths can be used as alreay offloaded pages.
+    // When offloaded == true, offload_start_indices + offload_lengths can be used as already offloaded pages.
     // When offloaded == false, offload_lengths can be empty.
 }
 

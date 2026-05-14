@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import torch
 
@@ -113,12 +113,3 @@ class KVLookupResult:
 class KVIndexMeta:
     user_ids: torch.Tensor
     seq_lengths: torch.Tensor
-
-
-@dataclass
-class FlexKVIndexMeta(KVIndexMeta):
-    batch_size: int = 0
-
-    token_ids: Optional[torch.Tensor] = None
-    token_mask: Optional[torch.Tensor] = None
-    namespaces: Optional[List[List[str]]] = None

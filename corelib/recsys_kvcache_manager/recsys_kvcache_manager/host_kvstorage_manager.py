@@ -37,12 +37,24 @@ class HostKVStorageErrorCode(str, Enum):
 @dataclass
 class HostKVTaskHandle:
     backend: str
-    user_ids: Optional[torch.Tensor] = None  # TODO(junyiq): check if needed
+    user_ids: Optional[torch.Tensor] = None
     handle: Optional[Any] = None
     status: HostKVTaskStatus = HostKVTaskStatus.UNINITIALIZED
     metadata: Optional[Dict[str, Any]] = None
     time_launched: Optional[float] = None
     is_layerwise: bool = False
+
+    def __post_init__(self):
+        if self.status not in {
+            HostKVTaskStatus.UNINITIALIZED,
+            HostKVTaskStatus.SKIPPED,
+        }:
+            assert (
+                self.user_ids is not None
+            ), "user_ids must be provided for initialized tasks"
+            assert (
+                self.handle is not None
+            ), "underlying handle must be provided for initialized tasks"
 
     def stream_wait_layer(self, layer_idx: int) -> None:
         if self.is_layerwise:

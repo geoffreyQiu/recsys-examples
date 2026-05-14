@@ -4,7 +4,7 @@ Recsys KVCache Manager is a Python package that LLM-compatible KV data caching, 
 It supports kvcache management based on **user-id**s from recommender systems, inter-requests kvcache reuse for the same user.
 
 Recsys KVCache Manager is based on the **Pytorch** ecosystem. It contains kv data cache on both GPU memory and host memory backed with lower-tier storage.
-It supports lookup, offloading (to low-tier sotrage for storage), and onboard (to GPU memory for inference), and also easy ways to read/write data to the kvcache.
+It supports lookup, offloading (to low-tier storage), and onboard (to GPU memory for inference), and also easy ways to read/write data to the kvcache.
 
 
 ## Table of Contents
@@ -28,7 +28,7 @@ Recsys KVCache Manager supports data lookup based on user-id only, instead of co
 </div>
 
 ```
-    + KVCacheManager :  Inferface for kvcache operations
+    + KVCacheManager :  Interface for kvcache operations
     |
     ├---- GPUKVCacheManager :  Manager for GPU kvcache table
     |
@@ -44,9 +44,9 @@ The GPU kvcache table is organized as a paged KV-data table, and supports KV dat
 
 - **Asynchronous Onboarding/Offloading**:
 By using asynchronous data copy on the side CUDA stream, we overlap the KV data transfer between GPU memory and host storage (onboarding/offloading) with embedding lookup, sequence pre-/post-processing, and inference for other requests (in some cases) to reduce the latency of HSTU inference.
-Futhermore, the `NativeHostKVCacheManager` backend supports layerwise KV data onboarding, overlaping the H2D data transfer with computation from the previous HSTU layers.
+Furthermore, the `NativeHostKVCacheManager` backend supports layerwise KV data onboarding, overlapping the H2D data transfer with computation from the previous HSTU layers.
 
-- **Extention for Multiple Backend**: 
+- **Extension for Multiple Backend**: 
 `HostKVStorageManagerBase` is provided as an interface for other LLM-compatible kvcache systems for the host memory, storage and remote data pool.
 This can be easily extended to integration other kvcache system. Currently, we provide the integration with [`FlexKV`](https://github.com/taco-project/FlexKV/tree/main) as the low-tier kv storage backend. 
 
@@ -86,7 +86,7 @@ There are some **limitations** for current implementation. These will be resolve
 
 1. API `allocate_kvcache` is host blocking, and cannot overlap with other operations.
 
-2. Allow only **one** GPU kvcache manager per deivce, and only one inference instance for each GPU kvcache manager.
+2. Allow only **one** GPU kvcache manager per device, and only one inference instance for each GPU kvcache manager.
 
 3. Host backend "native" is limited for at most **one** GPU kvcache manager, and only one inference instance. Recommend to use with `user_id` based routing with inference instance isolation.
 
@@ -119,7 +119,7 @@ There are some **limitations** for current implementation. These will be resolve
     [[ ... preprocess ... ]]
 
 
-    # Dense Module compuation
+    # Dense Module computation
     # Note: Here we show two possible ways to synchronize with onboard completion:
     #       (1) blocking wait for onboard completion
     #       (2) non-blocking "cuda stream wait" with layerwise onboard events.

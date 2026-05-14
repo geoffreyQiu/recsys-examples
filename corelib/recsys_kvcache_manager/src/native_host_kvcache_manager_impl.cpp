@@ -437,7 +437,7 @@ void HostKVStorageImpl::onload_kvcache(
             this->device_num_sms, this->scatter_stream);
         onloadhandle.complete_host(layer_idx, this->scatter_stream);
     }
-    // For next onload, gather stream wait for current offload completion to gpu offload buffers are not in used.
+    // For next onload, onload stream wait for current onload completion so gpu onload buffers are not in use.
     cudaCheck(cudaStreamWaitEvent(this->onload_stream, onloadhandle.compl_event[this->num_layers-1], 0));
 }
 
@@ -589,7 +589,7 @@ bool HostKVStorageImpl::offload_kvcache(
     if (empty_pinned_chunks.size() == 0) return false;  
 
     for (int layer_idx = 0; layer_idx < this->num_layers; layer_idx++) {
-        void *gpu_offload_buffer = this->offload_gpu_buffers[layer_idx % 2];  // single layer for a max batch (multi-chunks)
+        char *gpu_offload_buffer = static_cast<char*>(this->offload_gpu_buffers[layer_idx % 2]);  // single layer for a max batch (multi-chunks)
         if (layer_idx >= 2) cudaCheck(cudaStreamWaitEvent(this->gather_stream, offloadhandle.ready_event[layer_idx - 2], 0));
 
         // Step 1. Gather pages on GPU
@@ -608,7 +608,13 @@ bool HostKVStorageImpl::offload_kvcache(
             auto [chunk_offsets, chunk_psizes] = empty_pinned_chunks[seq_idx];
             size_t offset = num_pages_offsets[seq_idx] * this->page_bytes;
             for (int idx = 0; idx < chunk_offsets.size(); idx++) {
-                cudaCheck(cudaMemcpyAsync(this->pinned_kvstorage_buffers[layer_idx] + chunk_offsets[idx], gpu_offload_buffer + offset, chunk_psizes[idx] * this->page_bytes, cudaMemcpyDeviceToHost, this->offload_stream));
+                cudaCheck(cudaMemcpyAsync(
+                    static_cast<char*>(this->pinned_kvstorage_buffers[layer_idx]) + chunk_offsets[idx], 
+                    gpu_offload_buffer + offset, 
+                    chunk_psizes[idx] * this->page_bytes, 
+                    cudaMemcpyDeviceToHost, 
+                    this->offload_stream
+                ));
                 offset += chunk_psizes[idx] * this->page_bytes;
             }
         }
@@ -671,10 +677,6 @@ std::vector<int> HostKVStorageImpl::cancel_offload(
             if (chunk_psizes[idx] < this->num_pages_per_chunk) continue;
             _empty_chunks.push(std::make_pair(chunk_offsets[idx] / this->unit_chunk_bytes, chunk_psizes[idx] / this->num_pages_per_chunk));
             _num_empty_chunks += chunk_psizes[idx] / this->num_pages_per_chunk;
-        }
-        int64_t user_id = offloadhandle.offload_user_ids[seq_idx].item<int64_t>();
-        if (_uid_to_length.find(user_id) == _uid_to_length.end()) {
-            _uid_to_length.erase(user_id);
         }
     }
 

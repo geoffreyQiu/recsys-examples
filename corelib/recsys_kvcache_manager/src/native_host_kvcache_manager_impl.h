@@ -191,11 +191,8 @@ public:
     std::list<int64_t> _lru_list;
     std::unordered_map<int64_t, 
                        typename std::list<int64_t>::iterator> _lru_lookup_table;
-    std::queue<std::pair<int64_t, int64_t>> _empty_chunks;  // <offset of buffer, size in pages>
+    std::queue<std::pair<int64_t, int64_t>> _empty_chunks;  // <offset in #unit_chunks, size in #unit_chunks>
     int64_t _num_empty_chunks;
-    // std::list<int64_t> _lru_list;
-    // std::unordered_map<int64_t, 
-    //                 typename std::list<int64_t>::iterator> _lru_lookup_table;
     std::unordered_map<int64_t, std::pair<std::vector<int64_t>, std::vector<int64_t>>> _uid_to_chunks;
     std::unordered_map<int64_t, int64_t> _uid_to_length;
 

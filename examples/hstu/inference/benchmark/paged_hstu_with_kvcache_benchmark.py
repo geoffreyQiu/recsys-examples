@@ -244,8 +244,10 @@ def test_input(
         kvcache_metadata.kv_seqlen_offsets.copy_(kv_seqlen_offsets.int().cuda())
         kvcache_metadata.kv_onload_handle = HostKVTaskHandle(
             backend="native",
+            user_ids=torch.empty(0, dtype=torch.int64),  # dummy user_ids.
             handle=KVOnloadHandle(num_layers),
             status=HostKVTaskStatus.LAUNCHED,
+            is_layerwise=True,
         )
         input_lists.append(
             (

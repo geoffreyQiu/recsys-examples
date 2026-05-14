@@ -23,7 +23,17 @@ from .host_kvstorage_manager import (
     HostKVWaitResult,
 )
 from .kvcache_metadata import KVCacheMetadata
-from .kvcache_utils import FlexKVIndexMeta, KVIndexMeta, KVLookupResult
+from .kvcache_utils import KVIndexMeta, KVLookupResult
+
+
+@dataclass
+class FlexKVIndexMeta(KVIndexMeta):
+    batch_size: int
+
+    token_ids: List[torch.Tensor]
+    token_mask: List[Optional[Any]]
+    namespaces: List[List[str]]
+    slot_mappings: Optional[List[torch.Tensor]] = None
 
 
 @dataclass
@@ -33,18 +43,16 @@ class _FlexKVOnloadHandle:
     slot_mappings: List[torch.Tensor]
 
 
+@dataclass
 class _FlexKVOffloadHandle:
-    def __init__(
-        self,
-        task_ids: List[int],
-        uids: torch.Tensor,
-        seqlens: torch.Tensor,
-        responses: Dict[int, Any] = dict(),
-    ):
-        self.task_ids = task_ids
-        self.uids = uids
-        self.seqlens = seqlens
-        self.responses = responses
+    task_ids: List[int]
+    uids: torch.Tensor
+    seqlens: torch.Tensor
+    responses: Optional[Dict[int, Any]] = None
+
+    def __post_init__(self):
+        if self.responses is None:
+            self.responses = dict()
 
 
 @dataclass
@@ -113,7 +121,6 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
             "ipc:///tmp/flexkv_server_gpu_register",
         )
         self._registered: bool = False
-        self._tasks: Dict[str, Dict[str, Any]] = {}
         self._adapter = FlexKVClientAdapter(mode, server_addr, server_port)
         self._client = None
         self._ready = False

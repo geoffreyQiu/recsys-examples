@@ -167,4 +167,3 @@ def get_inference_hstu_config(
         scaling_seqlen=scaling_seqlen,
         embedding_backend=embedding_backend,
     )
-

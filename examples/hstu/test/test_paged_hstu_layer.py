@@ -521,6 +521,7 @@ def generate_test_input_data(
     )
     kvcache_metadata.kv_onload_handle = HostKVTaskHandle(
         backend="native",
+        user_ids=torch.empty(0, dtype=torch.int64),  # dummy user_ids.
         handle=KVOnloadHandle(num_layers),
         status=HostKVTaskStatus.LAUNCHED,
     )

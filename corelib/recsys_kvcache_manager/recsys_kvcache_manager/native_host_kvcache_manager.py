@@ -112,7 +112,9 @@ class NativeHostKVCacheManager(HostKVStorageManagerBase):
             for seq_idx in range(index_meta.user_ids.size(0))
         ]
         if torch.sum(onload_lengths).item() == 0:
-            # No data to onboard, skip the task.
+            # Note: No data to onboard, skip the task.
+            #       Whether to onboard for each used is decided in C++ implementation
+            #       from `onload_paged_ids_list`.
             return HostKVTaskHandle(
                 backend="native",
                 handle=None,
@@ -125,6 +127,7 @@ class NativeHostKVCacheManager(HostKVStorageManagerBase):
         )
         return HostKVTaskHandle(
             backend="native",
+            user_ids=index_meta.user_ids,
             handle=native_handle,
             status=HostKVTaskStatus.LAUNCHED,
             is_layerwise=True,
@@ -170,6 +173,7 @@ class NativeHostKVCacheManager(HostKVStorageManagerBase):
 
         return HostKVTaskHandle(
             backend="native",
+            user_ids=offload_user_ids,
             handle=native_handle,
             status=HostKVTaskStatus.LAUNCHED,
             time_launched=time.perf_counter_ns(),

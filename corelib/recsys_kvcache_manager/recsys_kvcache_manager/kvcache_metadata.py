@@ -130,7 +130,7 @@ def get_kvcache_metadata_buffer(
     )
 
 
-def copy_kvcache_metadata(dst_metadata: KVCacheMetadata, src_metata: KVCacheMetadata):
+def copy_kvcache_metadata(dst_metadata: KVCacheMetadata, src_metadata: KVCacheMetadata):
     def copy_tensor(dst, src):
         dst[: src.shape[0], ...].copy_(src, non_blocking=True)
         dst[src.shape[0] :, ...] = 0
@@ -139,18 +139,18 @@ def copy_kvcache_metadata(dst_metadata: KVCacheMetadata, src_metata: KVCacheMeta
         dst[: src.shape[0], ...].copy_(src, non_blocking=True)
         dst[src.shape[0] :, ...] = src[-1, ...]
 
-    copy_tensor(dst_metadata.kv_indices, src_metata.kv_indices)
-    copy_offsets(dst_metadata.kv_indptr, src_metata.kv_indptr)
-    copy_tensor(dst_metadata.kv_last_page_len, src_metata.kv_last_page_len)
-    copy_tensor(dst_metadata.batch_indices, src_metata.batch_indices)
-    copy_tensor(dst_metadata.position, src_metata.position)
-    copy_tensor(dst_metadata.new_history_nnz_cuda, src_metata.new_history_nnz_cuda)
-    copy_offsets(dst_metadata.total_history_offsets, src_metata.total_history_offsets)
-    copy_offsets(dst_metadata.new_history_offsets, src_metata.new_history_offsets)
-    copy_tensor(dst_metadata.kv_seqlens, src_metata.kv_seqlens)
-    copy_offsets(dst_metadata.kv_seqlen_offsets, src_metata.kv_seqlen_offsets)
+    copy_tensor(dst_metadata.kv_indices, src_metadata.kv_indices)
+    copy_offsets(dst_metadata.kv_indptr, src_metadata.kv_indptr)
+    copy_tensor(dst_metadata.kv_last_page_len, src_metadata.kv_last_page_len)
+    copy_tensor(dst_metadata.batch_indices, src_metadata.batch_indices)
+    copy_tensor(dst_metadata.position, src_metadata.position)
+    copy_tensor(dst_metadata.new_history_nnz_cuda, src_metadata.new_history_nnz_cuda)
+    copy_offsets(dst_metadata.total_history_offsets, src_metadata.total_history_offsets)
+    copy_offsets(dst_metadata.new_history_offsets, src_metadata.new_history_offsets)
+    copy_tensor(dst_metadata.kv_seqlens, src_metadata.kv_seqlens)
+    copy_offsets(dst_metadata.kv_seqlen_offsets, src_metadata.kv_seqlen_offsets)
 
-    dst_metadata.new_history_nnz = src_metata.new_history_nnz
+    dst_metadata.new_history_nnz = src_metadata.new_history_nnz
 
-    dst_metadata.kv_onload_handle = src_metata.kv_onload_handle
-    # dst_metadata.kv_offload_handle = src_metata.kv_offload_handle
+    dst_metadata.kv_onload_handle = src_metadata.kv_onload_handle
+    # dst_metadata.kv_offload_handle = src_metadata.kv_offload_handle

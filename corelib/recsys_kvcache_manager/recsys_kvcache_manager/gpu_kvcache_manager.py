@@ -92,7 +92,7 @@ class GPUKVCacheManager:
             batch_size = uids.size(0)
             num_new_tokens = torch.sum(new_hist_lengths, dtype=torch.int32).item()
             num_total_pages = torch.sum(
-                torch.ceil(seq_hist_lengths / self.page_size), dtype=torch.int32
+                torch.ceil(seq_hist_lengths.float() / self.page_size).to(torch.int32)
             ).item()
             output_kvcache_metadata = get_kvcache_metadata_buffer(
                 batch_size,

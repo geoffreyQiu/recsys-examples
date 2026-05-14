@@ -119,7 +119,7 @@ template <size_t vec_size>
 struct vec_t<nv_bfloat16, vec_size> {
   static_assert(vec_size % 8 == 0, "Invalid vector size");
   INLINE static void memcpy(nv_bfloat16* dst, const nv_bfloat16* src) {
-#pragma unoll
+#pragma unroll
     for (size_t i = 0; i < vec_size / 8; ++i) {
       ((int4*)dst)[i] = ((int4*)src)[i];
     }

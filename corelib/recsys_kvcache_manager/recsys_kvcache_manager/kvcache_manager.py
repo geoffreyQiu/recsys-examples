@@ -106,6 +106,10 @@ class KVCacheManager:
                 "[WARNING] onboard_try_wait is not implemented for flexkv backend currently. Calling onboard_wait instead."
             )
             return self.onboard_wait(kv_index_meta, task_handle)
+        else:
+            raise NotImplementedError(
+                f"Unknown host kvcache backend {self.host_kvstorage_manager.backend_name}"
+            )
 
     def onboard_wait(
         self,
@@ -129,25 +133,21 @@ class KVCacheManager:
             HostKVTaskStatus.TIMEOUT,
             HostKVTaskStatus.CANCELLED,
         ):
+            # Revoke affected pages on onboard failure.
+            self.gpu_kvcache_mgr.revoke_onboard_pages(
+                kv_index_meta.user_ids,
+                task_handle.metadata["onboard_start_indices"],
+                task_handle.metadata["onboard_lengths"],
+            )
             if task_handle.backend == "flexkv":
                 if self.host_kvstorage_fail_policy == "fail_close":
                     raise RuntimeError(
-                        f"Onboarding failed for {wait_result.failed_user_ids}"
+                        f"Onboarding failed for {wait_result.failed_user_ids}: status={wait_result.status.value}, msg={wait_result.message}"
                     )
                 else:
                     print(
                         f"[WARNING] Onboarding failed for {wait_result.failed_user_ids}, but continue with `fail_open` policy."
                     )
-            # Revoke affected pages on onboard failure.
-            self.gpu_kvcache_mgr.revoke_onboard_pages(
-                kv_index_meta.user_ids,
-                metadata["onboard_start_indices"],
-                metadata["onboard_lengths"],
-            )
-
-            raise RuntimeError(
-                f"onboard wait failed: status={wait_result.status.value}, msg={wait_result.message}"
-            )
         return wait_result
 
     def offload_launch(
@@ -167,7 +167,10 @@ class KVCacheManager:
                 index_meta.user_ids
             )
             _index_meta = self.host_kvstorage_manager.build_index_meta(
-                uids_to_offload, None
+                uids_to_offload,
+                torch.empty(
+                    0, dtype=torch.int32
+                ),  # dummy seq lengths since they are not used for lookup
             )
             offloaded_lengths = self.host_kvstorage_manager.lookup_kvcache(
                 _index_meta
@@ -227,7 +230,7 @@ class KVCacheManager:
                 offload_success = self.host_kvstorage_manager.finish_task(task_handle)
             elif wait_result.status == HostKVTaskStatus.SKIPPED:
                 # No need to release GPU pages since offload is skipped
-                print(f"Offload skipped for {task_handle.get_user_ids().tolist()}")
+                print(f"Offload skipped for {task_handle.user_ids.tolist()}")
                 continue
             elif wait_result.status in (
                 HostKVTaskStatus.FAILED,
@@ -235,11 +238,12 @@ class KVCacheManager:
                 HostKVTaskStatus.CANCELLED,
             ):
                 should_raise = self.host_kvstorage_fail_policy == "fail_close"
-                offload_success = [0 for _ in range(task_handle.get_user_ids().size(0))]
                 if should_raise:
                     raise RuntimeError(
                         f"Offloading failed for {wait_result.failed_user_ids}, fail_policy={self.host_kvstorage_fail_policy}"
                     )
+
+                offload_success = [0 for _ in range(task_handle.user_ids.size(0))]
                 self.host_kvstorage_manager.cancel_task(task_handle)
             else:
                 raise RuntimeError(
