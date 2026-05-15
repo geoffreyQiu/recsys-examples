@@ -67,10 +67,9 @@ RUN git clone https://github.com/jiayus-nvidia/flash-attention.git flash-attenti
     git checkout ${FLASH_ATTN_ARBITRARY_MASK_COMMIT} && \
     pip install --no-deps --no-build-isolation -e ./flash_attn/cute
 
-# -- Layer 6: FlexKV and NVE : both inference dependency --
-RUN git clone --recursive https://github.com/taco-project/FlexKV.git FlexKV && \
-    cd FlexKV && git submodule update --init --recursive && \
-    mkdir -p build && cd build && \
+# -- Layer 6, 7: FlexKV and NVE : both inference dependency --
+COPY third_party/FlexKV /workspace/deps/FlexKV
+RUN cd FlexKV && mkdir -p build && cd build && \
     TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" cmake .. && \
     TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" cmake --build . -j8 && \
     cd .. && mkdir -p flexkv/lib && cp -P build/lib/*.so* flexkv/lib/ && \
