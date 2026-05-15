@@ -149,5 +149,5 @@ There are some **limitations** for current implementation. These will be resolve
 
 ## Future Plans
 
-1. Support concurrent kvcache operations inference instances .
+1. Support concurrent kvcache operations inference instances.
 2. Support torch export and AOT induction compilation with the recommenders models for Torch C++ runtime inference.
