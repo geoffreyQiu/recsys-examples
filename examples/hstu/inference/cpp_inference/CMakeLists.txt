@@ -54,9 +54,9 @@ target_compile_definitions(inference_hstu_gr_ranking_exported_model PRIVATE HSTU
 
 target_include_directories(inference_hstu_gr_ranking_exported_model PRIVATE
     ${TORCH_INCLUDE_DIRS}
-    /workspace/nve
-    /workspace/nve/include
-    /workspace/nve/third_party/json/include/
+    /workspace/deps/nve
+    /workspace/deps/nve/include
+    /workspace/deps/nve/third_party/json/include/
 )
 
 # If fbgemm_gpu is found, link against it to register fbgemm operators

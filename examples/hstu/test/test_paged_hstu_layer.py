@@ -618,6 +618,7 @@ class TestModule:
         ]
         self.static_kvcache_metadata.kv_onload_handle = HostKVTaskHandle(
             backend="native",
+            user_ids=torch.empty(0, dtype=torch.int64),  # dummy user_ids.
             handle=KVOnloadHandle(self.num_layers),
             status=HostKVTaskStatus.LAUNCHED,
         )

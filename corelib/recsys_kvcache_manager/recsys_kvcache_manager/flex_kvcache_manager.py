@@ -371,23 +371,9 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
                 "onboard_lengths": torch.tensor(onboard_lengths, dtype=torch.int32),
             },
         )
-        fail_close = (
-            str(self.host_kvstorage_fail_policy).strip().lower() == "fail_close"
-        )
 
-        try:
-            self._client.launch(onload_handle.task_ids, onload_handle.slot_mappings)
-            return onload_task_handle
-        except Exception as e:
-            return HostKVTaskHandle(
-                backend="flexkv",
-                user_ids=index_meta.user_ids,
-                handle=onload_handle,
-                status=HostKVTaskStatus.FAILED
-                if fail_close
-                else HostKVTaskStatus.SKIPPED,
-                metadata={"error": f"onboard launch failed: {e}"},
-            )
+        self._client.launch(onload_handle.task_ids, onload_handle.slot_mappings)
+        return onload_task_handle
 
     def onboard_kvcache_wait(self, task_handle: HostKVTaskHandle) -> HostKVWaitResult:
         onboard_results: Dict[int, "KVResponse"] = self._client.wait(

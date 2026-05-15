@@ -326,6 +326,7 @@ class KVCacheManager:
                 num_cpu_blocks=flexkv_num_cpu_blocks,
                 num_local_blocks=flexkv_num_local_blocks,
                 num_tmp_cpu_blocks=flexkv_num_tmp_cpu_blocks,
+                dtype=kvcache_config.dtype,
                 enable_mps=flexkv_enable_mps,
                 host_kvstorage_fail_policy=flexkv_host_kvstorage_fail_policy,
                 hostkv_wait_timeout_ms=int(kvcache_config.offload_timeout_ms),
@@ -362,5 +363,5 @@ class KVCacheManager:
             host_kvcache_mgr,
             kvcache_config.offload_mode,
             # kvcache_config.offload_timeout_ms,
-            # kvcache_config.host_kvstorage_fail_policy,
+            kvcache_config.host_kvstorage_fail_policy,
         )

@@ -75,13 +75,13 @@ RUN git clone --recursive https://github.com/taco-project/FlexKV.git FlexKV && \
     TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" cmake --build . -j8 && \
     cd .. && mkdir -p flexkv/lib && cp -P build/lib/*.so* flexkv/lib/ && \
     MAX_JOBS=8 FLEXKV_DEBUG=0 TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" python3 setup.py install && \
-    cd /tmp && python3 -c "from flexkv.kvmanager import KVManager; print('flexkv import ok')" && cd - && \
+    cd /tmp && python3 -c "from flexkv.kvmanager import KVManager; print('flexkv import ok')" && \
+    cd /workspace/deps && \
     git clone --recursive https://github.com/NVIDIA/nv-embedding-cache.git nve && \
     cd nve && git submodule update --init --recursive && \
     cd third_party/ && git clone https://github.com/NVIDIA/NVTX.git NVTX && cd .. && \
     TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" PYNVE_WITH_TORCH_BINDINGS=1 PYNVE_DISABLE_AVX512=1 \
-    CPLUS_INCLUDE_PATH=$(realpath ./third_party/NVTX/c/include/):${CPLUS_INCLUDE_PATH} pip install --no-deps . && \
-    ln -s /workspace/deps/nve/ /workspace/nve
+    CPLUS_INCLUDE_PATH=$(realpath ./third_party/NVTX/c/include/):${CPLUS_INCLUDE_PATH} pip install --no-deps .
 
 # Install fbgemm_gpu_hstu (package: fbgemm_gpu_hstu, import: hstu) from submodule
 COPY third_party/FBGEMM /workspace/deps/fbgemm_hstu
