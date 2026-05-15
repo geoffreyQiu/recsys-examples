@@ -361,7 +361,7 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         )
         onload_task_handle = HostKVTaskHandle(
             backend="flexkv",
-            user_ids=index_meta.user_ids,
+            user_ids=onload_handle.uids,
             handle=onload_handle,
             status=HostKVTaskStatus.LAUNCHED,
             metadata={

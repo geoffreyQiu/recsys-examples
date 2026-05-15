@@ -135,7 +135,7 @@ class KVCacheManager:
         ):
             # Revoke affected pages on onboard failure.
             self.gpu_kvcache_mgr.revoke_onboard_pages(
-                kv_index_meta.user_ids,
+                task_handle.user_ids,
                 task_handle.metadata["onboard_start_indices"],
                 task_handle.metadata["onboard_lengths"],
             )
