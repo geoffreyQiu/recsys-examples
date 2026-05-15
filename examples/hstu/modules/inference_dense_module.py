@@ -223,17 +223,16 @@ class InferenceDenseModule(torch.nn.Module):
         self.use_cudagraph = use_cudagraph
         if use_cudagraph:
             max_batch_size = hstu_config.max_batch_size
-            max_num_pages = math.ceil(
-                hstu_config.max_seq_len / kvcache_config.page_size
-            )
-            max_num_pages *= max_batch_size
-            max_num_tokens = hstu_config.max_seq_len * max_batch_size
             self._kvcache_metadata = None
             if self._use_kvcache:
+                max_num_pages = math.ceil(
+                    hstu_config.max_seq_len / kvcache_config.page_size
+                ) * max_batch_size
+                max_num_tokens = hstu_config.max_seq_len * max_batch_size
                 self._kvcache_metadata = get_kvcache_metadata_buffer(
                     batch_size=max_batch_size,
                     num_new_tokens=max_num_tokens,
-                    num_pages=max_num_pages,
+                    num_pages=int(max_num_pages),
                     device=torch.cuda.current_device(),
                 )
                 self._kvcache_metadata.kv_cache_table = [
