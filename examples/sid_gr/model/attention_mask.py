@@ -240,17 +240,10 @@ def dense_mask_to_arbitrary_func(
     shifted[:, :, 1:] = valid_mask[:, :, :-1]
     starts = valid_mask & ~shifted  # start of each True run
     max_intervals = int(starts.sum(dim=-1).max().item())
-    n_func = max(2 * max_intervals - 1, 1)
-    if n_func % 2 == 0:
-        n_func += 1
-
-    # When first interval doesn't start at 0, it needs an extra slot.
-    # Recount: base interval [0, F0) is free only if first run starts at 0.
-    # Worst case: all intervals need explicit [F_start, F_end) pairs.
-    # n_func = 2*max_intervals + 1 covers all cases.
+    # F0 encodes [0, F0); every non-prefix interval needs an explicit
+    # (start, end) pair. 2 * max_intervals + 1 (always odd) covers the
+    # worst case where the first run does not start at 0.
     n_func = 2 * max_intervals + 1
-    if n_func % 2 == 0:
-        n_func += 1
 
     af = torch.zeros(B, 1, n_func, seqlen + padding, dtype=torch.int32, device=device)
 
@@ -317,6 +310,196 @@ def build_jagged_causal_arbitrary_func(
     # visible(q) = [0, 0) ∪ [batch_start, q+1)
     af[0, 0, 1, :total_tokens] = batch_starts.to(torch.int32)
     af[0, 0, 2, :total_tokens] = (positions + 1).to(torch.int32)
+
+    return af
+
+
+def build_jagged_target_aware_arbitrary_func(
+    history_seqlen: torch.Tensor,
+    num_target_region: int,
+    target_max_seqlen_per_region: int,
+    offsets: torch.Tensor,
+    total_tokens: int,
+    padding: int = 256,
+) -> torch.Tensor:
+    """
+    Vectorised construction of the flattened (B=1) arbitrary_func that
+    encodes ``padded_target_aware_causal_mask`` semantics — i.e. each
+    target/beam region attends only to its own sample's history plus its
+    own region (causal), with other target regions invisible.
+
+    Sequence layout per sample b (in flattened coordinates):
+        [batch_start, batch_start + hist_len)  history
+        [batch_start + hist_len, batch_start + hist_len + cl)  region 0
+        ...
+        [batch_start + hist_len + (W-1)*cl, batch_start + hist_len + W*cl)  region W-1
+    where ``hist_len = history_seqlen[b]``, ``cl = target_max_seqlen_per_region``,
+    and ``W = num_target_region``.
+
+    For position q in sample b at offset ``local_q`` from batch_start:
+      - if local_q < hist_len: causal over history → [batch_start, batch_start + local_q + 1)
+      - else: in region k = (local_q - hist_len) // cl,
+        visible = [batch_start, batch_start + hist_len)
+                ∪ [region_k_start, batch_start + local_q + 1)
+
+    The arbitrary_func encodes this with n_func=5: F0=0,
+    (F1,F2)=(batch_start, batch_start+hist_len),
+    (F3,F4)=(region_k_start, batch_start+local_q+1)  (zero-zero for hist rows).
+
+    Args:
+        history_seqlen: [B] per-sample history lengths (no padding).
+        num_target_region: ``W`` (beam width). 0 → pure causal-history mask.
+        target_max_seqlen_per_region: ``cl``.
+        offsets: [B+1] flattened offsets so positions
+            [offsets[b], offsets[b+1]) correspond to sample b.
+        total_tokens: ``offsets[-1].item()``.
+        padding: FA convention padding (default 256).
+
+    Returns:
+        arbitrary_func: [1, 1, n_func, total_tokens + padding] int32 tensor.
+    """
+    device = history_seqlen.device
+    history_seqlen.shape[0]
+    W = num_target_region
+    cl = target_max_seqlen_per_region
+
+    # If there are no target regions, the mask reduces to pure jagged causal,
+    # for which the optimised builder is faster.
+    if W == 0 or cl == 0:
+        return build_jagged_causal_arbitrary_func(offsets, total_tokens, padding)
+
+    n_func = 5
+    af = torch.zeros(
+        1, 1, n_func, total_tokens + padding, dtype=torch.int32, device=device
+    )
+
+    # Per-position metadata in flattened coordinates.
+    pos = torch.arange(total_tokens, device=device)  # [N]
+    batch_id = torch.searchsorted(offsets[1:], pos, right=True)  # [N] in [0,B)
+    batch_start = offsets[batch_id]  # [N]
+    local_q = pos - batch_start  # [N]
+
+    hist_per_pos = history_seqlen[batch_id]  # [N]
+    is_history = local_q < hist_per_pos
+    # Position relative to beginning of beam region (>=0 only when not history)
+    target_offset = (local_q - hist_per_pos).clamp(min=0)
+    region_idx = (target_offset // cl).clamp(max=W - 1)
+    region_start = batch_start + hist_per_pos + region_idx * cl
+
+    # F1, F2 — full-history interval (always batch_start..batch_start+hist_len).
+    # For history rows we set this to (batch_start, batch_start+local_q+1) so
+    # the row only sees itself and earlier history.
+    f1_hist = batch_start  # [N]
+    f2_hist = batch_start + local_q + 1  # [N]  causal
+
+    f1_region = batch_start  # [N]
+    f2_region = batch_start + hist_per_pos  # [N]
+
+    f3_region = region_start  # [N]
+    f4_region = batch_start + local_q + 1  # [N]
+
+    # Pick the right fields per row
+    f1 = torch.where(is_history, f1_hist, f1_region)
+    f2 = torch.where(is_history, f2_hist, f2_region)
+    f3 = torch.where(is_history, torch.zeros_like(f3_region), f3_region)
+    f4 = torch.where(is_history, torch.zeros_like(f4_region), f4_region)
+
+    af[0, 0, 1, :total_tokens] = f1.to(torch.int32)
+    af[0, 0, 2, :total_tokens] = f2.to(torch.int32)
+    af[0, 0, 3, :total_tokens] = f3.to(torch.int32)
+    af[0, 0, 4, :total_tokens] = f4.to(torch.int32)
+    return af
+
+
+def dense_mask_to_jagged_arbitrary_func(
+    valid_mask: torch.Tensor,
+    offsets: torch.Tensor,
+    total_tokens: int,
+    padding: int = 256,
+) -> torch.Tensor:
+    """
+    Convert per-batch dense bool mask to a flattened (B=1) arbitrary_func.
+
+    The dense mask is in per-batch padded coordinates ``[B, N, N]``.  This
+    function maps each row to global (flattened) coordinates and encodes
+    the visible intervals into a single arbitrary_func tensor of shape
+    ``[1, 1, n_func, total_tokens + padding]``.
+
+    Use this when a pre-built dense mask is available (e.g. from
+    ``padded_target_aware_causal_mask`` for beam-isolated attention during
+    generation). For pure causal jagged attention prefer
+    :func:`build_jagged_causal_arbitrary_func` which avoids the dense mask
+    entirely.
+
+    Args:
+        valid_mask: [B, N, N] or [B, 1, N, N] bool (True = can attend).
+        offsets: [B+1] cumulative offsets.
+        total_tokens: ``offsets[-1].item()``.
+        padding: FA convention padding (default 256).
+
+    Returns:
+        arbitrary_func: [1, 1, n_func, total_tokens + padding] int32 tensor.
+    """
+    if valid_mask.dim() == 4:
+        valid_mask = valid_mask.squeeze(1)
+    assert valid_mask.dim() == 3, f"Expected [B, N, N], got {valid_mask.shape}"
+
+    B, N, _ = valid_mask.shape
+    device = valid_mask.device
+
+    # Detect interval boundaries via transitions (vectorised on [B, N, N]).
+    shifted = torch.zeros_like(valid_mask)
+    shifted[:, :, 1:] = valid_mask[:, :, :-1]
+    starts = valid_mask & ~shifted
+
+    ends_shifted = torch.zeros_like(valid_mask)
+    ends_shifted[:, :, :-1] = valid_mask[:, :, 1:]
+    ends = valid_mask & ~ends_shifted
+
+    max_intervals = int(starts.sum(dim=-1).max().item())
+    # 2 * max_intervals + 1 is always odd, so no extra parity fix-up.
+    n_func = max(2 * max_intervals + 1, 3)
+
+    af = torch.zeros(
+        1, 1, n_func, total_tokens + padding, dtype=torch.int32, device=device
+    )
+    if max_intervals == 0:
+        return af  # mask is all-False; rows stay zero (F0=0 ⇒ no keys visible)
+
+    # Mask out positions outside each sample's [0, seq_len) range so the
+    # padded rows/cols never contribute spurious intervals.
+    seq_lens = offsets[1:] - offsets[:-1]  # [B]
+    batch_starts = offsets[:-1]  # [B]
+    arange_n = torch.arange(N, device=device)
+    in_range = arange_n.unsqueeze(0) < seq_lens.unsqueeze(-1)  # [B, N]
+    in_qk = in_range.unsqueeze(-1) & in_range.unsqueeze(-2)  # [B, N, N]
+    starts = starts & in_qk
+    ends = ends & in_qk
+
+    # cumsum along the key axis assigns a 1-based interval index to each
+    # transition position; e.g. the 3rd True in starts[b, q, :] gets value 3.
+    iv_starts = starts.cumsum(dim=-1)  # [B, N, N]
+    iv_ends = ends.cumsum(dim=-1)  # [B, N, N]
+
+    # Scatter all start transitions into af in a single op.
+    sc = starts.nonzero(as_tuple=False)  # [Ns, 3] = (b, q, k)
+    if sc.numel() > 0:
+        bs, qs, ks = sc[:, 0], sc[:, 1], sc[:, 2]
+        ivs = iv_starts[bs, qs, ks]  # [Ns] 1-based
+        global_qs = batch_starts[bs] + qs
+        global_ks = (batch_starts[bs] + ks).to(torch.int32)
+        af_row = (2 * (ivs - 1) + 1).long()
+        af[0, 0, af_row, global_qs] = global_ks
+
+    # Same for ends (exclusive: +1 because the loop version added +1).
+    ec = ends.nonzero(as_tuple=False)
+    if ec.numel() > 0:
+        be, qe, ke = ec[:, 0], ec[:, 1], ec[:, 2]
+        ive = iv_ends[be, qe, ke]
+        global_qe = batch_starts[be] + qe
+        global_ke = (batch_starts[be] + ke + 1).to(torch.int32)
+        af_row_e = (2 * (ive - 1) + 2).long()
+        af[0, 0, af_row_e, global_qe] = global_ke
 
     return af
 

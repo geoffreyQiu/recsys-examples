@@ -37,7 +37,10 @@ from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 from .attention_mask import (
     build_jagged_causal_arbitrary_func,
+    build_jagged_target_aware_arbitrary_func,
+    dense_mask_to_jagged_arbitrary_func,
     padded_causal_mask_with_optional_bos,
+    padded_target_aware_causal_mask,
 )
 from .jagged_flash_attn_block import JaggedTransformerBlock
 
@@ -94,8 +97,9 @@ class SIDGRDecoder(MegatronModule):
     Supports two backend modes controlled by *use_jagged_flash_attn*:
 
     * **True** (default) — ``JaggedTransformerBlock``: flattens all batch
-      sequences into one (B=1) and uses jiayus's Flash Attention with
-      arbitrary_func mask encoding.  Zero padding.
+      sequences into one (B=1) and uses the arbitrary-mask FlashAttention
+      path (``flash_attn.cute``) with ``arbitrary_func`` mask encoding.
+      Zero padding.
     * **False** — Megatron-Core ``TransformerBlock``: pads jagged to dense,
       uses ``DotProductAttention`` with a dense arbitrary attention mask.
     """
@@ -140,6 +144,18 @@ class SIDGRDecoder(MegatronModule):
                 config=self.config,
                 spec=self.transformer_decoder_layer_spec,
             )
+
+    def get_jagged_flash_attn_block(self):
+        """Return the inner JaggedFlashAttnBlock used by generate_beam_decode.
+
+        Raises if this decoder was constructed without use_jagged_flash_attn.
+        """
+        if not self.use_jagged_flash_attn:
+            raise RuntimeError(
+                "get_jagged_flash_attn_block() requires use_jagged_flash_attn=True"
+            )
+        # self.decoder is a JaggedTransformerBlock wrapping a JaggedFlashAttnBlock
+        return self.decoder.block
 
     def forward(
         self,
@@ -571,7 +587,18 @@ class SIDGRModel(MegatronModule):
                 )
 
         if self.decoder.use_jagged_flash_attn:
-            assert arbitrary_func is not None
+            # If caller provided a dense mask but we're on the jagged FA
+            # path, convert it to a flattened (B=1) arbitrary_func.
+            if arbitrary_func is None:
+                assert attention_mask is not None, (
+                    "decoder_step: at least one of attention_mask / "
+                    "arbitrary_func must be set"
+                )
+                total_tokens = int(input_offsets[-1].item())
+                valid_mask = ~attention_mask
+                arbitrary_func = dense_mask_to_jagged_arbitrary_func(
+                    valid_mask, input_offsets, total_tokens
+                )
             return self.decoder(
                 hidden_states=input_hidden_states,
                 arbitrary_func=arbitrary_func,
@@ -745,13 +772,46 @@ class SIDGRModel(MegatronModule):
                     dtype=input_offsets.dtype,
                 )
 
-            # 2. decoder (mask built in decoder_step when not overridden)
+            # 2. Build the beam-isolating attention mask for this step.
+            # Each beam is its own "target region" of length candidate_length
+            # so beams don't see each other's tokens. At step 0 there are no
+            # generated codes yet (just history+BOS), so num_target_region=0.
+            # If the caller passed an explicit mask/arbitrary_func via the
+            # generate() args, honour it; otherwise build the proper one.
+            step_attention_mask = attention_mask
+            step_arbitrary_func = arbitrary_func
+            if step_attention_mask is None and step_arbitrary_func is None:
+                if self.decoder.use_jagged_flash_attn:
+                    # Direct vectorised build of the flattened arbitrary_func.
+                    # Avoids materialising the dense [B, 1, N, N] mask and
+                    # then converting it via a Python loop, which is two
+                    # orders of magnitude slower for typical seqlens.
+                    total_tokens = int(cated_offsets[-1].item())
+                    history_seqlen = torch.diff(input_offsets)
+                    # The flattened sequence layout is [hist+BOS, beam0, ...]
+                    # so the per-sample "history" length here includes BOS,
+                    # which is exactly torch.diff(input_offsets).
+                    step_arbitrary_func = build_jagged_target_aware_arbitrary_func(
+                        history_seqlen=history_seqlen,
+                        num_target_region=(0 if i == 0 else topk_prev_step),
+                        target_max_seqlen_per_region=candidate_length,
+                        offsets=cated_offsets,
+                        total_tokens=total_tokens,
+                    )
+                else:
+                    step_attention_mask = padded_target_aware_causal_mask(
+                        torch.diff(input_offsets),
+                        input_max_seqlen,
+                        0 if i == 0 else topk_prev_step,
+                        candidate_length,
+                    )
+
             jagged_output_hidden_states = self.decoder_step(
                 cated_hidden_states,
                 cated_offsets,
                 cated_max_seqlen,
-                attention_mask=attention_mask,
-                arbitrary_func=arbitrary_func,
+                attention_mask=step_attention_mask,
+                arbitrary_func=step_arbitrary_func,
                 default_mask_add_bos_to_history=False,
             )
             # remove history[batchsize * topk_last_step * max(1,i), embedding_dim]
@@ -785,6 +845,411 @@ class SIDGRModel(MegatronModule):
             # 5. filter the topk candidates, update the generated_sids and log_probs for the next step
             self.beam_search.propagate(probs_this_step)
         # only for debugging purpose
+        generated_sids = self.beam_search.get_sids()
+        log_probs = self.beam_search.get_log_probs()
+        return generated_sids, log_probs
+
+    @torch.no_grad
+    def generate_beam_decode(
+        self,
+        batch: GPTSIDBatch,
+        backend: str = "3kernel",
+        phase_times: Optional[Dict[str, float]] = None,
+        use_jagged_kv: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Generate using beam_decode_attn kernel with KV cache.
+
+        Architecture:
+          1. Prefill: run [history + BOS] through JaggedFlashAttnBlock,
+             cache per-layer context K/V.
+          2. Decode loop: for each hierarchy step, embed the newly selected
+             code, run through layers using beam_decode_attn (context KV
+             shared, beam KV per-beam via topk_indices), then MLP → logits
+             → beam_search.propagate.
+
+        The beam_decode_attn kernel separates context KV (shared across all
+        beams, from prefill) and beam KV (per-beam, accumulated from decode
+        steps), using topk_indices to encode the tree-structured ancestor
+        chain. This avoids re-processing the full sequence at each step.
+
+        Backend choice (passed to ``beam_decode_attn``):
+          The kernel exposes two implementations of the same math:
+
+          - ``"3kernel"`` (default): pipelined implementation. Supports
+            ``seqused_k``, so it correctly masks padded K positions when
+            the batch contains samples with different history lengths.
+            Safe for arbitrary batches.
+          - ``"dsl"``: fused implementation. ~1.5x faster than 3kernel
+            on SM80 / SM90 / SM120 at typical SID-GR shapes (measured
+            2026-05 on H100 NVL: ~0.111 ms vs ~0.164 ms per call). The
+            fused path silently ignores ``seqused_k``, so it can only
+            be used when every sample in the batch has the same history
+            length. We check this at runtime and raise if you pick
+            ``"dsl"`` with a non-uniform batch.
+
+          On SM100 (B200) the kernel auto-routes to the pipelined
+          implementation regardless of the ``backend`` arg, because the
+          fused path is slower there.
+
+          Note: end-to-end this only saves ~0.15 ms on a ~6.7 ms decode
+          loop (~3%); dense projections dominate. Default stays
+          ``"3kernel"`` because it works for all batch shapes.
+
+        Args:
+            batch: input batch.
+            backend: ``"3kernel"`` (default) or ``"dsl"``. See "Backend
+                choice" above. Pass ``"dsl"`` only when all samples in
+                the batch share the same history length.
+            phase_times: optional dict; if given, populated with measured
+                phase latencies (in milliseconds) using cuda events:
+                  - "prefill_ms": time spent in prefill (including embedding).
+                  - "decode_loop_ms": time spent in the decode loop.
+                Useful for benchmarking. Adds tiny overhead.
+            use_jagged_kv: when True and ``backend="3kernel"``, run
+                prefill in jagged-native mode (concatenated
+                ``[total_tokens, D]`` stream through FA with an
+                arbitrary causal mask) and feed jagged
+                ``[total_k, H, D]`` context K/V caches to the kernel via
+                ``cu_seqlens_k``. No padding is computed anywhere.
+                When False (default), pad history to
+                ``[B, max_seqlen, D]``, run FA in ``causal=True``, and
+                pass ``seqused_k`` to mask pad positions.
+
+                Dense is faster on short-history shapes because FA's
+                ``causal=True`` is heavily optimized and the
+                arbitrary-mask path adds block-sparsity setup overhead.
+                Jagged wins once context grows past roughly
+                ``hist >= 1000`` items; see benchmark/RESULTS.md.
+
+                Requires ``backend="3kernel"``; raises ``ValueError``
+                otherwise.
+        """
+        # Backend whitelist: the kernel's interface silently treats any
+        # non-"3kernel" string as the fused/dsl path, so reject typos
+        # here rather than letting them slip through.
+        if backend not in ("3kernel", "dsl"):
+            raise ValueError(f"backend must be '3kernel' or 'dsl', got {backend!r}")
+
+        # use_jagged_kv requires the pipelined backend. The fused path
+        # doesn't consume cu_seqlens_k; silently routing through dense
+        # would discard the caller's choice.
+        if use_jagged_kv and backend != "3kernel":
+            raise ValueError(
+                f"use_jagged_kv=True requires backend='3kernel'; got "
+                f"backend={backend!r}. The fused/dsl path does not accept "
+                f"cu_seqlens_k."
+            )
+
+        # generate_beam_decode uses JaggedFlashAttnBlock for prefill and
+        # decode; SIDGRDecoder must have been constructed with
+        # use_jagged_flash_attn=True. Fail at entry rather than after
+        # _prepare_embeddings does work that has to be thrown away.
+        if not self.decoder.use_jagged_flash_attn:
+            raise RuntimeError(
+                "generate_beam_decode() requires use_jagged_flash_attn=True "
+                "because it uses JaggedFlashAttnBlock for prefill and beam "
+                "decode."
+            )
+
+        # Kernel-side preconditions on BeamSearch configuration.
+        # beam_decode_attn asserts uniform beam widths via
+        # k_beam.shape[1] == decode_nums * beam_width, and we accumulate
+        # beam_kv with a fixed stride per step. Reject non-uniform here.
+        beam_widths = self.beam_search.beam_widths
+        if not all(w == beam_widths[0] for w in beam_widths):
+            raise ValueError(
+                f"generate_beam_decode requires uniform beam_widths across "
+                f"hierarchy steps for the beam_decode_attn kernel; got "
+                f"{beam_widths}"
+            )
+        # propagate() clamps actual topk to
+        # min(beam_widths[s], topk_previous_step * codebook_size_this_step).
+        # If any codebook_size < beam_width, propagate would shrink topk,
+        # making k_beam.shape[1] inconsistent with decode_nums * beam_width.
+        bw = beam_widths[0]
+        cs_min = min(self.codebook_sizes)
+        if bw > cs_min:
+            raise ValueError(
+                f"generate_beam_decode requires beam_width ({bw}) <= "
+                f"min(codebook_sizes) ({cs_min}); otherwise propagate would "
+                f"shrink the actual topk and the kernel's "
+                f"k_beam.shape[1] == decode_nums * beam_width assertion fails"
+            )
+
+        # Capability probe for use_jagged_kv=True: fail at entry rather
+        # than deep in decode_beam. Catches two cases:
+        #   (a) installed kernel lacks the cu_seqlens_k kwarg (upstream).
+        #   (b) resolver fell back to _beam_decode_attn_reference, whose
+        #       signature includes cu_seqlens_k but only to raise
+        #       NotImplementedError on use.
+        if use_jagged_kv:
+            import inspect
+
+            from .jagged_flash_attn_block import (
+                _beam_decode_attn_reference,
+                _get_beam_decode_attn,
+            )
+
+            kernel = _get_beam_decode_attn()
+            if kernel is _beam_decode_attn_reference:
+                raise RuntimeError(
+                    "use_jagged_kv=True requires the real CuTe "
+                    "beam_decode_attn kernel; the PyTorch reference "
+                    "fallback does not implement jagged context K/V "
+                    "(it only raises NotImplementedError when actually "
+                    "called). Ensure corelib/gr_decode_atten is on "
+                    "PYTHONPATH (Docker image sets this automatically), "
+                    "or use use_jagged_kv=False."
+                )
+            try:
+                _kernel_sig = inspect.signature(kernel)
+            except (TypeError, ValueError) as exc:
+                # Fail closed: an uninspectable callable (e.g. a C
+                # extension) cannot be proven to accept cu_seqlens_k.
+                # Better an explicit entry error than a deep
+                # "unexpected keyword argument" surprise mid-decode.
+                raise RuntimeError(
+                    "use_jagged_kv=True requires a beam_decode_attn "
+                    "callable whose signature can be inspected for "
+                    "cu_seqlens_k support. The installed kernel's "
+                    "signature is not inspectable, so cu_seqlens_k "
+                    "support cannot be verified. Use use_jagged_kv=False "
+                    "or verify corelib/gr_decode_atten is on PYTHONPATH."
+                ) from exc
+            if "cu_seqlens_k" not in _kernel_sig.parameters:
+                raise RuntimeError(
+                    "use_jagged_kv=True requires a beam_decode_attn "
+                    "entry point that accepts cu_seqlens_k. The vendored "
+                    "corelib/gr_decode_atten kernel includes it; the "
+                    "currently-resolved kernel does not. Check "
+                    "PYTHONPATH, or use use_jagged_kv=False."
+                )
+
+        # Optional phase timing via cuda events
+        record_times = phase_times is not None
+        if record_times:
+            ev_t0 = torch.cuda.Event(enable_timing=True)
+            ev_t1 = torch.cuda.Event(enable_timing=True)
+            ev_t2 = torch.cuda.Event(enable_timing=True)
+            ev_t0.record()
+
+        # 0. Prepare history + BOS embeddings
+        (
+            history_embeddings,
+            input_offsets,
+            input_max_seqlen,
+        ) = self._prepare_embeddings(
+            batch, add_bos_to_history=False, is_generation=True
+        )
+        batch_size = batch.actual_batch_size
+        input_offsets = input_offsets[: batch_size + 1]
+
+        # Access the inner JaggedFlashAttnBlock through the decoder helper.
+        fa_block = self.decoder.get_jagged_flash_attn_block()
+
+        # 1. Prefill — produces per-layer context K/V caches in either
+        # jagged or dense layout, depending on use_jagged_kv.
+        history_seqlens = torch.diff(input_offsets)  # [B]
+        seqused_k = None
+        cu_seqlens_k = None
+
+        # backend="dsl" silently ignores both seqused_k and cu_seqlens_k —
+        # so it can only handle uniform-length history. Validate that
+        # before paying any prefill cost (host sync on .all().item() is
+        # cheap; the actual prefill is 2-3 ms).
+        if backend != "3kernel":
+            if not bool((history_seqlens == history_seqlens[0]).all().item()):
+                raise ValueError(
+                    f"backend={backend!r} (fused/dsl path) ignores "
+                    f"seqused_k / cu_seqlens_k, so all samples must share "
+                    f"the same history length. Got history_seqlens="
+                    f"{history_seqlens.tolist()}. Use backend='3kernel' "
+                    f"or pre-pad/crop history."
+                )
+
+        if backend == "3kernel" and use_jagged_kv:
+            # Jagged-native prefill: feed the concatenated [total_tokens, D]
+            # stream through FA as a B=1 sequence with arbitrary_func encoding
+            # per-sample causal isolation. The K/V caches that fall out are
+            # already jagged [total_tokens, H, D] — exactly the layout the
+            # kernel expects when cu_seqlens_k is supplied.
+            total_tokens = int(input_offsets[-1].item())
+            jagged_arbitrary_func = build_jagged_causal_arbitrary_func(
+                input_offsets, total_tokens
+            )
+            flat_history = history_embeddings.unsqueeze(0).to(
+                self._training_dtype
+            )  # [1, total_tokens, D]
+            prefill_output, context_kv_caches = fa_block.prefill(
+                flat_history,
+                arbitrary_func=jagged_arbitrary_func,
+                seqlen=total_tokens,
+            )
+            prefill_output = prefill_output.squeeze(0)  # [total_tokens, D]
+            context_kv_caches = [
+                (k.squeeze(0), v.squeeze(0)) for k, v in context_kv_caches
+            ]
+            cu_seqlens_k = input_offsets.to(torch.int32)
+            # BOS hidden = last valid position per sample, in flat layout
+            bos_offsets_flat = (input_offsets[1:] - 1).clamp(min=0)
+            bos_hidden = prefill_output[bos_offsets_flat]  # [B, D]
+        else:
+            # Dense prefill: pad history, run [B, max_seqlen, D] through
+            # FA's causal=True fast path.
+            padded_history = (
+                torch.ops.fbgemm.jagged_to_padded_dense(
+                    values=history_embeddings,
+                    offsets=[input_offsets],
+                    max_lengths=[input_max_seqlen],
+                    padding_value=0.0,
+                )
+                .view(batch_size, input_max_seqlen, -1)
+                .to(self._training_dtype)
+            )
+            prefill_output, context_kv_caches = fa_block.prefill(
+                padded_history, arbitrary_func=None, seqlen=input_max_seqlen
+            )
+            bos_positions = (history_seqlens - 1).clamp(min=0)  # [B]
+            bos_hidden = prefill_output[
+                torch.arange(batch_size, device=prefill_output.device),
+                bos_positions,
+            ]  # [B, D]
+            if backend == "3kernel":
+                seqused_k = history_seqlens.to(torch.int32)
+            # backend="dsl" already validated above (uniform history).
+
+        # MLP → logits for step 0
+        self.beam_search.reset()
+        bos_hidden = bos_hidden.unsqueeze(1)  # [B, 1, D]
+        mlp = (
+            self._decoder_mlp[0]
+            if not self.share_lm_head_across_hierarchies
+            else self._decoder_mlp
+        )
+        tuple_or_tensor: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor] = mlp(
+            bos_hidden
+        )
+        candidates_logits = (
+            tuple_or_tensor[0]
+            if isinstance(tuple_or_tensor, tuple)
+            else tuple_or_tensor
+        )
+        probs_step0: torch.Tensor = torch.nn.functional.log_softmax(
+            candidates_logits.float(), dim=-1
+        )
+        self.beam_search.propagate(probs_step0)
+
+        if record_times:
+            ev_t1.record()
+
+        # 2. Decode loop for remaining hierarchy steps
+        num_heads = fa_block.layers[0].num_heads
+        num_layers = len(fa_block.layers)
+
+        # Per-layer accumulated beam KV: None initially
+        beam_kv_caches: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [
+            None
+        ] * num_layers
+
+        for d in range(self._num_hierarchies - 1):
+            # d is the decode step (0-indexed); the codes we embed here
+            # were chosen by propagate(step=d).
+            hierarchy_step = d + 1
+
+            # Use the actual top-k count from beam_search (may be less than
+            # the configured beam_width when topk is bounded by
+            # topk_previous_step * codebook_size).
+            step_codes = self.beam_search.generated_sids[:, :, d]  # [B, current_topk]
+            current_topk = step_codes.shape[1]
+            step_codes_flat = step_codes.reshape(-1)
+
+            codes_kjt = KeyedJaggedTensor.from_lengths_sync(
+                keys=[
+                    batch.candidate_feature_name,
+                    batch.history_feature_name,
+                ],
+                values=step_codes_flat,
+                lengths=torch.cat(
+                    [
+                        torch.full(
+                            (batch_size,),
+                            current_topk,
+                            device=step_codes_flat.device,
+                            dtype=torch.long,
+                        ),
+                        torch.zeros(
+                            (batch_size,),
+                            device=step_codes_flat.device,
+                            dtype=torch.long,
+                        ),
+                    ]
+                ),
+            )
+            code_embeddings = (
+                self._codebooks_collection(codes_kjt)[batch.candidate_feature_name]
+                .values()
+                .to(self._training_dtype)
+            )  # [B * current_topk, D]
+            code_embeddings = code_embeddings.view(
+                batch_size, current_topk, self.embedding_dim
+            )
+
+            # Build topk_indices for this decode step
+            decode_nums = d + 1  # include self
+            topk_indices = self.beam_search.build_beam_topk_indices(
+                decode_step=d,
+                num_heads=num_heads,
+            )
+
+            # Decode through all layers
+            hidden_states, new_beam_kvs = fa_block.decode_beam(
+                code_embeddings,
+                context_kv_caches,
+                beam_kv_caches,
+                topk_indices,
+                decode_nums,
+                seqused_k=seqused_k,
+                cu_seqlens_k=cu_seqlens_k,
+                backend=backend,
+            )  # hidden_states: [B, W, D]
+
+            # Accumulate beam KV for next step
+            for l in range(num_layers):
+                k_new, v_new = new_beam_kvs[l]
+                cache = beam_kv_caches[l]
+                if cache is not None:
+                    k_prev, v_prev = cache
+                    beam_kv_caches[l] = (
+                        torch.cat([k_prev, k_new], dim=1),
+                        torch.cat([v_prev, v_new], dim=1),
+                    )
+                else:
+                    beam_kv_caches[l] = (k_new, v_new)
+
+            # MLP → logits → beam_search.propagate
+            mlp = (
+                self._decoder_mlp[hierarchy_step]
+                if not self.share_lm_head_across_hierarchies
+                else self._decoder_mlp
+            )
+            tuple_or_tensor = mlp(hidden_states)
+            candidates_logits = (
+                tuple_or_tensor[0]
+                if isinstance(tuple_or_tensor, tuple)
+                else tuple_or_tensor
+            )
+            probs_this_step: torch.Tensor = torch.nn.functional.log_softmax(
+                candidates_logits.float(), dim=-1
+            )
+            self.beam_search.propagate(probs_this_step)
+
+        if phase_times is not None:
+            ev_t2.record()
+            torch.cuda.synchronize()
+            phase_times["prefill_ms"] = ev_t0.elapsed_time(ev_t1)
+            phase_times["decode_loop_ms"] = ev_t1.elapsed_time(ev_t2)
+
         generated_sids = self.beam_search.get_sids()
         log_probs = self.beam_search.get_log_probs()
         return generated_sids, log_probs

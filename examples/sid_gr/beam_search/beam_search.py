@@ -21,6 +21,16 @@ class BeamSearch:
         """
         if isinstance(beam_width, int):
             beam_widths = [beam_width] * num_hierarchies
+        else:
+            beam_widths = list(beam_width)
+        assert len(beam_widths) == num_hierarchies, (
+            f"beam_width length {len(beam_widths)} must match "
+            f"num_hierarchies {num_hierarchies}"
+        )
+        # BeamSearch supports non-uniform beam widths in general; the
+        # uniform-only constraint belongs to consumers that hand off to
+        # the beam_decode_attn kernel (see SIDGRModel.generate_beam_decode),
+        # which asserts ``k_beam.shape[1] == decode_nums * beam_width``.
         self.beam_widths = beam_widths
         self.num_hierarchies = num_hierarchies
         self.codebook_sizes = codebook_sizes
@@ -34,10 +44,10 @@ class BeamSearch:
             ), "codebooks should be provided if prefix_valid_check is True"
         self.accumulated_log_probs: torch.Tensor = torch.tensor(
             []
-        )  # to perceive the mppy check
+        )  # to appease the mypy check
         self.generated_sids: torch.Tensor = torch.tensor(
             []
-        )  # to perceive the mppy check
+        )  # to appease the mypy check
         self.step: int = 0
 
         # for debugging purpose
@@ -46,6 +56,8 @@ class BeamSearch:
         self.history_accumulate_topk_probs: List[torch.Tensor] = []
         self.history_probs: List[torch.Tensor] = []
 
+        # parent beam indices per step for ancestor tracking
+        self.parent_indices: List[torch.Tensor] = []
         self.reset()
 
     def propagate(
@@ -114,6 +126,7 @@ class BeamSearch:
             self.history_topk_sids.append(generated_sids)
             self.history_accumulate_topk_probs.append(torch.exp(topk_probs))
             self.history_probs.append(torch.exp(log_probs_this_step))
+        self.parent_indices.append(last_step_indices)
         self.generated_sids = generated_sids
         self.accumulated_log_probs = topk_probs
         self.step += 1
@@ -127,6 +140,7 @@ class BeamSearch:
         self.history_topk_sids = []
         self.history_accumulate_topk_probs = []
         self.history_probs = []
+        self.parent_indices = []
 
     def get_sids(
         self,
@@ -144,11 +158,90 @@ class BeamSearch:
         else:
             raise ValueError(f"Step {step} is not valid, current step is {self.step}")
 
-    def generate_valid_mask(self) -> torch.Tensor:
+    def build_beam_topk_indices(
+        self,
+        decode_step: int,
+        num_heads: int,
+    ) -> torch.Tensor:
         """
-        update the valid mask between current step and previous step,
-        this can be used for transformer attention
+        Build topk_indices for beam_decode_attn kernel at a given decode step.
+
+        At decode step d, the beam KV cache contains (d+1) steps of KV
+        (steps 0..d, including self). The topk_indices encodes which beam
+        KV entry each current beam should attend to at each previous step.
+
+        beam_kv layout (general, possibly non-uniform widths):
+            beam_kv[B, sum(actual_topk_0..d), Hkv, D]
+            block s spans flat indices [step_offsets[s], step_offsets[s+1])
+            where step_offsets[s] = sum(actual_topk[:s]).
+
+        For beam w at current decode step d:
+          - at step d (self): index = step_offsets[d] + w
+          - at step s < d: index = step_offsets[s] + ancestor_beam_at_step_s
+            where ancestor is traced via parent_indices[s+1..d].
+
+        We use ``parent_indices[s].shape[1]`` — the actual topk count at
+        step s after ``propagate`` — rather than the configured
+        ``self.beam_widths[s]``. ``propagate`` clamps topk to
+        ``min(beam_widths[s], topk_previous_step * codebook_size_this_step)``,
+        so the actual count can be less than configured when the codebook
+        is small. Using the actual count keeps indexing consistent with
+        the beam_kv accumulation in ``generate_beam_decode``.
+
+        Note: ``beam_decode_attn`` asserts uniform widths via
+        ``k_beam.shape[1] == decode_nums * beam_width``. The
+        kernel-using path (``generate_beam_decode``) enforces uniformity
+        upstream; this function is correct in the general case so the
+        BeamSearch side is ready if/when the kernel grows support.
+
+        Args:
+            decode_step: current decode step (0-indexed). Must be < self.step.
+            num_heads: number of query heads (Hq) for the output shape.
+
+        Returns:
+            topk_indices: [B, 1, num_heads, decode_step+1, W_d] int32
         """
+        d = decode_step
+        # Actual topk after propagate (may differ from configured beam_widths
+        # when codebook is smaller than configured beam_width).
+        W_d = self.parent_indices[d].shape[1]
+        B = self.parent_indices[0].shape[0]
+        device = self.parent_indices[0].device
+        decode_nums = d + 1
+
+        # step_offsets[s] = first flat index of step s's block in beam_kv,
+        # using the ACTUAL topk count at each step (parent_indices.shape[1]).
+        step_offsets = [0]
+        for s in range(d):
+            step_offsets.append(step_offsets[-1] + self.parent_indices[s].shape[1])
+        # step_offsets has length decode_nums (covers steps 0..d).
+
+        # Trace ancestors backward from step d
+        # ancestor_at[s] has shape [B, W_d]: which beam at step s is the
+        # ancestor of each current beam at step d.
+        ancestor_at: List[Optional[torch.Tensor]] = [None] * decode_nums
+        ancestor_at[d] = torch.arange(W_d, device=device).unsqueeze(0).expand(B, -1)
+        pos = ancestor_at[d]
+        for s in range(d, 0, -1):
+            pos = torch.gather(self.parent_indices[s], dim=1, index=pos)
+            ancestor_at[s - 1] = pos
+
+        # Convert beam indices to beam_kv flat indices using the per-step
+        # offset (correct for both uniform and non-uniform widths). The
+        # loop above fills every slot in ancestor_at, so the asserts only
+        # exist to narrow Optional for mypy.
+        topk_columns = []
+        for s in range(decode_nums):
+            a_s = ancestor_at[s]
+            assert a_s is not None
+            topk_columns.append(step_offsets[s] + a_s)
+        topk_flat = torch.stack(topk_columns, dim=-1)  # [B, W_d, decode_nums]
+
+        # Reshape to [B, 1, num_heads, decode_nums, W_d]
+        topk_flat = topk_flat.permute(0, 2, 1)
+        topk_flat = topk_flat.unsqueeze(1).unsqueeze(1)
+        topk_flat = topk_flat.expand(B, 1, num_heads, decode_nums, W_d)
+        return topk_flat.to(torch.int32).contiguous()
 
     def get_log_probs(self) -> torch.Tensor:
         return self.accumulated_log_probs

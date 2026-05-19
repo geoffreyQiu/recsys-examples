@@ -81,7 +81,170 @@ The SID-GR model performs retrieval through beam search generation. To retrieve 
    - LLMs use beam search primarily for diversity, typically with beam width < 10
    - Recommender systems require retrieving hundreds or thousands of candidates, necessitating much larger beam widths
 
-These two characteristics necessitate different performance optimization strategies compared to LLM inference. 
+These two characteristics necessitate different performance optimization strategies compared to LLM inference.
+
+The diagram below walks through one full generation for `H=3` hierarchies, `beam_width=4`, and `codebook_size=256` (the per-hierarchy SID vocabulary). Each step takes **every** beam from the previous step — including the dashed ones — runs the model on it to produce 256 candidate continuations, and then top-K selects the 4 to keep. Each step title shows the math explicitly: e.g. `top 4 of 4 (every Step 1 beam) × 256 = 1024`. Dashed style means "this beam's descendants didn't make top-K at the next step," **not** "this beam wasn't expanded" — the multiplier `4` always counts every prev-step beam.
+
+```mermaid
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'primaryColor': '#ffffff',
+    'primaryBorderColor': '#222222',
+    'primaryTextColor': '#111111',
+    'lineColor': '#555555',
+    'fontSize': '14px',
+    'clusterBkg': '#f5f7fa',
+    'clusterBorder': '#888888'
+  }
+}}%%
+graph TD
+    BOS["history + BOS<br/>(prefill input)"]
+
+    subgraph step1["Step 1 · top 4 of 1 (BOS context) × 256 = 256"]
+        direction LR
+        S88["(88)"]
+        S89["(89)"]:::pruned
+        S12["(12)"]
+        S200["(200)"]
+    end
+
+    subgraph step2["Step 2 · top 4 of 4 (every Step 1 beam) × 256 = 1024"]
+        direction LR
+        subgraph p88["from (88)"]
+            direction LR
+            S88_50["(88, 50)"]:::pruned
+        end
+        subgraph p12["from (12) — cloned"]
+            direction LR
+            S12_30["(12, 30)"]
+            S12_28["(12, 28)"]
+        end
+        subgraph p200["from (200)"]
+            direction LR
+            S200_32["(200, 32)"]
+        end
+    end
+
+    subgraph step3["Step 3 · top 4 of 4 (every Step 2 beam) × 256 = 1024"]
+        direction LR
+        subgraph p1230["from (12, 30) — cloned"]
+            direction LR
+            S12_30_7["(12, 30, 7)"]
+            S12_30_200["(12, 30, 200)"]
+        end
+        subgraph p1228["from (12, 28)"]
+            direction LR
+            S12_28_100["(12, 28, 100)"]
+        end
+        subgraph p20032["from (200, 32)"]
+            direction LR
+            S200_32_88["(200, 32, 88)"]
+        end
+    end
+
+    BOS --> S88
+    BOS --> S89
+    BOS --> S12
+    BOS --> S200
+
+    S88 --> S88_50
+    S12 --> S12_30
+    S12 --> S12_28
+    S200 --> S200_32
+
+    S12_30 --> S12_30_7
+    S12_30 --> S12_30_200
+    S12_28 --> S12_28_100
+    S200_32 --> S200_32_88
+
+    classDef pruned stroke:#bbb,stroke-dasharray:5 4,color:#888;
+
+    linkStyle default stroke:#444,stroke-width:1.5px;
+```
+
+The four leaves at the bottom are the recommended SID tuples for this sample.
+
+### Generation APIs
+
+The model exposes two generation entry points, both producing top-K beams of full SID tuples. The diagram below contrasts the per-step work (example shapes: `hist=15`, `BOS=1`, `W=4`, `H=3`):
+
+<table width="100%">
+<tr>
+<th width="50%" align="center"><code>generate()</code> — no KV cache</th>
+<th width="50%" align="center"><code>generate_beam_decode()</code> — KV cache</th>
+</tr>
+<tr>
+<td width="50%" align="center">
+
+```mermaid
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'primaryColor': '#ffffff',
+    'primaryBorderColor': '#222222',
+    'primaryTextColor': '#111111',
+    'lineColor': '#555555',
+    'fontSize': '14px'
+  }
+}}%%
+flowchart TB
+    N0["forward<br/>seqlen = 16<br/>(hist + BOS)<br/>recompute all K/V"]
+    N1["forward<br/>seqlen = 20<br/>(hist + BOS + 4 codes)<br/>recompute all K/V"]
+    N2["forward<br/>seqlen = 24<br/>(hist + BOS + 8 codes)<br/>recompute all K/V"]
+    N0 -- "propagate → SID #1" --> N1
+    N1 -- "propagate → SID #2" --> N2
+    N2 -- "propagate → SID #3" --> Ne["done"]
+
+    linkStyle default stroke:#444,stroke-width:1.5px;
+```
+
+</td>
+<td width="50%" align="center">
+
+```mermaid
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'primaryColor': '#ffffff',
+    'primaryBorderColor': '#222222',
+    'primaryTextColor': '#111111',
+    'lineColor': '#555555',
+    'fontSize': '14px'
+  }
+}}%%
+flowchart TB
+    F0["prefill<br/>seqlen = 16<br/>(hist + BOS)<br/>→ context_kv_caches"]
+    F1["decode<br/>1 new token × W beams<br/>read ctx + own beam_kv"]
+    F2["decode<br/>1 new token × W beams<br/>read ctx + grown beam_kv"]
+    F0 -- "propagate → SID #1" --> F1
+    F1 -- "propagate → SID #2" --> F2
+    F2 -- "propagate → SID #3" --> Fe["done"]
+
+    linkStyle default stroke:#444,stroke-width:1.5px;
+```
+
+</td>
+</tr>
+</table>
+
+`generate()` reruns the full transformer over a growing `[hist + already-generated]` sequence at every step. `generate_beam_decode()` pays the history cost once during prefill and then each decode step runs only the new token per beam, attending into the cached K/V.
+
+1. **`generate()`** — baseline path. At every hierarchy step it re-runs the transformer over `[history + generated_prefix]` with a beam-isolating attention mask so beams do not cross-attend within a step. Works with either decoder backend (Megatron-Core `TransformerBlock` or `JaggedTransformerBlock`). Per-step cost grows with the running prefix length.
+
+2. **`generate_beam_decode()`** — KV-cache path. Runs a single prefill over `[history + BOS]` to populate a per-layer context K/V cache, then performs incremental beam decode using the `beam_decode_attn` kernel. The fixed context K/V is shared across beams; per-step beam K/V is appended to the cache and parent-beam ancestry is tracked through `topk_indices` rather than by reshuffling the cache. Requires `use_jagged_flash_attn=True`; the kernel is vendored at [`corelib/gr_decode_atten/`](../../corelib/gr_decode_atten/) and is on `PYTHONPATH` automatically in the Docker image. Per-step decode no longer reruns the full transformer over the growing prefix — context-side attention remains linear in history length, but full-prefix recomputation at every hierarchy step is avoided, which is where the long-history speedup comes from.
+
+The KV cache in `generate_beam_decode()` is split into two parts, with different sharing and indexing semantics:
+
+<p align="center">
+  <img src="./figs/kv_cache_split.png" alt="KV cache split in generate_beam_decode" width="75%">
+</p>
+
+The diagram is conceptual: rows = beams, columns = decode steps. In memory `beam_kv_caches[ℓ]` is flattened step-major — each decode step appends `W` new K/V rows after the previous step's rows.
+
+`context_kv_caches[ℓ]` is a single per-layer slab populated by prefill and read every decode step by every beam; no per-beam indexing. `beam_kv_caches[ℓ]` is a 2-D conceptual grid (decode step × beam slot) that grows by `W` rows per decode step; per-beam ancestor lookup walks `parent_indices` backwards and is fed to the kernel as `topk_indices`. This split is what keeps the kernel from re-shuffling the cache after each beam-search pruning and what avoids replicating history `W` times.
+
+For backend selection (`backend="3kernel"` vs `"dsl"`), jagged-vs-dense context K/V (`use_jagged_kv`), kernel dependency notes, and measured numbers, see [`benchmark/RESULTS.md`](./benchmark/RESULTS.md) and [`training/README.md`](./training/README.md).
 
 
 ## References
