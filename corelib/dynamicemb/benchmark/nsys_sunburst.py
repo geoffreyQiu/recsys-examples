@@ -29,12 +29,10 @@ import csv
 import math
 import os
 import random
-import sys
 from typing import List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 from matplotlib.patches import Wedge
-
 
 # ── tree ────────────────────────────────────────────────────────────────────
 
@@ -82,8 +80,8 @@ def add_path(root: Node, path: List[str], value: float) -> None:
 # Stage names we collapse into the 3-bucket ring 2.  Matched as substrings
 # (in order) against each segment of parent_stages.
 _STAGE_BUCKETS = [
-    ("dynamicemb_prefetch",            "prefetch"),
-    ("DynamicEmbeddingFunction.forward",  "forward"),
+    ("dynamicemb_prefetch", "prefetch"),
+    ("DynamicEmbeddingFunction.forward", "forward"),
     ("DynamicEmbeddingFunction.backward", "backward"),
 ]
 
@@ -185,28 +183,45 @@ def tree_demo() -> Node:
 
     KERNEL_SEQ = {
         ("dyn", "forward"): [
-            "segmented_unique", "hash_find", "load_from_flat",
-            "init_for_admitted", "gather_embedding", "hash_insert",
+            "segmented_unique",
+            "hash_find",
+            "load_from_flat",
+            "init_for_admitted",
+            "gather_embedding",
+            "hash_insert",
         ],
         ("dyn", "backward"): [
-            "reduce_grads", "optimizer_update", "store_to_flat",
+            "reduce_grads",
+            "optimizer_update",
+            "store_to_flat",
         ],
         ("trc", "forward"): [
-            "bounds_check", "embedding_lookup", "pooling",
+            "bounds_check",
+            "embedding_lookup",
+            "pooling",
         ],
         ("trc", "backward"): [
-            "reduce_grads", "optimizer_update",
+            "reduce_grads",
+            "optimizer_update",
         ],
     }
     BASE_MS = {
-        "segmented_unique":  0.4, "hash_find": 3.0, "load_from_flat": 2.2,
-        "init_for_admitted": 0.3, "gather_embedding": 11.0, "hash_insert": 3.2,
-        "reduce_grads":      0.6, "optimizer_update": 0.3, "store_to_flat": 0.1,
-        "bounds_check":      0.4, "embedding_lookup":  3.5, "pooling":      0.2,
+        "segmented_unique": 0.4,
+        "hash_find": 3.0,
+        "load_from_flat": 2.2,
+        "init_for_admitted": 0.3,
+        "gather_embedding": 11.0,
+        "hash_insert": 3.2,
+        "reduce_grads": 0.6,
+        "optimizer_update": 0.3,
+        "store_to_flat": 0.1,
+        "bounds_check": 0.4,
+        "embedding_lookup": 3.5,
+        "pooling": 0.2,
     }
-    CONFIGS  = ["cfr=0.8", "cfr=1.0"]
+    CONFIGS = ["cfr=0.8", "cfr=1.0"]
     BACKENDS = ["dyn", "trc"]
-    PHASES   = ["forward", "backward"]
+    PHASES = ["forward", "backward"]
 
     root = Node("ALL")
     for cfg in CONFIGS:
@@ -215,10 +230,20 @@ def tree_demo() -> Node:
                 for step, kn in enumerate(KERNEL_SEQ[(back, phase)]):
                     base = BASE_MS[kn]
                     jitter = random.uniform(0.75, 1.25)
-                    shrink = 0.4 if (cfg == "cfr=1.0" and kn in {
-                        "hash_insert", "load_from_flat",
-                        "store_to_flat", "hash_find",
-                    }) else 1.0
+                    shrink = (
+                        0.4
+                        if (
+                            cfg == "cfr=1.0"
+                            and kn
+                            in {
+                                "hash_insert",
+                                "load_from_flat",
+                                "store_to_flat",
+                                "hash_find",
+                            }
+                        )
+                        else 1.0
+                    )
                     ms = round(base * jitter * shrink, 3)
                     add_path(root, [cfg, back, phase, f"{step:02d}_{kn}"], ms)
     return root
@@ -362,13 +387,20 @@ def _draw_node(
         # Leaves get a globally-unique pre-computed color (set in render()
         # before this descent); other nodes fall back to the per-ring
         # palette indexed by sibling order.
-        fc = child.color if child.color is not None \
-             else color_for(draw_depth, idx, n_sibs)
+        fc = (
+            child.color
+            if child.color is not None
+            else color_for(draw_depth, idx, n_sibs)
+        )
         w = Wedge(
-            (0, 0), r_outer, 90 - c_end, 90 - c_start,
+            (0, 0),
+            r_outer,
+            90 - c_end,
+            90 - c_start,
             width=r_outer - r_inner,
             facecolor=fc,
-            edgecolor="white", linewidth=1.2,
+            edgecolor="white",
+            linewidth=1.2,
         )
         ax.add_patch(w)
 
@@ -380,7 +412,7 @@ def _draw_node(
             y = r_label * math.cos(rad)
             rotation = -mid_angle
             if 90 < mid_angle < 270:
-                rotation += 180          # flip bottom-half labels
+                rotation += 180  # flip bottom-half labels
             # Percentage = this wedge's value / total iter time.  Reads
             # as "this slice is X% of the whole iteration", consistent
             # across levels (parent + child pcts sum to parent's pct).
@@ -390,20 +422,24 @@ def _draw_node(
             # table next to the chart.  Stage / phase rings use the
             # human-readable label.
             display_name = child.code if (is_leaf and child.code) else child.label
-            label_text = (f"{display_name}\n{pct:.1f}%"
-                          if extent >= 6.0 else display_name)
+            label_text = (
+                f"{display_name}\n{pct:.1f}%" if extent >= 6.0 else display_name
+            )
             ax.text(
-                x, y, label_text,
-                ha="center", va="center",
-                rotation=rotation, rotation_mode="anchor",
+                x,
+                y,
+                label_text,
+                ha="center",
+                va="center",
+                rotation=rotation,
+                rotation_mode="anchor",
                 fontsize=8.5 if draw_depth < 3 else 7.0,
-                color="black",   # all rings are now light pastels
+                color="black",  # all rings are now light pastels
                 linespacing=0.95,
             )
 
         if not is_leaf:
-            _draw_node(ax, child, c_start, c_end, depth + 1, rings,
-                       grand_total)
+            _draw_node(ax, child, c_start, c_end, depth + 1, rings, grand_total)
         cursor = c_end
 
 
@@ -431,7 +467,7 @@ def render(
     # value triplet rotation as a secondary distinguishing axis so even
     # wedges that happen to share a hue family (every ~3 steps if N is
     # divisible) stay visually separable.
-    GOLDEN_STEP = 1.0 - 1.0 / ((1 + 5 ** 0.5) / 2)   # ≈ 0.381966
+    GOLDEN_STEP = 1.0 - 1.0 / ((1 + 5**0.5) / 2)  # ≈ 0.381966
     sat_levels = (0.32, 0.46, 0.58)
     val_levels = (0.97, 0.92, 0.99)
     for i, (_, leaf) in enumerate(leaves_in_order):
@@ -453,7 +489,8 @@ def render(
     chart_share = 1.0 - table_share
     fig = plt.figure(figsize=(14, 18))
     gs = fig.add_gridspec(
-        2, 1,
+        2,
+        1,
         height_ratios=[chart_share, table_share],
         hspace=0.05,
     )
@@ -468,16 +505,27 @@ def render(
 
     _draw_node(ax_chart, root, 0.0, 360.0, 0, rings, total)
 
-    ax_chart.text(0, 0, f"total\n{total:.2f} {units}",
-                  ha="center", va="center",
-                  fontsize=11, fontweight="bold")
     ax_chart.text(
-        0, -1.18,
-        subtitle or "rings (inside → out): phase → "
-                    "{prefetch / forward / backward} → op  "
-                    "(wedge angle ∝ avg ms / iter, dyn side only; "
-                    "pct = share of full iter)",
-        ha="center", va="top", fontsize=9, color="#444",
+        0,
+        0,
+        f"total\n{total:.2f} {units}",
+        ha="center",
+        va="center",
+        fontsize=11,
+        fontweight="bold",
+    )
+    ax_chart.text(
+        0,
+        -1.18,
+        subtitle
+        or "rings (inside → out): phase → "
+        "{prefetch / forward / backward} → op  "
+        "(wedge angle ∝ avg ms / iter, dyn side only; "
+        "pct = share of full iter)",
+        ha="center",
+        va="top",
+        fontsize=9,
+        color="#444",
     )
 
     # ── legend table ──────────────────────────────────────────────────
@@ -515,7 +563,9 @@ def render(
 
     fig.suptitle(
         title or "GPU time breakdown",
-        y=0.98, fontsize=14, fontweight="bold",
+        y=0.98,
+        fontsize=14,
+        fontweight="bold",
     )
     fig.savefig(out_png, dpi=140, bbox_inches="tight")
     print(f"saved {out_png}")
@@ -540,31 +590,33 @@ def _detect_format(csv_path: str) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Multi-ring nested donut from nsys_breakdown CSV(s).  "
-                    "Accepts the per-config 'opcalls__*.csv' (one PNG per "
-                    "input) or the legacy cross-config 'breakdown.csv' "
-                    "(single PNG).",
+        "Accepts the per-config 'opcalls__*.csv' (one PNG per "
+        "input) or the legacy cross-config 'breakdown.csv' "
+        "(single PNG).",
     )
     parser.add_argument(
-        "csv", nargs="*",
+        "csv",
+        nargs="*",
         help="one or more breakdown CSVs (omit when --demo is used)",
     )
     parser.add_argument(
         "--out",
         help="output PNG path -- only honored when exactly one input CSV "
-             "is given (or in --demo).  With multiple inputs the path is "
-             "derived per-CSV as <csv-base>.sunburst.png",
+        "is given (or in --demo).  With multiple inputs the path is "
+        "derived per-CSV as <csv-base>.sunburst.png",
     )
     parser.add_argument(
         "--out-dir",
         help="when given, write per-input PNGs into this dir instead of "
-             "next to the CSV",
+        "next to the CSV",
     )
     parser.add_argument(
         "--filter-config",
         help="legacy CSVs only: keep configs whose label contains this substring",
     )
     parser.add_argument(
-        "--demo", action="store_true",
+        "--demo",
+        action="store_true",
         help="ignore csv args and render a hand-tuned fake-data tree",
     )
     args = parser.parse_args()
@@ -576,10 +628,11 @@ def main() -> None:
             "sunburst_demo.png",
         )
         render(
-            root, out_png,
+            root,
+            out_png,
             title="GPU time breakdown — fake demo data",
             subtitle="rings (inside → out): config → backend → phase → kernel  "
-                     "(wedge angle ∝ ms)",
+            "(wedge angle ∝ ms)",
             units="ms",
         )
         return
@@ -605,16 +658,20 @@ def main() -> None:
             # short config label for the figure title.
             cfg_label = base.replace("opcalls__", "")
             title = f"GPU time breakdown per iteration\n{cfg_label}"
-            subtitle = ("rings (inside → out): phase → "
-                        "{prefetch / forward / backward} → op  "
-                        "(wedge angle ∝ avg ms / iter, dyn side only; "
-                        "pct = share of full iter)")
+            subtitle = (
+                "rings (inside → out): phase → "
+                "{prefetch / forward / backward} → op  "
+                "(wedge angle ∝ avg ms / iter, dyn side only; "
+                "pct = share of full iter)"
+            )
             units = "ms/iter"
         else:
             title_suffix = f" — {args.filter_config}" if args.filter_config else ""
             title = f"GPU time breakdown{title_suffix}"
-            subtitle = ("rings (inside → out): config → backend → phase → "
-                        "kernel  (wedge angle ∝ ms)")
+            subtitle = (
+                "rings (inside → out): config → backend → phase → "
+                "kernel  (wedge angle ∝ ms)"
+            )
             units = "ms"
 
         render(root, out_png, title=title, subtitle=subtitle, units=units)

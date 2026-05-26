@@ -439,9 +439,7 @@ def create_dynamic_embedding_tables(
                     torch.arange(start, end_t, device=device, dtype=torch.int64)
                 )
                 tids_list.append(
-                    torch.full(
-                        (end_t - start,), t, dtype=torch.int64, device=device
-                    )
+                    torch.full((end_t - start,), t, dtype=torch.int64, device=device)
                 )
             if not keys_list:
                 break
@@ -907,9 +905,7 @@ def benchmark_with_nsys(dynamic_emb, torchrec_emb, sparse_features, cfg):
     torch.cuda.synchronize()
     torch.cuda.cudart().cudaProfilerStop()
 
-    print(
-        f"  Nsys profiled {len(sparse_features)} iters (dyn + trc, fwd+bwd each)."
-    )
+    print(f"  Nsys profiled {len(sparse_features)} iters (dyn + trc, fwd+bwd each).")
 
 
 # ── NCU (Nsight Compute) profiler integration ────────────────────────────────
@@ -988,7 +984,9 @@ def print_ncu_command(cfg: BenchmarkConfig):
         f" {single_inner}"
     )
 
-    multi_inner = "bash benchmark/benchmark_batched_dynamicemb_tables.sh --profile ncu-run"
+    multi_inner = (
+        "bash benchmark/benchmark_batched_dynamicemb_tables.sh --profile ncu-run"
+    )
     multi_out = os.path.join(os.getcwd(), "ncu_all_configs")
     multi_cmd = (
         f"ncu -f --target-processes all"
@@ -1265,17 +1263,15 @@ def _populate_correctness_tables(
         if half == 0:
             continue
         trc_w_t = trc_weights[t]
-        assert trc_w_t.shape[1] == D, (
-            f"trc_weights[{t}] dim {trc_w_t.shape[1]} != cfg.embedding_dim {D}"
-        )
+        assert (
+            trc_w_t.shape[1] == D
+        ), f"trc_weights[{t}] dim {trc_w_t.shape[1]} != cfg.embedding_dim {D}"
 
         for start in range(0, half, _INSERT_BATCH):
             end = min(start + _INSERT_BATCH, half)
             chunk = end - start
             keys = torch.arange(start, end, device=device, dtype=torch.int64)
-            init_w = trc_w_t[start:end].to(
-                device=device, dtype=torch.float32
-            )
+            init_w = trc_w_t[start:end].to(device=device, dtype=torch.float32)
 
             if optstate_dim > 0:
                 opt_zero = torch.zeros(
@@ -1286,9 +1282,7 @@ def _populate_correctness_tables(
                 values = init_w.contiguous()
             values = values.to(emb_dtype)
 
-            table_ids = torch.full(
-                (chunk,), t, dtype=torch.int64, device=device
-            )
+            table_ids = torch.full((chunk,), t, dtype=torch.int64, device=device)
             scores = (
                 torch.ones(chunk, dtype=torch.uint64, device=device)
                 if cfg.cache_algorithm == "lfu"
@@ -1374,9 +1368,7 @@ def run_single_benchmark(
     # of each table so every lookup hits a key we mirrored from TorchRec
     # into DynamicEmb.  All other modes sample over the full cap.
     half_caps = (
-        [c // 2 for c in cfg.num_embeddings_per_feature]
-        if cfg.correctness
-        else None
+        [c // 2 for c in cfg.num_embeddings_per_feature] if cfg.correctness else None
     )
 
     timer.start()
@@ -1418,9 +1410,7 @@ def run_single_benchmark(
         # PowerLaw/zipf already produce values in [min, max-1] / [min, max),
         # so passing half_caps as the upper bound guarantees every index is
         # strictly less than cap/2 -- the populated range on DynamicEmb.
-        n_keys = _populate_correctness_tables(
-            dynamic_emb, torchrec_emb, cfg, device
-        )
+        n_keys = _populate_correctness_tables(dynamic_emb, torchrec_emb, cfg, device)
         print(
             f"  Correctness: mirrored {n_keys} keys "
             f"(TorchRec[:cap/2] -> DynamicEmb)"
