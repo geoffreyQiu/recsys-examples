@@ -317,7 +317,9 @@ class HSTULayer(MegatronModule):
                 tk,
                 tv,
                 jd.seqlen_offsets,
-                num_contextuals=jd.contextual_seqlen if not self._disable_contextual_mask else None,
+                num_contextuals=jd.contextual_seqlen
+                if not self._disable_contextual_mask
+                else None,
                 num_candidates=jd.num_candidates,
                 max_seqlen=jd.max_seqlen,
                 scaling_seqlen=jd.scaling_seqlen,

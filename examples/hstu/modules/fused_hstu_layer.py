@@ -148,7 +148,9 @@ class FusedHSTULayer(MegatronModule):
             # attn related
             attn_backend=self._attn_backend,
             num_targets=jd.num_candidates,
-            num_contextuals=jd.contextual_seqlen if not self._disable_contextual_mask else None,
+            num_contextuals=jd.contextual_seqlen
+            if not self._disable_contextual_mask
+            else None,
             target_group_size=self._target_group_size,
             alpha=self._alpha,
             causal=self._is_causal,
