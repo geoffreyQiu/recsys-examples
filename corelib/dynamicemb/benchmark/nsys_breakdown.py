@@ -49,7 +49,6 @@
 #   python nsys_breakdown.py trace.nsys-rep --out-dir /tmp/bd
 
 import argparse
-import bisect
 import csv
 import os
 import re
@@ -59,23 +58,22 @@ import sys
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
+
 # KERNEL_NAME_PATTERNS pulled from the benchmark file via AST, used only as a
 # fallback when an unwrapped kernel falls outside any op:* range.  We don't
 # import the module directly because it pulls in torch/torchrec at import time.
 def _load_kernel_name_patterns() -> Dict[str, List[str]]:
     import ast
+
     src_path = os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
         "benchmark_batched_dynamicemb_tables.py",
     )
     tree = ast.parse(open(src_path).read())
     for node in tree.body:
-        if (
-            isinstance(node, ast.Assign)
-            and any(
-                isinstance(t, ast.Name) and t.id == "KERNEL_NAME_PATTERNS"
-                for t in node.targets
-            )
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "KERNEL_NAME_PATTERNS"
+            for t in node.targets
         ):
             return ast.literal_eval(node.value)
     return {}
@@ -94,15 +92,20 @@ def ensure_sqlite(nsys_rep: str) -> str:
     sqlite_path = re.sub(r"\.(nsys-rep|qdrep)$", ".sqlite", nsys_rep)
     if sqlite_path == nsys_rep:
         sqlite_path = nsys_rep + ".sqlite"
-    if (
-        os.path.exists(sqlite_path)
-        and os.path.getmtime(sqlite_path) >= os.path.getmtime(nsys_rep)
-    ):
+    if os.path.exists(sqlite_path) and os.path.getmtime(
+        sqlite_path
+    ) >= os.path.getmtime(nsys_rep):
         return sqlite_path
     print(f"[export] {nsys_rep} -> {sqlite_path}", file=sys.stderr)
     subprocess.run(
-        ["nsys", "export", "--type=sqlite",
-         f"--output={sqlite_path}", "--force-overwrite=true", nsys_rep],
+        [
+            "nsys",
+            "export",
+            "--type=sqlite",
+            f"--output={sqlite_path}",
+            "--force-overwrite=true",
+            nsys_rep,
+        ],
         check=True,
     )
     return sqlite_path
@@ -232,7 +235,7 @@ def _attribute_kernels(nvtx, kernels):
     # close) gets the right enclosing context.
     events.sort(key=lambda x: (x[0], x[1]))
 
-    stack: List[Tuple[int, str]] = []      # (open_idx, name)
+    stack: List[Tuple[int, str]] = []  # (open_idx, name)
 
     for t, kind, idx, payload in events:
         if kind == OPEN:
@@ -282,11 +285,11 @@ def _parse_record(k_start: int, k_end: int, k_name: str, stack: List[str]):
 
     # Filter rules.
     if in_trc:
-        return None                # trc side, skip entirely
+        return None  # trc side, skip entirely
     if not in_dyn:
-        return None                # outside dyn (setup / between iters)
+        return None  # outside dyn (setup / between iters)
     if cfg_label is None or phase is None or iter_id is None:
-        return None                # missing context, can't average per iter
+        return None  # missing context, can't average per iter
 
     # When no op:* NVTX wraps this launch, use the kernel name itself as
     # the op label.  Each distinct kernel then becomes its own row,
@@ -298,12 +301,11 @@ def _parse_record(k_start: int, k_end: int, k_name: str, stack: List[str]):
         "cfg_label": cfg_label,
         "phase": phase,
         "iter_id": iter_id,
-        "parent_stages": stages,   # outer -> inner
+        "parent_stages": stages,  # outer -> inner
         "op": op_name,
         "is_wrapped": op_leaf is not None,
         "kernel_name": k_name,
-        "fallback_cat": _classify_kernel_fallback(k_name)
-                          if op_leaf is None else None,
+        "fallback_cat": _classify_kernel_fallback(k_name) if op_leaf is None else None,
         "duration_ns": k_end - k_start,
         "start": k_start,
     }
@@ -323,14 +325,17 @@ def _accumulate(records, file_idx: int, acc):
             continue
         cfg = r["cfg_label"]
         key = (r["phase"], tuple(r["parent_stages"]), r["op"])
-        entry = acc[cfg].setdefault(key, {
-            "calls": defaultdict(int),       # iter -> #invocations
-            "ms":    defaultdict(float),     # iter -> total ms
-            "first_start": None,             # for row ordering
-            "kernel_names": set(),
-            "fallback_cats": set(),
-            "is_wrapped": r["is_wrapped"],
-        })
+        entry = acc[cfg].setdefault(
+            key,
+            {
+                "calls": defaultdict(int),  # iter -> #invocations
+                "ms": defaultdict(float),  # iter -> total ms
+                "first_start": None,  # for row ordering
+                "kernel_names": set(),
+                "fallback_cats": set(),
+                "is_wrapped": r["is_wrapped"],
+            },
+        )
         scoped_iter = (file_idx, r["iter_id"])
         entry["calls"][scoped_iter] += 1
         entry["ms"][scoped_iter] += r["duration_ns"] / 1e6
@@ -356,20 +361,24 @@ def _finalize(acc) -> Dict[str, List[Dict[str, Any]]]:
                 continue
             total_ms = sum(e["ms"].values())
             total_calls = sum(e["calls"].values())
-            rows.append({
-                "phase": phase,
-                "parent_stages": "/".join(parents),
-                "op": op,
-                "calls_per_iter": total_calls / n_iters,
-                "avg_ms_per_iter": total_ms / n_iters,
-                "total_ms": total_ms,
-                "num_iters": n_iters,
-                "kernel_names": ", ".join(sorted(e["kernel_names"]))
-                                  if e["kernel_names"] else "",
-                "fallback_category": ", ".join(sorted(e["fallback_cats"]))
-                                     if e["fallback_cats"] else "",
-                "_sort": e["first_start"],
-            })
+            rows.append(
+                {
+                    "phase": phase,
+                    "parent_stages": "/".join(parents),
+                    "op": op,
+                    "calls_per_iter": total_calls / n_iters,
+                    "avg_ms_per_iter": total_ms / n_iters,
+                    "total_ms": total_ms,
+                    "num_iters": n_iters,
+                    "kernel_names": ", ".join(sorted(e["kernel_names"]))
+                    if e["kernel_names"]
+                    else "",
+                    "fallback_category": ", ".join(sorted(e["fallback_cats"]))
+                    if e["fallback_cats"]
+                    else "",
+                    "_sort": e["first_start"],
+                }
+            )
         rows.sort(key=lambda r: r["_sort"])
         for r in rows:
             r.pop("_sort", None)
@@ -405,17 +414,19 @@ def _write_csv(cfg_label: str, rows: List[Dict[str, Any]], out_dir: str) -> str:
         w = csv.DictWriter(f, fieldnames=_CSV_COLS)
         w.writeheader()
         for r in rows:
-            w.writerow({
-                "phase": r["phase"],
-                "parent_stages": r["parent_stages"],
-                "op": r["op"],
-                "calls_per_iter": f"{r['calls_per_iter']:.3f}",
-                "avg_ms_per_iter": f"{r['avg_ms_per_iter']:.6f}",
-                "total_ms": f"{r['total_ms']:.4f}",
-                "num_iters": r["num_iters"],
-                "kernel_names": r["kernel_names"],
-                "fallback_category": r["fallback_category"],
-            })
+            w.writerow(
+                {
+                    "phase": r["phase"],
+                    "parent_stages": r["parent_stages"],
+                    "op": r["op"],
+                    "calls_per_iter": f"{r['calls_per_iter']:.3f}",
+                    "avg_ms_per_iter": f"{r['avg_ms_per_iter']:.6f}",
+                    "total_ms": f"{r['total_ms']:.4f}",
+                    "num_iters": r["num_iters"],
+                    "kernel_names": r["kernel_names"],
+                    "fallback_category": r["fallback_category"],
+                }
+            )
     return path
 
 
@@ -425,10 +436,11 @@ def _write_csv(cfg_label: str, rows: List[Dict[str, Any]], out_dir: str) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Per-config op-call breakdown CSVs from one or more "
-                    "nsys-rep traces.  TorchRec (trc) is dropped.",
+        "nsys-rep traces.  TorchRec (trc) is dropped.",
     )
     parser.add_argument(
-        "inputs", nargs="+",
+        "inputs",
+        nargs="+",
         help="one or more .nsys-rep (or .qdrep) files",
     )
     parser.add_argument(
@@ -448,8 +460,9 @@ def main() -> None:
     for file_idx, rep in enumerate(args.inputs):
         sqlite = ensure_sqlite(rep)
         nvtx, kernels = _fetch_nvtx_and_kernels(sqlite)
-        print(f"[load] {rep}: {len(nvtx)} nvtx + {len(kernels)} kernels",
-              file=sys.stderr)
+        print(
+            f"[load] {rep}: {len(nvtx)} nvtx + {len(kernels)} kernels", file=sys.stderr
+        )
         records = (
             _parse_record(s, e, n, stack)
             for s, e, n, stack in _attribute_kernels(nvtx, kernels)

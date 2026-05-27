@@ -1009,7 +1009,9 @@ def _generic_forward_path(
             )
         key_persisted[positions_in_unique] = True
         with torch.cuda.nvtx.range("op:flagged_compact"):
-            _, persisted_unique_indices, _ = flagged_compact(key_persisted, [unique_keys])
+            _, persisted_unique_indices, _ = flagged_compact(
+                key_persisted, [unique_keys]
+            )
         return unique_values, persisted_unique_indices
 
 

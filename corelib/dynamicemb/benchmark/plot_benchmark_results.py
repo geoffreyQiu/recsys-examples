@@ -21,7 +21,6 @@ import os
 from typing import List
 
 import matplotlib.pyplot as plt
-import numpy as np
 
 # Canonical ordering for the four storage modes the suite parametrizes over.
 METRICS = ["forward", "backward", "train", "eval"]
@@ -52,10 +51,13 @@ def build_panels(results: List[dict]):
     keeps cfr=0.8 and cfr=1.0 in the same figure rather than splitting them
     into separate PNGs.
     """
-    ratios = sorted({
-        r.get("cache_footprint_ratio") for r in results
-        if r.get("cache_footprint_ratio") is not None
-    })
+    ratios = sorted(
+        {
+            r.get("cache_footprint_ratio")
+            for r in results
+            if r.get("cache_footprint_ratio") is not None
+        }
+    )
     panels = [("gpu", None)]
     if ratios:
         panels.extend([("caching", r) for r in ratios])
@@ -139,7 +141,8 @@ def make_figure(
     optimizers = sorted({r["optimizer_type"] for r in results})
 
     fig, axes = plt.subplots(
-        len(optimizers), 1,
+        len(optimizers),
+        1,
         figsize=(max(2.6 * len(panels), 10.0), 4.2 * len(optimizers)),
         squeeze=False,
     )
@@ -147,7 +150,7 @@ def make_figure(
 
     width = 0.30
     panel_inner_width = 2.0  # group positions: x=0 (train) and x=1 (eval)
-    panel_gap = 0.9          # blank space between panels
+    panel_gap = 0.9  # blank space between panels
     panel_step = panel_inner_width + panel_gap
 
     first_handles = None  # captured from first non-empty group for fig-level legend
@@ -164,14 +167,36 @@ def make_figure(
             x_eval = col * panel_step + 1
 
             # Train: stacked forward (bottom) + backward (top) per backend.
-            ax.bar(x_train - width / 2, dyn_fwd, width,
-                   color=DYN_FWD_COLOR, label="DynamicEmb · fwd / eval")
-            ax.bar(x_train - width / 2, dyn_bwd, width, bottom=dyn_fwd,
-                   color=DYN_BWD_COLOR, label="DynamicEmb · bwd")
-            ax.bar(x_train + width / 2, trc_fwd, width,
-                   color=TRC_FWD_COLOR, label="TorchRec · fwd / eval")
-            ax.bar(x_train + width / 2, trc_bwd, width, bottom=trc_fwd,
-                   color=TRC_BWD_COLOR, label="TorchRec · bwd")
+            ax.bar(
+                x_train - width / 2,
+                dyn_fwd,
+                width,
+                color=DYN_FWD_COLOR,
+                label="DynamicEmb · fwd / eval",
+            )
+            ax.bar(
+                x_train - width / 2,
+                dyn_bwd,
+                width,
+                bottom=dyn_fwd,
+                color=DYN_BWD_COLOR,
+                label="DynamicEmb · bwd",
+            )
+            ax.bar(
+                x_train + width / 2,
+                trc_fwd,
+                width,
+                color=TRC_FWD_COLOR,
+                label="TorchRec · fwd / eval",
+            )
+            ax.bar(
+                x_train + width / 2,
+                trc_bwd,
+                width,
+                bottom=trc_fwd,
+                color=TRC_BWD_COLOR,
+                label="TorchRec · bwd",
+            )
 
             # Eval is forward-only on each backend so it shares the fwd shade.
             ax.bar(x_eval - width / 2, dyn_eval, width, color=DYN_FWD_COLOR)
@@ -190,8 +215,7 @@ def make_figure(
         # Dotted separators between panel regions
         for i in range(1, len(panels)):
             sep_x = i * panel_step - panel_gap / 2
-            ax.axvline(sep_x, color="#aaa", linestyle=":",
-                       linewidth=0.8, alpha=0.7)
+            ax.axvline(sep_x, color="#aaa", linestyle=":", linewidth=0.8, alpha=0.7)
 
         # Inner x-ticks: train / eval label under every panel.
         xticks: list = []
@@ -201,8 +225,7 @@ def make_figure(
             xticklabels.extend(["train\n(fwd+bwd)", "eval"])
         ax.set_xticks(xticks)
         ax.set_xticklabels(xticklabels, fontsize=8)
-        ax.set_xlim(-panel_gap / 2,
-                    len(panels) * panel_step - panel_gap / 2)
+        ax.set_xlim(-panel_gap / 2, len(panels) * panel_step - panel_gap / 2)
         ax.set_ylabel("ms")
         ax.grid(axis="y", alpha=0.3)
         if log:
@@ -213,7 +236,8 @@ def make_figure(
         sax.set_xticks([i * panel_step + 0.5 for i in range(len(panels))])
         sax.set_xticklabels(
             [panel_label(m, c).replace("\n", " ") for m, c in panels],
-            fontsize=10, fontweight="bold",
+            fontsize=10,
+            fontweight="bold",
         )
         sax.tick_params(axis="x", length=0)  # no tick marks, just labels
 
@@ -229,12 +253,12 @@ def make_figure(
     # the figure height; legend and tight_layout shift down accordingly.
     n_lines = subtitle.count("\n") + 1 if subtitle else 0
     if subtitle:
-        fig.text(0.5, 0.955, subtitle, ha="center", va="top",
-                 fontsize=10, color="#444")
+        fig.text(0.5, 0.955, subtitle, ha="center", va="top", fontsize=10, color="#444")
     if first_handles is not None:
         handles, labels = first_handles
         fig.legend(
-            handles, labels,
+            handles,
+            labels,
             loc="upper center",
             bbox_to_anchor=(0.5, 0.95 - 0.025 * n_lines),
             ncol=len(labels),
@@ -295,17 +319,23 @@ def main() -> None:
     here = os.path.dirname(os.path.abspath(__file__))
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--results", default=os.path.join(here, "benchmark_results.json"),
+        "--results",
+        default=os.path.join(here, "benchmark_results.json"),
         help="path to benchmark_results.json",
     )
     parser.add_argument(
-        "--out-dir", default=os.path.join(here, "plots"),
+        "--out-dir",
+        default=os.path.join(here, "plots"),
         help="directory to write generated PNGs into (created if missing)",
     )
-    parser.add_argument("--log", action="store_true",
-                        help="log-scale y-axis (useful when one mode dominates)")
-    parser.add_argument("--no-values", action="store_true",
-                        help="hide numeric labels on bars")
+    parser.add_argument(
+        "--log",
+        action="store_true",
+        help="log-scale y-axis (useful when one mode dominates)",
+    )
+    parser.add_argument(
+        "--no-values", action="store_true", help="hide numeric labels on bars"
+    )
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -326,8 +356,9 @@ def main() -> None:
         fig.savefig(path, dpi=130, bbox_inches="tight")
         print(f"Saved -> {path}")
 
-    fig = make_figure(results, panels, log=args.log,
-                      show_values=not args.no_values, subtitle=subtitle)
+    fig = make_figure(
+        results, panels, log=args.log, show_values=not args.no_values, subtitle=subtitle
+    )
     _save(fig, "benchmark_bdet_plot.png")
 
 
