@@ -221,6 +221,10 @@ std::vector<at::Tensor> permute_and_split_cuda(
   return permute_and_split_impl(jagged_features, jagged_lengths, jagged_offsets, num_static_features, num_dynamic_features, features_order, /*expect_cuda=*/true);
 }
 
+at::Tensor view_flat2(const at::Tensor& x) {
+  return x.view({2*x.size(0), x.size(1)/2});
+}
+
 } // namespace
 
 TORCH_LIBRARY_FRAGMENT(hstu_cuda_ops, m) {
@@ -228,6 +232,7 @@ TORCH_LIBRARY_FRAGMENT(hstu_cuda_ops, m) {
   m.def("lengths_reduce_dim1(Tensor lengths_1d, int num_splits) -> Tensor");
   m.def("lengths_splits(Tensor lengths_1d, int num_splits) -> Tensor[]");
   m.def("permute_and_split(Tensor jagged_features, Tensor jagged_lengths, Tensor jagged_offsets, int num_static_features, int num_dynamic_features, int[] features_order) -> Tensor[]");
+  m.def("view_flat2(Tensor x) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(hstu_cuda_ops, CPU, m) {
@@ -235,6 +240,7 @@ TORCH_LIBRARY_IMPL(hstu_cuda_ops, CPU, m) {
   m.impl("lengths_reduce_dim1", lengths_reduce_dim1_cpu);
   m.impl("lengths_splits", lengths_splits_cpu);
   m.impl("permute_and_split", permute_and_split_cpu);
+  m.impl("view_flat2", view_flat2);
 }
 
 TORCH_LIBRARY_IMPL(hstu_cuda_ops, CUDA, m) {
@@ -242,4 +248,5 @@ TORCH_LIBRARY_IMPL(hstu_cuda_ops, CUDA, m) {
   m.impl("lengths_reduce_dim1", lengths_reduce_dim1_cuda);
   m.impl("lengths_splits", lengths_splits_cuda);
   m.impl("permute_and_split", permute_and_split_cuda);
+  m.impl("view_flat2", view_flat2);
 }

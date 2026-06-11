@@ -72,3 +72,10 @@ def _permute_and_split_fake(
         ),
     ]
     return out
+
+
+@torch.library.register_fake("hstu_cuda_ops::view_flat2")
+def _view_flat2_fake(
+    x,
+):
+    return x.new_empty((x.size(0) * 2, x.size(1) // 2))

@@ -39,6 +39,8 @@ try:
 except ImportError:
     SUPPORT_TRAINING = False
 
+import hstu_cuda_ops  # noqa: F401 – registers torch.ops.hstu_cuda_ops.*
+
 
 def hstu_preprocess_embeddings(
     embeddings: Dict[str, JaggedTensor],
@@ -86,9 +88,16 @@ def hstu_preprocess_embeddings(
         embedding_dim = sequence_embeddings.size(1)
 
         if not is_inference:
-            sequence_embeddings = torch.cat(
-                [sequence_embeddings, action_jt.values().to(dtype)], dim=1
-            ).view(2 * jagged_size, embedding_dim)
+            if not torch.compiler.is_compiling():
+                sequence_embeddings = torch.cat(
+                    [sequence_embeddings, action_jt.values().to(dtype)], dim=1
+                ).view(2 * jagged_size, embedding_dim)
+            else:
+                sequence_embeddings = torch.ops.hstu_cuda_ops.view_flat2(
+                    torch.cat(
+                        [sequence_embeddings, action_jt.values().to(dtype)], dim=1
+                    )
+                )
             sequence_embeddings_lengths = sequence_embeddings_lengths * 2
             sequence_embeddings_lengths_offsets = (
                 sequence_embeddings_lengths_offsets * 2
@@ -228,7 +237,7 @@ def hstu_preprocess_embeddings(
     # actual_batch_size while KJTs retain batch_size entries (see BaseBatch
     # invariants).  Re-pad num_candidates with zeros so it stays aligned with
     # the KJT-derived sequence_embeddings_lengths.
-    if num_candidates is not None:
+    if num_candidates is not None and not torch.compiler.is_compiling():
         bs_kjt = sequence_embeddings_lengths.size(0)
         if num_candidates.size(0) < bs_kjt:
             num_candidates = torch.nn.functional.pad(
