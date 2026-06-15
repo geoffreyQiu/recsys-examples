@@ -299,6 +299,130 @@ Working artifacts (`.nsys-rep`, `.sqlite`, intermediate CSV/PNG) are
 expected to land under `local/` (gitignored).  Only the curated
 figures committed under `plots/` are tracked.
 
+### Nsight Compute (ncu) profiling
+
+`--profile ncu` profiles per-kernel hardware counters (unlike nsys, which is a
+timeline).  It is a two-step workflow:
+
+1. **`--profile ncu-gen`** prints the exact `ncu` command for a config (single-
+   config and whole-suite variants) and exits without running anything.  This
+   is the source of truth for the literal command.  Optionally pass
+   `--ncu-kernel-regex` to name the kernel(s) to profile (emitted verbatim as
+   `--kernel-name 'regex:<value>'`); omit it to profile **every** kernel within
+   the `--nvtx-include` scope (e.g. all kernels of an op range).
+2. **`--profile ncu`** is the inner workload the printed command wraps: it warms
+   up via the reporting loop, runs every iteration inside a single
+   `cudaProfilerStart/Stop` window (outer NVTX range `cfg.label()`, inner range
+   `ncu_iter`, per-iter range `iter_{i}`), and **by default only iteration 0 is
+   actually captured** -- the printed command's `--nvtx-include` scopes it.  Use
+   `--ncu-iterations` to widen.
+
+So you generate the command, then run it:
+
+```bash
+# Step 1 — print the command for one TestGpu config.  -k takes any pytest
+# expression matched against the test id (class + cfg.label()); the concise
+# "TestGpu and adam" uniquely selects the adam config today.  --ncu-kernel-regex
+# is optional (omit to profile all kernels in the nvtx scope).  ncu-gen prints a
+# command whose inner -k is the exact, lossless label.
+bash ./benchmark/benchmark_batched_dynamicemb_tables.sh \
+    --profile ncu-gen -k "TestGpu and adam" \
+    --ncu-kernel-regex 'segmented_unique|table_insert'
+
+# Step 2 — run the printed command (shape shown here; ncu-gen emits the exact
+# -k label and your --ncu-kernel-regex verbatim):
+ncu -f --target-processes all \
+    --profile-from-start off \
+    --nvtx --nvtx-include 'ncu_iter/iter_0/' \
+    --kernel-name 'regex:segmented_unique|table_insert' \
+    --set full \
+    --import-source=yes \
+    --csv --page raw \
+    -o ncu_T10_totalB1048570_D128_adam_gpu_pool=none_cap=1M \
+    bash ./benchmark/benchmark_batched_dynamicemb_tables.sh \
+        --profile ncu -k 'T10_totalB1048570_D128_adam_gpu_pool=none_cap=1M'
+```
+
+To profile **all** TestGpu configs (currently `adam` + `sgd`) into one report,
+drop the exact label and select the class: `-k TestGpu` on both the `ncu-gen`
+and the wrapped `--profile ncu` invocation; the outer `cfg.label()` NVTX range
+attributes kernels per config.
+
+| ncu flag | why |
+| -------- | --- |
+| `--target-processes all` | ncu launches `bash`, which `torchrun`-spawns the python worker that runs the CUDA kernels; without this ncu would only watch the kernel-less `bash`. |
+| `--profile-from-start off` | gate profiling to the `cudaProfilerStart/Stop` window (skips table build + warmup).  Must stay paired with `cudaProfilerStart` -- dropping the call profiles nothing. |
+| `--nvtx --nvtx-include 'ncu_iter/iter_0/'` | belt-and-suspenders NVTX-range gate, and the iteration selector: only kernels under the listed `iter_{i}` ranges are profiled (default `iter_0`; `--ncu-iterations` emits one include per selected iter). |
+| `--kernel-name 'regex:...'` | restrict to the kernel(s) named via the optional `--ncu-kernel-regex`; omitted entirely when that flag is not given, so all kernels in the NVTX scope are profiled (e.g. every kernel of an op range like `op:segmented_unique`). |
+| `--set full` | full metric set (heaviest; most replay passes). |
+| `--import-source=yes` | embed CUDA source so the Source page works offline (relies on `-lineinfo`, which the build now sets). |
+
+`--num-iterations N` overrides `BenchmarkConfig.num_iterations` (default 100) on
+every config.  This is the number of sampled batches, so it also bounds the
+warmup/reporting loop and how many iterations each profile mode covers.  Lower
+it to keep `--profile ncu` tractable (ncu replays every matched kernel launch
+with the full metric set), e.g. add `--num-iterations 3` to the wrapped
+`--profile ncu` invocation.
+
+`--ncu-iterations` (only with `--profile ncu`) selects *which* iterations ncu
+captures, widening the default of iteration 0 only.  It accepts either a comma
+list or a Python-style `begin:end:step` slice (end exclusive; parts optional):
+
+```bash
+--ncu-iterations 0,3,7      # capture iterations 0, 3, 7
+--ncu-iterations ::2        # every other iteration
+--ncu-iterations 2:20:3     # 2,5,8,11,... (clamped to num_iterations)
+--ncu-iterations 90:        # the last iterations of a 100-iter run
+```
+
+The selection is applied in the **ncu command**, not the workload: a single
+`cudaProfilerStart/Stop` pair still wraps the whole run (ncu reliably honors
+only one window), and `ncu-gen` turns the selection into one
+`--nvtx-include 'ncu_iter/iter_{i}/'` per selected iteration (OR-ed together).
+Unselected iterations still run (to advance the table / keep the cache warm)
+but their kernels are filtered out by NVTX.  This differs from
+`--num-iterations`: that shrinks the *total* iteration count (and warmup);
+`--ncu-iterations` keeps the full run but only profiles a subset -- the right
+tool when you need a warmed, steady-state iteration rather than the first few.
+Pass it to `ncu-gen` so the printed command carries the right `--nvtx-include`
+filters.
+
+#### Capturing all kernels of an op range
+
+A single dynamicemb op launches several **differently-named** kernels
+(`segmented_unique` runs `expand_table_ids`, `segmented_init`,
+`segmented_unique_kernel`, two `cub::DeviceScan*`, `compact_keys_and_freq`,
+`adjust_output_indices`, plus a couple of torch fill kernels).  A
+`--kernel-name` regex can only match one name, so to profile the **whole op**
+you scope by its NVTX range instead and drop the kernel-name filter.
+
+The prefetch/forward path wraps each op in an `op:<name>` NVTX range (e.g.
+`op:segmented_unique`, `op:cache_lookup`, `op:gather_embedding`,
+`op:reduce_grads`, `op:store_to_flat`, ...).  Their nesting inside a profiled
+iteration is:
+
+```
+ncu_iter / iter_0 / forward / dynamicemb_prefetch / op:segmented_unique / <kernels>
+```
+
+To capture every kernel of `op:segmented_unique` in iteration 0, point
+`--nvtx-include` at that nested path and omit `--ncu-kernel-regex` (so no
+`--kernel-name` filter is emitted):
+
+```bash
+ncu -f --target-processes all --profile-from-start off \
+    --nvtx --nvtx-include 'ncu_iter/iter_0/forward/dynamicemb_prefetch/op:segmented_unique/' \
+    --set full --import-source=yes --csv --page raw \
+    -o ncu_sgd_segunique_all \
+    bash ./benchmark/benchmark_batched_dynamicemb_tables.sh --profile ncu -k "TestGpu and sgd"
+```
+
+The trailing `/` includes the whole subtree, so all kernels launched inside the
+range are profiled regardless of name.  (Anchoring on just `op:segmented_unique/`
+would match the op in *every* iteration; the `ncu_iter/iter_0/.../` prefix pins
+it to iteration 0.  If the intermediate nesting changes, replace the middle
+levels with wildcards: `ncu_iter/iter_0/*/*/op:segmented_unique/`.)
+
 Other profile modes:
 
 | `--profile` value | What it does                                                          |
@@ -307,7 +431,7 @@ Other profile modes:
 | `torch`           | Runs each backend under `torch.profiler`; exports Chrome trace + bandwidth report. |
 | `nsys`            | NVTX-annotated profile path described above.                          |
 | `ncu-gen`         | Prints the matching `ncu` command for the config and exits.           |
-| `ncu-run`         | Runs a single fwd+bwd inside `cudaProfilerStart/Stop` for `ncu` wrap. |
+| `ncu`             | Warms up via the reporting loop, runs all iterations inside one `cudaProfilerStart/Stop` window, and captures iteration 0 by default (widen with `--ncu-iterations`). |
 
 ### Cache footprint sizing (TestCaching)
 

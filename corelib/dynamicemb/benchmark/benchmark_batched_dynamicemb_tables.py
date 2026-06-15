@@ -181,6 +181,12 @@ class BenchmarkConfig:
     pooling_mode: str = "none"
     max_hotness: int = 10
     num_iterations: int = 100
+    # Profiling-only: which iterations --profile ncu captures (raw spec string,
+    # parsed by parse_ncu_iterations).  None = capture iter 0.  Not in cfg.label().
+    ncu_iterations: Optional[str] = None
+    # Profiling-only: user-supplied kernel-name regex for the generated ncu
+    # command (--ncu-kernel-regex).  Required for --profile ncu-gen.
+    ncu_kernel_regex: Optional[str] = None
     emb_precision: str = "fp32"
     output_dtype: str = "fp32"
     use_index_dedup: bool = False
@@ -198,6 +204,14 @@ class BenchmarkConfig:
     # default fill_tables / hybrid-storage population is skipped so the
     # mirrored values aren't overwritten.
     correctness: bool = False
+    # Sparse-key sampling range: when set, each table draws indices from its
+    # distribution over ``[.., sparse_key_range)`` instead of ``[.., per-table
+    # cap)``, decoupling the duplicate rate from table capacity (a smaller range
+    # yields more duplicates).  ``None`` keeps the per-table cap.
+    sparse_key_range: Optional[int] = None
+    # When False the TorchRec/FBGEMM TBE baseline is neither built nor run; only
+    # DynamicEmb is exercised and the ``trc_*`` metrics are reported as None.
+    run_torchrec: bool = True
 
     @property
     def num_tables(self):
@@ -228,12 +242,17 @@ class BenchmarkConfig:
     def label(self):
         # Uniform caps collapse to a single token (T{nt} already encodes the
         # count); heterogeneous caps fall back to underscore-joined per-table
-        # values so the label remains lossless.
-        caps_mb = [e // (1024 * 1024) for e in self.num_embeddings_per_feature]
-        if len(set(caps_mb)) == 1:
-            caps = f"{caps_mb[0]}M"
-        else:
-            caps = "_".join(f"{c}M" for c in caps_mb)
+        # values so the label remains lossless.  Sub-MB caps (e.g. 16K with many
+        # tables) render in K rather than rounding to "0M".
+        def _fmt_cap(e):
+            if e >= 1024 * 1024 and e % (1024 * 1024) == 0:
+                return f"{e // (1024 * 1024)}M"
+            if e >= 1024 and e % 1024 == 0:
+                return f"{e // 1024}K"
+            return str(e)
+
+        caps_fmt = [_fmt_cap(e) for e in self.num_embeddings_per_feature]
+        caps = caps_fmt[0] if len(set(caps_fmt)) == 1 else "_".join(caps_fmt)
         s = (
             f"T{self.num_tables}_totalB{self.total_batch_size}_D{self.embedding_dim}_"
             f"{self.optimizer_type}_{self.mode}_"
@@ -286,10 +305,15 @@ def generate_sparse_features_gpu(
             num_iters, bs * num_tables, device=device, dtype=torch.int64
         )
 
+    # Optional override of the per-table sampling range (decouples duplicate
+    # rate from table capacity).  Applied on top of caps for every table.
+    skr = cfg.sparse_key_range
+
     if cfg.feature_distribution == "random":
         total_vals = int(all_lengths.sum().item())
+        hi = skr if skr is not None else (2**63) - 1
         all_values = torch.randint(
-            0, (2**63) - 1, (total_vals,), device=device, dtype=torch.int64
+            0, hi, (total_vals,), device=device, dtype=torch.int64
         )
     elif cfg.feature_distribution in ("pow-law", "zipf"):
         from dataset_generator import PowerLaw, zipf
@@ -300,7 +324,7 @@ def generate_sparse_features_gpu(
         per_table_vals = []
         for t in range(num_tables):
             n_samples = int(per_table_totals[t].item())
-            cap = caps[t]
+            cap = skr if skr is not None else caps[t]
             if cfg.feature_distribution == "pow-law":
                 vals = PowerLaw(1, cap, cfg.alpha, n_samples, device)
             else:
@@ -572,9 +596,13 @@ def benchmark_train_eval(
     (non-uninitialized) tensor keeps the optimizer-driven weight evolution
     deterministic across the two backends.
     """
+    has_trc = torchrec_emb is not None
     dynamic_emb.train()
-    torchrec_emb.train()
+    if has_trc:
+        torchrec_emb.train()
 
+    # check_forward needs the baseline to compare against.
+    check_forward = check_forward and has_trc
     atol, rtol = _CORRECTNESS_TOL.get(cfg.emb_precision, (1e-4, 1e-3))
     failures: List[Dict[str, Any]] = []
 
@@ -614,22 +642,25 @@ def benchmark_train_eval(
         torch.cuda.nvtx.range_pop()
 
         # ── trc ──
-        torch.cuda.nvtx.range_push("trc")
-        trc_s.record()
-        out_trc = torchrec_emb(sf.values(), sf.offsets())
-        trc_m.record()
-        out_trc.backward(grad)
-        trc_e.record()
-        torch.cuda.nvtx.range_pop()
+        out_trc = None
+        if has_trc:
+            torch.cuda.nvtx.range_push("trc")
+            trc_s.record()
+            out_trc = torchrec_emb(sf.values(), sf.offsets())
+            trc_m.record()
+            out_trc.backward(grad)
+            trc_e.record()
+            torch.cuda.nvtx.range_pop()
 
         torch.cuda.nvtx.range_pop()
         torch.cuda.synchronize()
         dyn_fwd += dyn_s.elapsed_time(dyn_m)
         dyn_bwd += dyn_m.elapsed_time(dyn_e)
         dyn_total += dyn_s.elapsed_time(dyn_e)
-        trc_fwd += trc_s.elapsed_time(trc_m)
-        trc_bwd += trc_m.elapsed_time(trc_e)
-        trc_total += trc_s.elapsed_time(trc_e)
+        if has_trc:
+            trc_fwd += trc_s.elapsed_time(trc_m)
+            trc_bwd += trc_m.elapsed_time(trc_e)
+            trc_total += trc_s.elapsed_time(trc_e)
 
         if check_forward:
             passed, max_diff, mean_diff = _forward_allclose(
@@ -646,7 +677,8 @@ def benchmark_train_eval(
                 )
 
     dynamic_emb.eval()
-    torchrec_emb.eval()
+    if has_trc:
+        torchrec_emb.eval()
     dyn_eval = trc_eval = 0.0
     for i in range(num_iterations):
         sf = sparse_features[i]
@@ -656,11 +688,13 @@ def benchmark_train_eval(
         torch.cuda.synchronize()
         dyn_eval += dyn_s.elapsed_time(dyn_e)
 
-        trc_s.record()
-        out_trc = torchrec_emb(sf.values(), sf.offsets())
-        trc_e.record()
-        torch.cuda.synchronize()
-        trc_eval += trc_s.elapsed_time(trc_e)
+        out_trc = None
+        if has_trc:
+            trc_s.record()
+            out_trc = torchrec_emb(sf.values(), sf.offsets())
+            trc_e.record()
+            torch.cuda.synchronize()
+            trc_eval += trc_s.elapsed_time(trc_e)
 
         if check_forward:
             passed, max_diff, mean_diff = _forward_allclose(
@@ -684,10 +718,10 @@ def benchmark_train_eval(
         "dyn_forward_ms": dyn_fwd / num_iterations,
         "dyn_backward_ms": dyn_bwd / num_iterations,
         "dyn_eval_ms": dyn_eval / num_iterations,
-        "trc_train_ms": trc_total / num_iterations,
-        "trc_forward_ms": trc_fwd / num_iterations,
-        "trc_backward_ms": trc_bwd / num_iterations,
-        "trc_eval_ms": trc_eval / num_iterations,
+        "trc_train_ms": trc_total / num_iterations if has_trc else None,
+        "trc_forward_ms": trc_fwd / num_iterations if has_trc else None,
+        "trc_backward_ms": trc_bwd / num_iterations if has_trc else None,
+        "trc_eval_ms": trc_eval / num_iterations if has_trc else None,
     }
 
 
@@ -702,7 +736,10 @@ def benchmark_one_iteration(model, sparse_feature):
     start_event.record()
     output = model(sparse_feature.values(), sparse_feature.offsets())
     mid_event.record()
-    grad = torch.empty_like(output)
+    # Deterministic grad: empty_like is uninitialized and NaN/denormals here
+    # would be written into the embedding table by the fused optimizer update,
+    # then carried into the subsequent measured/profiled run.
+    grad = torch.ones_like(output)
     output.backward(grad)
     end_event.record()
 
@@ -735,6 +772,9 @@ def run_reporting_loop(dynamic_emb, torchrec_emb, sparse_features, cfg):
         print(
             f"    dyn iter {i:3d}: fwd={fwd:.3f} bwd={bwd:.3f} total={total:.3f} ms{cache_info}"
         )
+
+    if torchrec_emb is None:
+        return
 
     print()
     for i in range(cfg.num_iterations):
@@ -769,7 +809,7 @@ def benchmark_with_torch_profiler(
     for i in range(n_warm):
         sf = sparse_features[i]
         output = model(sf.values(), sf.offsets())
-        grad = torch.empty_like(output)
+        grad = torch.ones_like(output)
         output.backward(grad)
     torch.cuda.synchronize()
 
@@ -791,7 +831,7 @@ def benchmark_with_torch_profiler(
             output = model(sf.values(), sf.offsets())
             torch.cuda.nvtx.range_pop()
             torch.cuda.nvtx.range_push("backward")
-            grad = torch.empty_like(output)
+            grad = torch.ones_like(output)
             output.backward(grad)
             torch.cuda.nvtx.range_pop()
             torch.cuda.nvtx.range_pop()
@@ -872,8 +912,10 @@ def benchmark_with_nsys(dynamic_emb, torchrec_emb, sparse_features, cfg):
     side-by-side in the same trace.  NVTX layout:
     ``<cfg.label()>`` -> ``nsys_iter_i`` -> ``dyn``/``trc`` -> ``forward``/``backward``.
     """
+    has_trc = torchrec_emb is not None
     dynamic_emb.train()
-    torchrec_emb.train()
+    if has_trc:
+        torchrec_emb.train()
 
     torch.cuda.cudart().cudaProfilerStart()
     torch.cuda.nvtx.range_push(cfg.label())
@@ -885,20 +927,22 @@ def benchmark_with_nsys(dynamic_emb, torchrec_emb, sparse_features, cfg):
         out_dyn = dynamic_emb(sf.values(), sf.offsets())
         torch.cuda.nvtx.range_pop()
         torch.cuda.nvtx.range_push("backward")
-        grad_dyn = torch.empty_like(out_dyn)
+        # Deterministic grad (empty_like is uninitialized -> NaN/denormal noise).
+        grad_dyn = torch.ones_like(out_dyn)
         out_dyn.backward(grad_dyn)
         torch.cuda.nvtx.range_pop()
         torch.cuda.nvtx.range_pop()  # dyn
 
-        torch.cuda.nvtx.range_push("trc")
-        torch.cuda.nvtx.range_push("forward")
-        out_trc = torchrec_emb(sf.values(), sf.offsets())
-        torch.cuda.nvtx.range_pop()
-        torch.cuda.nvtx.range_push("backward")
-        grad_trc = torch.empty_like(out_trc)
-        out_trc.backward(grad_trc)
-        torch.cuda.nvtx.range_pop()
-        torch.cuda.nvtx.range_pop()  # trc
+        if has_trc:
+            torch.cuda.nvtx.range_push("trc")
+            torch.cuda.nvtx.range_push("forward")
+            out_trc = torchrec_emb(sf.values(), sf.offsets())
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("backward")
+            grad_trc = torch.ones_like(out_trc)
+            out_trc.backward(grad_trc)
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_pop()  # trc
 
         torch.cuda.nvtx.range_pop()  # nsys_iter_i
     torch.cuda.nvtx.range_pop()  # cfg.label()
@@ -911,38 +955,89 @@ def benchmark_with_nsys(dynamic_emb, torchrec_emb, sparse_features, cfg):
 # ── NCU (Nsight Compute) profiler integration ────────────────────────────────
 
 
+def parse_ncu_iterations(spec: Optional[str], num_iterations: int) -> set:
+    """Parse --ncu-iterations into a set of 0-based iteration indices to profile.
+
+    Two accepted forms:
+      * comma-separated list, e.g. ``"0,3,7"``
+      * Python-style slice ``begin:end:step`` (end exclusive, any part optional),
+        e.g. ``":10"``, ``"5:"``, ``"::2"``, ``"2:20:3"``
+
+    Indices are clamped to ``[0, num_iterations)``.  ``None`` means "not
+    specified by the caller"; ``print_ncu_command`` treats it as iteration 0
+    only (the default capture target).  Raises ValueError on malformed input.
+    """
+    if spec is None:
+        return set(range(num_iterations))
+    spec = spec.strip()
+    if not spec:
+        return set(range(num_iterations))
+
+    if ":" in spec:
+        parts = spec.split(":")
+        if len(parts) > 3:
+            raise ValueError(f"--ncu-iterations slice has too many ':' parts: {spec!r}")
+        begin = int(parts[0]) if parts[0].strip() else 0
+        end = int(parts[1]) if len(parts) > 1 and parts[1].strip() else num_iterations
+        step = int(parts[2]) if len(parts) > 2 and parts[2].strip() else 1
+        if step <= 0:
+            raise ValueError(f"--ncu-iterations step must be positive: {spec!r}")
+        return {i for i in range(begin, end, step) if 0 <= i < num_iterations}
+
+    selected = set()
+    for tok in spec.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        idx = int(tok)
+        if 0 <= idx < num_iterations:
+            selected.add(idx)
+    return selected
+
+
 def benchmark_with_ncu(model, sparse_features, cfg):
-    """Run a single train iteration for NCU profiling.
+    """Run all iterations for NCU profiling under a single capture window.
 
     Meant to be launched externally under ``ncu --profile-from-start off
-    ...``.  The Start/Stop pair gates which launches ncu replays for PMU
-    counters; setup kernels (table create, data gen, segmented_unique,
-    etc.) stay outside the window.
+    ...``.  A *single* cudaProfilerStart/Stop pair wraps the whole loop (ncu
+    reliably honors one cudaProfiler window), so setup kernels (table create,
+    data gen, warmup) stay outside it.
 
-    ncu is per-kernel-launch (not timeline) so multi-config "Just Works":
-    invoking pytest without a ``-k`` filter under one ncu command profiles
-    every config's wrapped iter back-to-back into the same report; the
-    outermost NVTX range ``cfg.label()`` attributes kernels per config.
+    Every iteration runs and is tagged with its own ``iter_{i}`` NVTX range
+    nested under ``ncu_iter``.  *Which* iterations are actually captured is
+    decided in the ncu command itself: ``--ncu-iterations`` turns into per-iter
+    ``--nvtx-include 'ncu_iter/iter_{i}/'`` filters (see print_ncu_command), so
+    the unselected iterations still run here (advancing the table / keeping the
+    cache warm) but their kernels are filtered out by NVTX.
+
+    ncu is per-kernel-launch (not timeline) so multi-config "Just Works": one
+    ncu command without ``-k`` profiles every config's iters into the same
+    report.  The outer NVTX range ``cfg.label()`` attributes kernels per config.
     """
     model.train()
 
-    sf = sparse_features[0]
     torch.cuda.cudart().cudaProfilerStart()
     torch.cuda.nvtx.range_push(cfg.label())
     torch.cuda.nvtx.range_push("ncu_iter")
-    torch.cuda.nvtx.range_push("forward")
-    output = model(sf.values(), sf.offsets())
-    torch.cuda.nvtx.range_pop()
-    torch.cuda.nvtx.range_push("backward")
-    grad = torch.empty_like(output)
-    output.backward(grad)
-    torch.cuda.nvtx.range_pop()
+    for i, sf in enumerate(sparse_features):
+        torch.cuda.nvtx.range_push(f"iter_{i}")
+        torch.cuda.nvtx.range_push("forward")
+        output = model(sf.values(), sf.offsets())
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("backward")
+        # Deterministic grad: empty_like is uninitialized and may hold
+        # NaN/denormals that propagate through reduce_grads -> fused_update and
+        # add FP-counter / timing noise to the profiled kernels.
+        grad = torch.ones_like(output)
+        output.backward(grad)
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_pop()  # iter_i
     torch.cuda.nvtx.range_pop()  # ncu_iter
     torch.cuda.nvtx.range_pop()  # cfg.label()
     torch.cuda.synchronize()
     torch.cuda.cudart().cudaProfilerStop()
 
-    print("  NCU profiled iteration complete (1 fwd+bwd).")
+    print(f"  NCU ran {len(sparse_features)} iters (capture scoped by --nvtx-include).")
 
 
 def print_ncu_command(cfg: BenchmarkConfig):
@@ -956,44 +1051,74 @@ def print_ncu_command(cfg: BenchmarkConfig):
     """
     label = cfg.label()
 
-    all_patterns: list[str] = []
-    for patterns in KERNEL_NAME_PATTERNS.values():
-        all_patterns.extend(patterns)
-    regex = "|".join(f".*{p}.*" for p in all_patterns)
+    # Optional kernel-name filter (--ncu-kernel-regex), emitted verbatim as
+    # ncu's --kernel-name 'regex:...'.  If omitted, no name filter is emitted so
+    # every kernel within the --nvtx-include scope is profiled -- the way to
+    # capture all kernels of an op range (e.g. op:segmented_unique), since one
+    # op launches several differently-named kernels that a name regex can't all
+    # match.
+    regex = cfg.ncu_kernel_regex
+    kernel_part = f"--kernel-name 'regex:{regex}'" if regex else ""
 
-    # pytest -k accepts substrings of the test id; the parametrize id is
-    # exactly cfg.label(), so passing the whole label uniquely selects this
-    # one config.  An earlier version split on "=" and AND-joined the
-    # fragments, but cfg.label() embeds "=" inside its values
-    # (pool=none, cap=24M) -- the split produced cross-field chunks like
-    # "none_cap" that happened to be substrings of the id today but would
-    # silently drift if the label format changed or two configs shared a
-    # fragment.
+    # NVTX-range filter: belt-and-suspenders to the cudaProfilerStart/Stop gate
+    # (only kernels under ncu_iter are profiled, excluding anything that leaked
+    # into the cudaProfiler window).  --ncu-iterations narrows this to specific
+    # iterations by OR-ing one --nvtx-include per selected iter
+    # (ncu_iter/iter_{i}/), instead of toggling the single cudaProfiler window.
+    selected = parse_ncu_iterations(cfg.ncu_iterations, cfg.num_iterations)
+    if cfg.ncu_iterations is None:
+        # Default to iteration 0 only -- profiling every iteration with the full
+        # metric set is prohibitively expensive.  Use --ncu-iterations to widen.
+        nvtx_part = "--nvtx --nvtx-include 'ncu_iter/iter_0/'"
+    elif selected:
+        includes = " ".join(
+            f"--nvtx-include 'ncu_iter/iter_{i}/'" for i in sorted(selected)
+        )
+        nvtx_part = f"--nvtx {includes}"
+    else:
+        print(
+            f"# WARNING: --ncu-iterations={cfg.ncu_iterations!r} selects no "
+            f"iteration in [0, {cfg.num_iterations}); defaulting to iter_0."
+        )
+        nvtx_part = "--nvtx --nvtx-include 'ncu_iter/iter_0/'"
+
+    # pytest -k is an expression grammar that REJECTS '=', which cfg.label()
+    # embeds (pool=none, cap=1M); passing the whole label fails at runtime with
+    # "Wrong expression passed to '-k': ... unexpected character '='".  Split on
+    # '=' and AND-join the remaining chunks into a valid -k expression that
+    # still uniquely selects this config -- the leading chunk already encodes
+    # tables/batch/dim/opt/mode, so the conjunction is unambiguous.  (The '='
+    # is only a problem for -k; it is fine inside the -o report filename below.)
+    k_expr = " and ".join(part for part in label.split("=") if part)
     single_inner = (
         f"bash benchmark/benchmark_batched_dynamicemb_tables.sh"
-        f" --profile ncu-run -k '{label}'"
+        f" --profile ncu -k '{k_expr}'"
     )
     single_out = os.path.join(os.getcwd(), f"ncu_{label}")
     single_cmd = (
         f"ncu -f --target-processes all"
         f" --profile-from-start off"
-        f" --kernel-name 'regex:{regex}'"
+        f" {nvtx_part}"
+        f" {kernel_part}"
         f" --set full"
+        # Embed CUDA source into the report so the Source page works offline /
+        # on a machine without the sources (requires -lineinfo at build time).
+        f" --import-source=yes"
         f" --csv --page raw"
         f" -o {single_out}"
         f" {single_inner}"
     )
 
-    multi_inner = (
-        "bash benchmark/benchmark_batched_dynamicemb_tables.sh --profile ncu-run"
-    )
+    multi_inner = "bash benchmark/benchmark_batched_dynamicemb_tables.sh --profile ncu"
     multi_out = os.path.join(os.getcwd(), "ncu_all_configs")
     multi_cmd = (
         f"ncu -f --target-processes all"
         f" --profile-from-start off"
-        f" --kernel-name 'regex:{regex}'"
+        f" {kernel_part}"
         f" --set full"
-        f" --nvtx"
+        f" {nvtx_part}"
+        # Embed CUDA source into the report (requires -lineinfo at build time).
+        f" --import-source=yes"
         f" --csv --page raw"
         f" -o {multi_out}"
         f" {multi_inner}"
@@ -1356,6 +1481,17 @@ def run_single_benchmark(
         )
         cfg.correctness = False
 
+    # The correctness check compares against the TorchRec baseline, so it cannot
+    # run with the baseline disabled.
+    if cfg.correctness and not cfg.run_torchrec:
+        warnings.warn(
+            "cfg.correctness=True requires the TorchRec baseline; "
+            "re-enabling run_torchrec for this run.",
+            UserWarning,
+            stacklevel=2,
+        )
+        cfg.run_torchrec = True
+
     torch.cuda.manual_seed(cfg.seed)
     torch.cuda.empty_cache()
 
@@ -1401,10 +1537,14 @@ def run_single_benchmark(
     timer.stop()
     print(f"  DynamicEmb created in {timer.elapsed_time() / 1000:.3f} s")
 
-    timer.start()
-    torchrec_emb = create_split_table_batched_embeddings(cfg, device)
-    timer.stop()
-    print(f"  TorchRec created in {timer.elapsed_time() / 1000:.3f} s")
+    if cfg.run_torchrec:
+        timer.start()
+        torchrec_emb = create_split_table_batched_embeddings(cfg, device)
+        timer.stop()
+        print(f"  TorchRec created in {timer.elapsed_time() / 1000:.3f} s")
+    else:
+        torchrec_emb = None
+        print("  TorchRec baseline disabled (run_torchrec=False)")
 
     if cfg.correctness:
         # PowerLaw/zipf already produce values in [min, max-1] / [min, max),
@@ -1426,6 +1566,25 @@ def run_single_benchmark(
     if cfg.caching:
         dynamic_emb.set_record_cache_metrics(True)
 
+    # Warm up before timing/profiling for every mode except correctness.  The
+    # reporting loop populates the cache (so measured runs see steady-state hit
+    # rate instead of a cold start), warms the caching allocator, and triggers
+    # first-launch autotune / lazy init.  Correctness is excluded because the
+    # loop advances each backend with independent gradients, drifting their
+    # weights apart and breaking the forward-output comparison.
+    #
+    # Profile windows are bounded separately (cudaProfilerStart/Stop inside
+    # benchmark_with_nsys / benchmark_with_ncu, and torch.profiler's own
+    # schedule), so this warmup is never captured.
+    if not cfg.correctness:
+        print("  (run_reporting_loop warmup)")
+        run_reporting_loop(dynamic_emb, torchrec_emb, sparse_features, cfg)
+
+    if cfg.caching:
+        # Keep the warm cache contents/counters; only stop *recording* hit-rate
+        # metrics so the measured/profiled run reflects steady state.
+        dynamic_emb.set_record_cache_metrics(False)
+
     bw_results: List[Dict] = []
     if profile_mode == "torch":
         print("\n  >> DynamicEmb profiler run")
@@ -1437,13 +1596,14 @@ def run_single_benchmark(
         )
         bw_results = compute_bandwidth_report(prof, avg_n_unique, avg_n_total, cfg)
 
-        print("\n  >> TorchRec profiler run")
-        benchmark_with_torch_profiler(
-            torchrec_emb,
-            sparse_features,
-            cfg.num_iterations,
-            trace_prefix=f"torchrec_{cfg.label()}_",
-        )
+        if torchrec_emb is not None:
+            print("\n  >> TorchRec profiler run")
+            benchmark_with_torch_profiler(
+                torchrec_emb,
+                sparse_features,
+                cfg.num_iterations,
+                trace_prefix=f"torchrec_{cfg.label()}_",
+            )
 
         del dynamic_emb, torchrec_emb, sparse_features
         torch.cuda.empty_cache()
@@ -1452,40 +1612,15 @@ def run_single_benchmark(
             result["bandwidth"] = bw_results
         return result
     elif profile_mode == "nsys":
-        # Run reporting loop as untimed warmup (NOT captured by nsys -- the
-        # cudaProfilerStart/Stop window inside benchmark_with_nsys is what
-        # bounds the capture when launched under
-        # `nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop`).
-        print("  (run_reporting_loop warmup, then nsys sample 1 fwd+bwd)")
-        run_reporting_loop(dynamic_emb, torchrec_emb, sparse_features, cfg)
-        # Keep the cache warm from the reporting loop so nsys captures
-        # steady-state kernel behavior (same convention as the non-profile
-        # path).  Only stop recording hit-rate metrics.
-        if cfg.caching:
-            dynamic_emb.set_record_cache_metrics(False)
-
         benchmark_with_nsys(dynamic_emb, torchrec_emb, sparse_features, cfg)
         del dynamic_emb, torchrec_emb, sparse_features
         torch.cuda.empty_cache()
         return {"label": cfg.label(), "nsys": True}
-    elif profile_mode == "ncu-run":
+    elif profile_mode == "ncu":
         benchmark_with_ncu(dynamic_emb, sparse_features, cfg)
         del dynamic_emb, torchrec_emb, sparse_features
         torch.cuda.empty_cache()
-        return {"label": cfg.label(), "ncu_run": True}
-
-    # The reporting loop runs each backend independently with separate
-    # gradients, which drifts their weights apart; skip it when we need
-    # the post-loop weight state to match for the forward comparison.
-    if not cfg.correctness:
-        run_reporting_loop(dynamic_emb, torchrec_emb, sparse_features, cfg)
-
-    if cfg.caching:
-        # Keep the cache warm from the reporting loop -- benchmark_train_eval
-        # then measures steady-state hit-rate performance instead of a cold
-        # start.  We only stop *recording* hit-rate metrics; the cache
-        # contents and counters stay as the warmup left them.
-        dynamic_emb.set_record_cache_metrics(False)
+        return {"label": cfg.label(), "ncu": True}
 
     metrics = benchmark_train_eval(
         dynamic_emb,
@@ -1530,12 +1665,13 @@ def run_single_benchmark(
         f"  bwd={metrics['dyn_backward_ms']:.3f}"
         f"  eval={metrics['dyn_eval_ms']:.3f} ms"
     )
-    print(
-        f"  TorchRec    train={metrics['trc_train_ms']:.3f}"
-        f"  fwd={metrics['trc_forward_ms']:.3f}"
-        f"  bwd={metrics['trc_backward_ms']:.3f}"
-        f"  eval={metrics['trc_eval_ms']:.3f} ms"
-    )
+    if metrics["trc_train_ms"] is not None:
+        print(
+            f"  TorchRec    train={metrics['trc_train_ms']:.3f}"
+            f"  fwd={metrics['trc_forward_ms']:.3f}"
+            f"  bwd={metrics['trc_backward_ms']:.3f}"
+            f"  eval={metrics['trc_eval_ms']:.3f} ms"
+        )
     if bw_results:
         print("\n  Bandwidth (DynamicEmb):")
         print(format_bandwidth_table(bw_results))
@@ -1686,17 +1822,74 @@ def _no_hbm_configs():
 # ── Test suites ───────────────────────────────────────────────────────────────
 
 
-def _apply_overrides(cfg: BenchmarkConfig, correctness_flag: bool) -> BenchmarkConfig:
+def _retable(cfg: BenchmarkConfig, new_nt: int) -> None:
+    """Rebuild a config for ``new_nt`` tables in place, holding the per-suite
+    total capacity and total batch fixed (per-table cap = total // new_nt,
+    batch_size = total_batch // new_nt).  The per-table HBM entry is preserved
+    and replicated to the new length."""
+    old_nt = cfg.num_tables
+    total_cap = sum(cfg.num_embeddings_per_feature)
+    total_batch = cfg.batch_size * old_nt
+    cfg.num_embeddings_per_feature = [max(1, total_cap // new_nt)] * new_nt
+    cfg.batch_size = max(1, total_batch // new_nt)
+    hbm0 = cfg.hbm_for_embeddings[0] if cfg.hbm_for_embeddings else sys.maxsize
+    cfg.hbm_for_embeddings = [hbm0] * new_nt
+
+
+def _apply_overrides(
+    cfg: BenchmarkConfig,
+    correctness_flag: bool,
+    num_iterations: Optional[int] = None,
+    ncu_iterations: Optional[str] = None,
+    ncu_kernel_regex: Optional[str] = None,
+    num_tables: Optional[int] = None,
+    sparse_key_range: Optional[int] = None,
+    no_torchrec: bool = False,
+) -> BenchmarkConfig:
     """Apply session-wide CLI overrides onto a parametrized config."""
     if correctness_flag:
         cfg.correctness = True
+    if num_iterations is not None:
+        cfg.num_iterations = num_iterations
+    if ncu_iterations is not None:
+        cfg.ncu_iterations = ncu_iterations
+    if ncu_kernel_regex is not None:
+        cfg.ncu_kernel_regex = ncu_kernel_regex
+    if num_tables is not None and num_tables != cfg.num_tables:
+        _retable(cfg, num_tables)
+    if sparse_key_range is not None:
+        cfg.sparse_key_range = sparse_key_range
+    if no_torchrec:
+        cfg.run_torchrec = False
     return cfg
 
 
 class TestGpu:
     @pytest.mark.parametrize("cfg", _gpu_configs(), ids=lambda c: c.label())
-    def test_gpu(self, cfg, device, timer, profile_mode, correctness_flag):
-        cfg = _apply_overrides(cfg, correctness_flag)
+    def test_gpu(
+        self,
+        cfg,
+        device,
+        timer,
+        profile_mode,
+        correctness_flag,
+        num_iterations,
+        ncu_iterations,
+        ncu_kernel_regex,
+        num_tables,
+        sparse_key_range,
+        no_torchrec,
+    ):
+        cfg = _apply_overrides(
+            cfg,
+            correctness_flag,
+            num_iterations,
+            ncu_iterations,
+            ncu_kernel_regex,
+            num_tables,
+            sparse_key_range,
+            no_torchrec,
+        )
         result = run_single_benchmark(cfg, device, timer, profile_mode)
         append_result(result)
         assert "error" not in result
@@ -1704,8 +1897,30 @@ class TestGpu:
 
 class TestCaching:
     @pytest.mark.parametrize("cfg", _caching_configs(), ids=lambda c: c.label())
-    def test_caching(self, cfg, device, timer, profile_mode, correctness_flag):
-        cfg = _apply_overrides(cfg, correctness_flag)
+    def test_caching(
+        self,
+        cfg,
+        device,
+        timer,
+        profile_mode,
+        correctness_flag,
+        num_iterations,
+        ncu_iterations,
+        ncu_kernel_regex,
+        num_tables,
+        sparse_key_range,
+        no_torchrec,
+    ):
+        cfg = _apply_overrides(
+            cfg,
+            correctness_flag,
+            num_iterations,
+            ncu_iterations,
+            ncu_kernel_regex,
+            num_tables,
+            sparse_key_range,
+            no_torchrec,
+        )
         result = run_single_benchmark(cfg, device, timer, profile_mode)
         append_result(result)
         assert "error" not in result
@@ -1713,8 +1928,30 @@ class TestCaching:
 
 class TestNoCaching:
     @pytest.mark.parametrize("cfg", _no_caching_configs(), ids=lambda c: c.label())
-    def test_no_caching(self, cfg, device, timer, profile_mode, correctness_flag):
-        cfg = _apply_overrides(cfg, correctness_flag)
+    def test_no_caching(
+        self,
+        cfg,
+        device,
+        timer,
+        profile_mode,
+        correctness_flag,
+        num_iterations,
+        ncu_iterations,
+        ncu_kernel_regex,
+        num_tables,
+        sparse_key_range,
+        no_torchrec,
+    ):
+        cfg = _apply_overrides(
+            cfg,
+            correctness_flag,
+            num_iterations,
+            ncu_iterations,
+            ncu_kernel_regex,
+            num_tables,
+            sparse_key_range,
+            no_torchrec,
+        )
         result = run_single_benchmark(cfg, device, timer, profile_mode)
         append_result(result)
         assert "error" not in result
@@ -1722,8 +1959,30 @@ class TestNoCaching:
 
 class TestNoHbm:
     @pytest.mark.parametrize("cfg", _no_hbm_configs(), ids=lambda c: c.label())
-    def test_no_hbm(self, cfg, device, timer, profile_mode, correctness_flag):
-        cfg = _apply_overrides(cfg, correctness_flag)
+    def test_no_hbm(
+        self,
+        cfg,
+        device,
+        timer,
+        profile_mode,
+        correctness_flag,
+        num_iterations,
+        ncu_iterations,
+        ncu_kernel_regex,
+        num_tables,
+        sparse_key_range,
+        no_torchrec,
+    ):
+        cfg = _apply_overrides(
+            cfg,
+            correctness_flag,
+            num_iterations,
+            ncu_iterations,
+            ncu_kernel_regex,
+            num_tables,
+            sparse_key_range,
+            no_torchrec,
+        )
         result = run_single_benchmark(cfg, device, timer, profile_mode)
         append_result(result)
         assert "error" not in result
