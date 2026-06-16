@@ -7,4 +7,4 @@
 	branch = recsys-examples-v26.05
 [submodule "third_party/FlexKV"]
 	path = third_party/FlexKV
-	url = git@github.com:taco-project/FlexKV.git
+	url = https://github.com/taco-project/FlexKV.git

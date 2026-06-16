@@ -487,13 +487,25 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         user_ids = task_handle.handle.uids
 
         remain_task_ids = [t for t in task_ids if t not in task_handle.handle.responses]
+        if not remain_task_ids:
+            return HostKVWaitResult(status=HostKVTaskStatus.READY, ready=True)
+
         responses = self._client.try_wait(remain_task_ids)
 
+        # try_wait is non-blocking: empty or partial result means tasks are still pending.
         has_unready = False
         # has_timeout = False
         has_cancelled = False
         has_failed = False
         msgs: List[str] = []
+
+        missing_task_ids = [t for t in remain_task_ids if t not in responses]
+        if missing_task_ids:
+            has_unready = True
+            msgs.extend(
+                f"{task_id}:{KVResponseStatus.UNREADY}" for task_id in missing_task_ids
+            )
+
         for task_id, resp in responses.items():
             task_handle.handle.responses[task_id] = resp
             msgs.append(f"{task_id}:{resp.status}")
@@ -533,9 +545,20 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         return HostKVWaitResult(status=HostKVTaskStatus.READY, ready=True)
 
     def finish_task(self, task_handle: HostKVTaskHandle) -> List[int]:
-        # FlexKV wait success equals finish
+        # FlexKV wait success equals finish.
+        # offload_kvcache_wait() may already try_wait() to SUCCESS and release tasks in
+        # FlexKV; waiting again on those ids logs "not submitted" (NOTFOUND). Only wait
+        # on tasks that are not yet SUCCESS in handle.responses.
         # TODO(junyiq): Make sure gpu kvcache locks the pages when offloading for flexkv backend.
-        self._client.wait(task_handle.handle.task_ids, completely=True)
+        responses = task_handle.handle.responses
+        pending_task_ids = [
+            task_id
+            for task_id in task_handle.handle.task_ids
+            if responses.get(task_id) is None
+            or responses[task_id].status != KVResponseStatus.SUCCESS
+        ]
+        if pending_task_ids:
+            self._client.wait(pending_task_ids, completely=True)
         return [1 for _ in range(task_handle.handle.uids.size(0))]
 
     def cancel_task(self, task_handle: HostKVTaskHandle) -> bool:
