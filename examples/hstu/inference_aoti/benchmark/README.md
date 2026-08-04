@@ -56,24 +56,25 @@ The PyTorch AOTI results use the Triton
 
 #### Runtime and backend comparison
 
+Benchmark with Triton batch size = 2.
+
 - 3-Layer HSTU Model
 
-
-| Runtime or serving path            | Cache state      | Latency per logical request (ms) |
-| ---------------------------------- | ---------------- | -------------------------------- |
-| Triton Server Python backend       | No cache         | 3.161                            |
-| Triton Server PyTorch AOTI backend | No cache         | 2.471                            |
-| Triton Server PyTorch AOTI backend | GPU KV-cache hit | 1.436                            |
+| Runtime or serving path            | Cache state      | Latency per logical request (ms) | Latency Speedup   |
+| ---------------------------------- | ---------------- | -------------------------------- | ----------------- |
+| Triton Server Python backend       | No cache         | 3.161                            | Baseline          |
+| Triton Server PyTorch AOTI backend | No cache         | 2.471                            | **1.28x**         |
+| Triton Server PyTorch AOTI backend | GPU KV-cache hit | 1.436                            | **2.20x**         |
 
 
 - 8-Layer HSTU Model
 
 
-| Runtime or serving path            | Cache state      | Latency per logical request (ms) |
-| ---------------------------------- | ---------------- | -------------------------------- |
-| Triton Server Python backend       | No cache         | 5.879                            |
-| Triton Server PyTorch AOTI backend | No cache         | 5.156                            |
-| Triton Server PyTorch AOTI backend | GPU KV-cache hit | 2.467                            |
+| Runtime or serving path            | Cache state      | Latency per logical request (ms) | Latency Speedup   |
+| ---------------------------------- | ---------------- | -------------------------------- | ----------------- |
+| Triton Server Python backend       | No cache         | 5.879                            | Baseline          |
+| Triton Server PyTorch AOTI backend | No cache         | 5.156                            | **1.14x**         |
+| Triton Server PyTorch AOTI backend | GPU KV-cache hit | 2.467                            | **2.38x**         |
 
 
 
