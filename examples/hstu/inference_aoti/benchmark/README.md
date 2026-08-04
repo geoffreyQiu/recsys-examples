@@ -46,22 +46,39 @@ The PyTorch AOTI results use the Triton
 
 #### Runtime and backend comparison
 
+- 3-Layer HSTU Model
 
 | Runtime or serving path | Cache state | Latency per logical request (ms) |
 | --- | --- | ---: |
-| Torch Python runtime | No cache | 2.809 |
-| Torch C++ runtime + AOTI | No cache | 1.950 |
 | Triton Server Python backend | No cache | 3.161 |
 | Triton Server PyTorch AOTI backend | No cache | 2.471 |
 | Triton Server PyTorch AOTI backend | GPU KV-cache hit | 1.436 |
 
+- 8-Layer HSTU Model
+
+| Runtime or serving path | Cache state | Latency per logical request (ms) |
+| --- | --- | ---: |
+| Triton Server Python backend | No cache | 5.879 |
+| Triton Server PyTorch AOTI backend | No cache | 5.156 |
+| Triton Server PyTorch AOTI backend | GPU KV-cache hit | 2.467 |
+
 #### PyTorch AOTI backend by batch size
+
+- 3-Layer HSTU Model
 
 |  Batch Size | No-cache latency per logical request (ms) | GPU KV-cache-hit latency per logical request (ms) | GPU KV-cache-hit speedup |
 | ---: | ---: | ---: | ---: |
 | 2 | 2.471 | 1.436 | **1.72x** |
 | 4 | 1.956 | 0.763 | **2.56x** |
 | 8 | 1.890 | 0.423 | **4.47x** |
+
+- 8-Layer HSTU Model
+
+|  Batch Size | No-cache latency per logical request (ms) | GPU KV-cache-hit latency per logical request (ms) | GPU KV-cache-hit speedup |
+| ---: | ---: | ---: | ---: |
+| 2 | 5.156 | 2.467 | **2.09x** |
+| 4 | 4.406 | 1.267 | **3.48x** |
+| 8 | 4.020 | 0.678 | **5.93x** |
 
 #### Model structure
 
@@ -72,7 +89,7 @@ The effective sequence capacity follows the
 
 | Model property | Value |
 | --- | --- |
-| HSTU layers | 3 |
+| HSTU layers | 3 / 8 |
 | Hidden size | 512 |
 | Attention heads | 4 |
 | Head dimension (`kv_channels`) | 128 |
