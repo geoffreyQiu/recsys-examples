@@ -32,7 +32,7 @@ These results are emitted by the no-cache
 loads the packaged AOTI artifact, and compares Python runtime time against the
 native C++ replay executable on the KuaiRand-1K evaluation data.
 
-- 3-Layer HSTU Model
+- 3-Layer HSTU Model (See [below](./README.md#model-structure) for details)
 
 
 | Hardware                                   | Python runtime per-request latency (ms) | C++ runtime per-request latency (ms) | C++ speedup |
@@ -99,6 +99,10 @@ The PyTorch AOTI results use the Triton
 | 4          | 4.406                                     | 1.267                                             | **3.48x**                |
 | 8          | 4.020                                     | 0.678                                             | **5.93x**                |
 
+
+
+
+### Notes:
 
 
 
