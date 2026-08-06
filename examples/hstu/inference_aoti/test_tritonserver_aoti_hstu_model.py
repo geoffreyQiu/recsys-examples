@@ -403,7 +403,7 @@ def parse_args() -> argparse.Namespace:
         "--batch_size",
         type=int,
         choices=SUPPORTED_BATCH_SIZES,
-        default=8,
+        default=2,
         help="Logical HSTU batch size for measured Triton requests.",
     )
     parser.add_argument("--post_warmup_sleep_seconds", type=float, default=1.0)
