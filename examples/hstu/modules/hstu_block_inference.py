@@ -111,8 +111,7 @@ def _initialize_kvcache_metadata_for_cudagraph(
             )
         )
     kvcache_metadata.kv_indptr[: batch_size + 1].copy_(
-        torch.arange(batch_size + 1, dtype=dtype, device=device)
-        * pages_per_sequence
+        torch.arange(batch_size + 1, dtype=dtype, device=device) * pages_per_sequence
     )
     if kvcache_metadata.kv_indptr.numel() > batch_size + 1:
         kvcache_metadata.kv_indptr[batch_size + 1 :].fill_(num_pages)
@@ -129,12 +128,8 @@ def _initialize_kvcache_metadata_for_cudagraph(
     kvcache_metadata.total_history_offsets[: batch_size + 1].copy_(history_offsets)
     kvcache_metadata.new_history_offsets[: batch_size + 1].copy_(history_offsets)
     if kvcache_metadata.total_history_offsets.numel() > batch_size + 1:
-        kvcache_metadata.total_history_offsets[batch_size + 1 :].fill_(
-            new_history_nnz
-        )
-        kvcache_metadata.new_history_offsets[batch_size + 1 :].fill_(
-            new_history_nnz
-        )
+        kvcache_metadata.total_history_offsets[batch_size + 1 :].fill_(new_history_nnz)
+        kvcache_metadata.new_history_offsets[batch_size + 1 :].fill_(new_history_nnz)
 
     if new_history_nnz > 0:
         kvcache_metadata.batch_indices[:new_history_nnz].copy_(
@@ -152,9 +147,7 @@ def _initialize_kvcache_metadata_for_cudagraph(
     kv_seqlen_offsets = (
         torch.arange(batch_size + 1, dtype=dtype, device=device) * kv_seqlen
     )
-    kvcache_metadata.kv_seqlen_offsets[: batch_size + 1].copy_(
-        kv_seqlen_offsets
-    )
+    kvcache_metadata.kv_seqlen_offsets[: batch_size + 1].copy_(kv_seqlen_offsets)
     if kvcache_metadata.kv_seqlen_offsets.numel() > batch_size + 1:
         kvcache_metadata.kv_seqlen_offsets[batch_size + 1 :].fill_(
             batch_size * kv_seqlen
