@@ -142,6 +142,21 @@ DOCKER_BUILDKIT=1 docker build --progress=plain \
   -f "docker/Dockerfile" .
 ```
 
+For fast upgrade validation when CI already published a completed main-branch
+`build` image, use `docker/Dockerfile.nve_overlay`. This path replaces and
+rebuilds only NVE, updates the changed DynamicEmb/HSTU Python sources, and
+incrementally rebuilds the two NVE-aware replay executables. It verifies that
+the installed FBGEMM HSTU binary is unchanged. The base must be the final image
+from `docker/Dockerfile`, not `base_fbgemm` or `base_triton`:
+
+```bash
+DOCKER_BUILDKIT=1 docker build --progress=plain \
+  --platform linux/amd64 \
+  --build-arg BASE_MAIN_IMAGE="${BASE_MAIN_IMAGE}" \
+  -t "recsys-examples:nve-26.07-overlay" \
+  -f "docker/Dockerfile.nve_overlay" .
+```
+
 ### 2. Prepare the dataset and train a checkpoint
 
 This step preprocesses the `kuairand-1k` dataset, runs single-GPU training with
