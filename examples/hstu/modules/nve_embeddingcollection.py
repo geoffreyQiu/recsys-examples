@@ -22,7 +22,7 @@ from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 try:
     import pynve.torch.nve_ps as nve_ps
-    from pynve.torch.nve_layers import CacheType, NVEmbedding
+    from pynve.torch.nve_layers import LayerType, NVEmbedding
 
     def get_nve_local_ps(vocab_size, embedding_dim, torch_dtype):
         return nve_ps.NVEParameterServer(vocab_size, embedding_dim, torch_dtype)
@@ -63,11 +63,11 @@ try:
                         num_embeddings=embedding_config.num_embeddings,
                         embedding_size=embedding_config.embedding_dim,
                         data_type=embedding_config.data_type,
-                        cache_type=CacheType.Hierarchical,
+                        layer_type=LayerType.Hierarchical,
                         gpu_cache_size=gpu_cache_size,
                         host_cache_size=0,
                         optimize_for_training=False,
-                        remote_interface=sparse_shareables[embedding_config.name]
+                        storage=sparse_shareables[embedding_config.name]
                         if sparse_shareables
                         else get_nve_local_ps(
                             0, embedding_config.embedding_dim, torch.float32
@@ -78,7 +78,7 @@ try:
                         num_embeddings=embedding_config.num_embeddings,
                         embedding_size=embedding_config.embedding_dim,
                         data_type=embedding_config.data_type,
-                        cache_type=CacheType.NoCache,
+                        layer_type=LayerType.GPULayer,
                         optimize_for_training=False,
                     )
 

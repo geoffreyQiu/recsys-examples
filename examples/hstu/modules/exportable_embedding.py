@@ -82,13 +82,6 @@ from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 
-# Register fake impl for nve_ops::embedding_lookup
-@torch.library.register_fake("nve_ops::embedding_lookup", allow_override=True)
-def _f(keys, layer_id):
-    ctx = torch.library.get_ctx()
-    return keys.new_empty((keys.size(0), ctx.new_dynamic_size()), dtype=torch.float32)
-
-
 @dataclass
 class InferenceEmbeddingConfig(ShardedEmbeddingConfig):
     use_dynamic: bool = False
