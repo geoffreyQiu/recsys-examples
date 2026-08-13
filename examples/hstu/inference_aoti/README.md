@@ -120,27 +120,24 @@ C++.
 
 ### 1. Build the development image
 
-The first build creates the reusable FBGEMM base image. The second reuses that
-image and builds the remaining dependencies, in-tree custom operators, C++
-replay executable, and runtime libraries. It intentionally does not build the
-legacy NVE Triton initialization hook.
+Use a completed `base_triton` image as `BASE_TRITON_IMAGE`. This makes the
+Docker build begin at the `devel` stage, skipping the Dockerfile's
+`base_fbgemm` and `base_triton` stages while building the remaining
+dependencies, in-tree custom operators, C++ replay executable, and runtime
+libraries. It intentionally does not build the legacy NVE Triton
+initialization hook.
 
 ```bash
-# Build the reusable FBGEMM base image.
 DOCKER_BUILDKIT=1 docker build --progress=plain \
   --platform linux/amd64 \
-  --target base_fbgemm \
-  -t "recsys-fbgemm-base" \
-  -f "docker/Dockerfile" .
-
-# Build the recsys-examples development image from that base.
-DOCKER_BUILDKIT=1 docker build --progress=plain \
-  --platform linux/amd64 \
-  --build-arg BASE_FBGEMM_IMAGE=recsys-fbgemm-base \
-  --build-arg BASE_TRITON_IMAGE=recsys-fbgemm-base \
+  --build-arg BASE_TRITON_IMAGE="${BASE_TRITON_IMAGE}" \
   -t "recsys-examples-dev" \
   -f "docker/Dockerfile" .
 ```
+
+Without the `BASE_TRITON_IMAGE` override, the default `base_triton` value
+selects the Dockerfile's internal stage and therefore also builds its
+`base_fbgemm` dependency.
 
 For fast upgrade validation when CI already published a completed main-branch
 `build` image, use `docker/Dockerfile.nve_overlay`. This path replaces and
