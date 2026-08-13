@@ -3,16 +3,14 @@
 ## Purpose
 
 This document describes how to export and run the HSTU ranking inference model
-with PyTorch AOTInductor (AOTI), native C++ replay, a FlexKV-backed KV cache,
-and Triton Server.
+with PyTorch AOTInductor (AOTI), native C++ replay, and a FlexKV-backed KV cache.
 
-The workflow covers five stages:
+The supported workflow covers four stages:
 
 1. Building the required custom operators and runtime libraries
 2. Exporting the HSTU ranking model with `torch.export` and AOTInductor
 3. Starting the FlexKV-backed KV-cache runtime service
 4. Validating the exported artifacts and replay tensors with native C++
-5. Serving and testing the exported KV-cache AOTI model with Triton Server
 
 For lower-level build and deployment details, see the
 [HSTU KV-cache AOTI setup guide](./guide_to_hstu_aoti_inference_setup.md).
@@ -20,6 +18,12 @@ For lower-level build and deployment details, see the
 ---
 
 ## Scope
+
+> [!NOTE]
+> The NVE 26.06/26.07 upgrade covers DynamicEmb and HSTU Python export,
+> NVE-aware Python AOTI reload, and native C++ replay. Triton deployment is not
+> validated or supported in this stage, and `nve_init_hook/` is not built.
+> The existing Triton files remain checked in for a later integration update.
 
 This guide covers these checked-in entry points:
 
@@ -33,19 +37,12 @@ C++ AOTI replay:
 - `cpp_inference/inference_hstu_gr_ranking_exported_model.cpp`
 - `cpp_inference/inference_hstu_gr_ranking_kvcache_exported_model.cpp`
 
-Triton Server AOTI deployment:
-
-- `nve_init_hook/`
-- `triton_aoti/hstu_gr_ranking_kvcache/`
-- `test_tritonserver_aoti_hstu_model.py`
-
 FlexKV server launcher:
 
 - `start_flexkv_server_for_kvcache_cpp.py`
 
 For each export variant, Python validation and native C++ replay consume the
-same model package and replay tensors. The KV-cache artifacts are also used by
-the Triton request-replay path.
+same model package and replay tensors.
 
 The complete example below focuses on the KV-cache variant. The non-KV-cache
 exporter and C++ replay executable remain available for direct AOTI validation.
@@ -55,7 +52,7 @@ At the end of the KV-cache workflow, the following key artifacts are expected:
 1. Exported KV-cache AOTI package in `examples/hstu/inference_aoti/hstu_gr_ranking_kvcache_model/`
 2. Replay tensors in `examples/hstu/inference_aoti/export_test_dump/`
 3. C++ executable at `examples/hstu/inference_aoti/cpp_inference/build/inference_hstu_gr_ranking_kvcache_exported_model`
-4. AOTI/Triton runtime libraries under `examples/hstu/triton_libs/`
+4. AOTI runtime libraries under `examples/hstu/triton_libs/`
 
 ---
 
@@ -65,16 +62,18 @@ The AOTI export path converts the HSTU PyTorch model with `torch.export` and
 `torch._inductor.aoti_compile_and_package` for native C++ loading.
 
 The embedding implementation combines DynamicEmb `InferenceEmbeddingTable`
-and `ScoredHashTable` with NVEmbedding layers. NVEmbedding's customized
-`export_and_aot` stores layer metadata and embedding-table files alongside the
-model `.pt2` archive, avoiding duplicate embedding-table copies at load time.
+and `ScoredHashTable` with NVEmbedding layers. NVE's `export_aot` stores
+schema-v2 layer/resource metadata and embedding-table
+files alongside the model `.pt2` archive. Python validation uses NVE's
+`load_aot`, and native replay constructs `LayerDirectory` after the AOTI package
+loader so each compiled marker constant is rebound to its loaded NVE layer.
 The complete exported model archive has this structure:
 
 ```text
 path/to/model_archive
         ├── model.pt2                              # AOTI model package
-        ├── metadata.json                          # NVEmbedding layer metadata
-        └── weights/{emb_layer_module_name}.nve    # NVEmbedding weight data
+        ├── metadata.json                          # NVE schema-v2 metadata
+        └── weights/{resource_id}.nve              # NVE storage-resource data
 ```
 
 ---
@@ -84,16 +83,15 @@ path/to/model_archive
 1. PyTorch export, C++ replay, and development use the image built from
    `docker/Dockerfile`. It extends NVIDIA PyTorch 26.05
    (`nvcr.io/nvidia/pytorch:26.05-py3`) with the repository's FBGEMM, FlexKV,
-   NVE, HSTU, DynamicEmb, commons, and KV-cache manager builds. See the HSTU
-   example [README](../README.md) for broader training and inference context.
+   NVE 26.07, HSTU, DynamicEmb, commons, and KV-cache manager builds. The
+   integration uses APIs shared by NVE 26.06 and 26.07. See the HSTU example
+   [README](../README.md) for broader training and inference context.
 
-2. Triton Server testing uses `docker/Dockerfile.tritonserver`, based on NVIDIA
-   Triton Server 26.06 (`nvcr.io/nvidia/tritonserver:26.06-py3`). It copies the
-   custom PyTorch backend, PyTorch installation, FlexKV, NVE, HSTU, FBGEMM,
-   custom-operator libraries, and Triton client dependencies from the AOTI
-   development image.
+   The image selects NVE's non-plugin key/cache kernel features because this
+   workflow uses LinearUVM layers and does not require the optional parameter
+   server storage plugins.
 
-3. KV-cache AOTI support depends on the FlexKV source under
+2. KV-cache AOTI support depends on the FlexKV source under
    `third_party/FlexKV`, which `docker/Dockerfile` copies into the image.
 
 ---
@@ -117,15 +115,15 @@ If your layout differs, update the corresponding volume mounts and commands.
 ## Example: HSTU AOTI Inference on KuaiRand-1K
 
 The following commands build the images, prepare KuaiRand-1K data, train a
-small checkpoint, export a KV-cache AOTI package, validate it with native C++,
-and replay requests through Triton Server.
+small checkpoint, export a KV-cache AOTI package, and validate it with native
+C++.
 
 ### 1. Build the development image
 
 The first build creates the reusable FBGEMM base image. The second reuses that
 image and builds the remaining dependencies, in-tree custom operators, C++
-replay executable, NVE initialization hook, PyTorch backend, and staged Triton
-runtime libraries.
+replay executable, and runtime libraries. It intentionally does not build the
+legacy NVE Triton initialization hook.
 
 ```bash
 # Build the reusable FBGEMM base image.
@@ -139,6 +137,7 @@ DOCKER_BUILDKIT=1 docker build --progress=plain \
 DOCKER_BUILDKIT=1 docker build --progress=plain \
   --platform linux/amd64 \
   --build-arg BASE_FBGEMM_IMAGE=recsys-fbgemm-base \
+  --build-arg BASE_TRITON_IMAGE=recsys-fbgemm-base \
   -t "recsys-examples-dev" \
   -f "docker/Dockerfile" .
 ```
@@ -235,53 +234,8 @@ docker run \
     cp -apr /workspace/recsys-examples/examples/hstu/inference_aoti/export_test_dump /exported_hstu_model/ "
 ```
 
-### 4. Package the Triton Server runtime image
+## Triton status
 
-```bash
-DOCKER_BUILDKIT=1 docker build --progress=plain \
-  --build-arg PYTORCH_AOTI_IMAGE=recsys-examples-dev \
-  -f docker/Dockerfile.tritonserver \
-  -t recsys-examples-tritonserver .
-```
-
-### 5. Replay the exported model through Triton Server
-
-```bash
-docker run \
-  --rm --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 --gpus 1 \
-  --volume exported_hstu_model:/exported_hstu_model \
-  --hostname $(hostname) --name recsys-dev-tritonserver \
-  --tmpfs /tmp:exec \
-  recsys-examples-tritonserver \
-  bash -lecx "
-    mkdir -p /triton_model_repo/
-    cp -apr \
-      /workspace/recsys-examples/examples/hstu/inference_aoti/triton_aoti/hstu_gr_ranking_kvcache \
-      /triton_model_repo/
-    cp -apr /exported_hstu_model/hstu_gr_ranking_kvcache_model \
-      /triton_model_repo/hstu_gr_ranking_kvcache/1
-    cp -apr /exported_hstu_model/export_test_dump \
-      /workspace/recsys-examples/examples/hstu/inference_aoti
-
-    cd /workspace/recsys-examples/examples/hstu/inference_aoti
-    export FLEXKV_LOG_LEVEL=WARNING
-    export KVCACHE_MANAGER_CONFIG_FILE=\${PWD}/kvcache_cpp_runtime.yaml
-    python3 start_flexkv_server_for_kvcache_cpp.py --config_file \${KVCACHE_MANAGER_CONFIG_FILE} 2>&1 &
-    kvserver_pid=\$!
-    sleep 10
-    kill -0 \${kvserver_pid}
-
-    tritonserver --model-repository=/triton_model_repo/ &
-    triton_pid=\$!
-    sleep 30
-
-    python3 test_tritonserver_aoti_hstu_model.py \
-      --batch_size 2 > test_benchmark.log
-    cat test_benchmark.log
-    kill \$triton_pid || true
-    kill -9 \$triton_pid || true
-    kill \$kvserver_pid || true "
-
-# Remove the exported artifacts only when they are no longer needed.
-docker volume rm exported_hstu_model
-```
+`docker/Dockerfile.tritonserver`, `nve_init_hook/`, and `triton_aoti/` retain the
+pre-upgrade integration for follow-up work. Do not use those paths with NVE
+26.06 or 26.07 until their loader contract is migrated and validated.
