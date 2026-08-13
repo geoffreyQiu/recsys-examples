@@ -5,7 +5,6 @@ ARG BASE_MAIN_IMAGE
 FROM ${BASE_MAIN_IMAGE} AS nve_overlay
 
 ARG TARGETPLATFORM
-ARG REPLAYER_BUILD_JOBS=8
 
 USER root
 WORKDIR /workspace/recsys-examples
@@ -96,7 +95,7 @@ RUN set -eux; \
       --target \
         inference_hstu_gr_ranking_exported_model \
         inference_hstu_gr_ranking_kvcache_exported_model \
-      -j "${REPLAYER_BUILD_JOBS}"; \
+      -j 8; \
     rm -rf /workspace/recsys-examples/examples/hstu/triton_libs/pynve; \
     mkdir -p /workspace/recsys-examples/examples/hstu/triton_libs/pynve; \
     cp -a /usr/local/lib/python3.12/dist-packages/pynve/. \
