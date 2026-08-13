@@ -1,8 +1,6 @@
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.05-py3
 ARG BASE_FBGEMM_IMAGE=base_fbgemm
-# Keep the standalone AOTI build independent of Triton. The legacy Triton
-# integration can still opt in by setting this to the base_triton stage/image.
-ARG BASE_TRITON_IMAGE=base_fbgemm
+ARG BASE_TRITON_IMAGE=base_triton
 ARG DEVEL_IMAGE=devel
 
 # Triton r${TRITON_SERVER_VERSION} is built against local PyTorch libraries.
@@ -205,7 +203,7 @@ RUN set -eux; \
     done
 
 # ============================================================================
-# Stage 3: devel — standalone base + system setup + Megatron + pip
+# Stage 3: devel — base_triton + system setup + Megatron + pip
 # + flash-attention + FlexKV/NVE + HSTU Path B.
 # ============================================================================
 FROM ${BASE_TRITON_IMAGE} AS devel
