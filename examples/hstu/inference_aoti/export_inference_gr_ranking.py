@@ -30,7 +30,7 @@ from megatron.core import parallel_state
 from model import get_ranking_model
 from model.inference_ranking_gr import apply_inference
 from modules.metrics import get_multi_event_metric_module
-from pynve.torch.nve_export import export_aot
+from pynve.torch.nve_export import export_aot, load_aot
 from torch.export import Dim, ShapesCollection
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from utils import NetworkArgs, TensorModelParallelArgs
@@ -386,12 +386,14 @@ def export_inference_gr_ranking(
         print(
             "       ├── metadata.json              # NVE layer metadata (id, num_embeddings, emb_size, etc.)"
         )
-        print("       └── weights/{emb_layer}.nve    # NVE weight data (LinearUVM)")
+        print("       └── weights/{resource_id}.nve  # NVE weight data (LinearUVM)")
 
         # === Test Compiled Model ===
-        compiled_model = torch._inductor.aoti_load_package(
-            os.path.join(export_dir, "model.pt2")
+        compiled_loader, loaded_nve_layers = load_aot(
+            export_dir,
+            device=torch.device("cuda", torch.cuda.current_device()),
         )
+        print(f"[INFO] Loaded {len(loaded_nve_layers)} NVE layer(s) for AOTI")
 
         dump_dir = os.path.join(os.path.dirname(__file__), "export_test_dump")
         os.makedirs(dump_dir, exist_ok=True)
@@ -408,13 +410,19 @@ def export_inference_gr_ranking(
                 inputs.append(batch)
 
                 with torch.inference_mode():
-                    logits = compiled_model(
-                        (
+                    compiled_outputs = compiled_loader.run(
+                        [
                             batch.features.values(),
                             batch.features.lengths(),
                             batch.num_candidates,
-                        )
+                        ]
                     )
+                    if len(compiled_outputs) != 1:
+                        raise RuntimeError(
+                            "Expected the compiled AOTI model to return one tensor, "
+                            f"got {len(compiled_outputs)}"
+                        )
+                    logits = compiled_outputs[0]
                     ref_logits = model(batch)
                     ref_logits_cpu = ref_logits.detach().cpu()
 
@@ -487,13 +495,19 @@ def export_inference_gr_ranking(
             start = time.perf_counter()
             with torch.inference_mode():
                 for b in inputs:
-                    logits = compiled_model(
-                        (
+                    compiled_outputs = compiled_loader.run(
+                        [
                             b.features.values(),
                             b.features.lengths(),
                             b.num_candidates,
-                        )
+                        ]
                     )
+                    if len(compiled_outputs) != 1:
+                        raise RuntimeError(
+                            "Expected the compiled AOTI model to return one tensor, "
+                            f"got {len(compiled_outputs)}"
+                        )
+                    logits = compiled_outputs[0]
                     results.append(logits)
             torch.cuda.synchronize()
             end = time.perf_counter()

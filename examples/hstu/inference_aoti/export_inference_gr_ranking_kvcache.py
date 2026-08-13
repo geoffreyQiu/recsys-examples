@@ -52,7 +52,7 @@ from model import get_ranking_model
 from model.export_kvcached_inference_ranking_gr import ExportKVCachedInferenceRankingGR
 from modules.inference_dense_module import InferenceDenseModule
 from modules.metrics import get_multi_event_metric_module
-from pynve.torch.nve_export import export_aot
+from pynve.torch.nve_export import export_aot, load_aot
 from recsys_kvcache_manager.kvcache_config import KVCacheConfig, get_kvcache_config
 from torch.export import Dim, ShapesCollection
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
@@ -664,11 +664,15 @@ def export_inference_gr_ranking(
             print(
                 "       ├── metadata.json              # NVE layer metadata (id, num_embeddings, emb_size, etc.)"
             )
-            print("       └── weights/{emb_layer}.nve    # NVE weight data (LinearUVM)")
+            print("       └── weights/{resource_id}.nve  # NVE weight data (LinearUVM)")
 
             # === Test Compiled Model ===
-            compiled_model = torch._inductor.aoti_load_package(
-                os.path.join(export_dir, "model.pt2")
+            compiled_loader, loaded_nve_layers = load_aot(
+                export_dir,
+                device=torch.device("cuda", torch.cuda.current_device()),
+            )
+            print(
+                f"[INFO] Loaded {len(loaded_nve_layers)} NVE layer(s) for AOTI"
             )
 
             dump_dir = os.path.join(os.path.dirname(__file__), "export_test_dump")
@@ -689,14 +693,14 @@ def export_inference_gr_ranking(
             compiled_results = []
             with torch.inference_mode():
                 for batch, user_ids, total_history_lengths in inputs:
-                    compiled_outputs = compiled_model(
-                        (
+                    compiled_outputs = compiled_loader.run(
+                        [
                             batch.features.values(),
                             batch.features.lengths(),
                             batch.num_candidates,
                             user_ids,
                             total_history_lengths,
-                        )
+                        ]
                     )
                     compiled_results.append(_split_model_outputs(compiled_outputs))
 
