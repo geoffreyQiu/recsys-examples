@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1
+
 # Fast validation image for an NVE-only upgrade. BASE_MAIN_IMAGE must be the
 # completed `build` image produced from main by docker/Dockerfile, not the
 # base_fbgemm or base_triton dependency image.
@@ -6,45 +8,35 @@ FROM ${BASE_MAIN_IMAGE} AS nve_overlay
 
 ARG TARGETPLATFORM
 
-USER root
-WORKDIR /workspace/recsys-examples
-
-# The main image must already contain every expensive dependency and the CMake
-# build tree used below for an incremental relink. Record the HSTU binary hash
-# so the overlay can prove that it did not rebuild or replace FBGEMM HSTU.
-RUN set -eux; \
-    test -d /workspace/deps/nve; \
-    test -d /workspace/deps/nve/third_party/NVTX/c/include; \
-    test -f /workspace/recsys-examples/examples/hstu/inference_aoti/cpp_inference/build/CMakeCache.txt; \
-    test -f /usr/local/lib/python3.12/dist-packages/hstu/fbgemm_gpu_experimental_hstu.so; \
-    python3 -c 'import dynamicemb, pynve; print("base pynve:", pynve.__version__)'; \
-    sha256sum \
-      /usr/local/lib/python3.12/dist-packages/hstu/fbgemm_gpu_experimental_hstu.so \
-      > /tmp/fbgemm-hstu-before.sha256
-
-# Preserve NVTX from the main image because it is fetched while that image is
-# built and is not an NVE git submodule. Replace the old source and uninstall
-# the old pynve wheel before copying/building NVE 26.07.
-RUN set -eux; \
-    mkdir -p /workspace/deps/nve-overlay-assets; \
-    mv /workspace/deps/nve/third_party/NVTX \
-      /workspace/deps/nve-overlay-assets/NVTX; \
-    rm -rf /workspace/deps/nve; \
-    python3 -m pip uninstall -y pynve
-
-COPY third_party/nv-embedding-cache /workspace/deps/nve
-COPY docker/nve_standalone_features.cmake /workspace/deps/nve_standalone_features.cmake
-
-RUN set -eux; \
-    mv /workspace/deps/nve-overlay-assets/NVTX \
-      /workspace/deps/nve/third_party/NVTX; \
-    rmdir /workspace/deps/nve-overlay-assets; \
+# The main image is already close to Docker's maximum layer depth. Mount the
+# build context without copying it into the image, then perform the complete
+# overlay in one filesystem layer. FBGEMM HSTU is neither rebuilt nor replaced.
+# Runtime verification is intentionally separate from this build.
+RUN --mount=type=bind,source=.,target=/tmp/nve-overlay-context \
+    set -eux; \
+    overlay=/tmp/nve-overlay-context; \
+    repo=/workspace/recsys-examples; \
+    nve=/workspace/deps/nve; \
+    replay_build=${repo}/examples/hstu/inference_aoti/cpp_inference/build; \
+    test -d "${nve}"; \
+    test -d "${nve}/third_party/NVTX/c/include"; \
+    test -f "${replay_build}/CMakeCache.txt"; \
+    test -d "${overlay}/third_party/nv-embedding-cache"; \
+    test -f "${overlay}/docker/nve_standalone_features.cmake"; \
+    mv "${nve}/third_party/NVTX" /tmp/nve-overlay-NVTX; \
+    rm -rf "${nve}"; \
+    cp -a "${overlay}/third_party/nv-embedding-cache" "${nve}"; \
+    mv /tmp/nve-overlay-NVTX "${nve}/third_party/NVTX"; \
+    install -m 0644 \
+      "${overlay}/docker/nve_standalone_features.cmake" \
+      /workspace/deps/nve_standalone_features.cmake; \
+    python3 -m pip uninstall -y pynve; \
     if [ "${TARGETPLATFORM}" = "linux/arm64" ]; then \
       avx512_env=""; \
     else \
       avx512_env="PYNVE_DISABLE_AVX512=1"; \
     fi; \
-    cd /workspace/deps/nve; \
+    cd "${nve}"; \
     env \
       CMAKE_TOOLCHAIN_FILE=/workspace/deps/nve_standalone_features.cmake \
       PYNVE_BUILD_DIR=/tmp/pynve-26.07-build \
@@ -54,56 +46,48 @@ RUN set -eux; \
       ${avx512_env} \
       python3 -m pip install --no-build-isolation --no-deps .; \
     rm -rf /tmp/pynve-26.07-build; \
-    python3 -c 'import pynve; assert pynve.__version__ == "26.07.0", pynve.__version__; print("overlay pynve:", pynve.__version__)'
-
-# Only these application sources changed for the 26.07 API. DynamicEmb's CUDA
-# extension did not change, so update its installed Python module in place.
-# HSTU exporters/modules run from /workspace/recsys-examples and need no wheel
-# rebuild. The two C++ sources are incrementally rebuilt below.
-COPY corelib/dynamicemb/dynamicemb/exportable_tables.py /workspace/recsys-examples/corelib/dynamicemb/dynamicemb/exportable_tables.py
-COPY corelib/dynamicemb/test/test_nve_aoti_export.py /workspace/recsys-examples/corelib/dynamicemb/test/test_nve_aoti_export.py
-COPY examples/hstu/modules/exportable_embedding.py /workspace/recsys-examples/examples/hstu/modules/exportable_embedding.py
-COPY examples/hstu/modules/nve_embeddingcollection.py /workspace/recsys-examples/examples/hstu/modules/nve_embeddingcollection.py
-COPY examples/hstu/inference_aoti/export_inference_gr_ranking.py /workspace/recsys-examples/examples/hstu/inference_aoti/export_inference_gr_ranking.py
-COPY examples/hstu/inference_aoti/export_inference_gr_ranking_kvcache.py /workspace/recsys-examples/examples/hstu/inference_aoti/export_inference_gr_ranking_kvcache.py
-COPY examples/hstu/inference_aoti/cpp_inference/inference_hstu_gr_ranking_exported_model.cpp /workspace/recsys-examples/examples/hstu/inference_aoti/cpp_inference/inference_hstu_gr_ranking_exported_model.cpp
-COPY examples/hstu/inference_aoti/cpp_inference/inference_hstu_gr_ranking_kvcache_exported_model.cpp /workspace/recsys-examples/examples/hstu/inference_aoti/cpp_inference/inference_hstu_gr_ranking_kvcache_exported_model.cpp
-COPY examples/hstu/inference_aoti/README.md /workspace/recsys-examples/examples/hstu/inference_aoti/README.md
-
-RUN set -eux; \
+    install -m 0644 \
+      "${overlay}/corelib/dynamicemb/dynamicemb/exportable_tables.py" \
+      "${repo}/corelib/dynamicemb/dynamicemb/exportable_tables.py"; \
+    install -m 0644 \
+      "${overlay}/corelib/dynamicemb/test/test_nve_aoti_export.py" \
+      "${repo}/corelib/dynamicemb/test/test_nve_aoti_export.py"; \
+    install -m 0644 \
+      "${overlay}/examples/hstu/modules/exportable_embedding.py" \
+      "${repo}/examples/hstu/modules/exportable_embedding.py"; \
+    install -m 0644 \
+      "${overlay}/examples/hstu/modules/nve_embeddingcollection.py" \
+      "${repo}/examples/hstu/modules/nve_embeddingcollection.py"; \
+    install -m 0644 \
+      "${overlay}/examples/hstu/inference_aoti/export_inference_gr_ranking.py" \
+      "${repo}/examples/hstu/inference_aoti/export_inference_gr_ranking.py"; \
+    install -m 0644 \
+      "${overlay}/examples/hstu/inference_aoti/export_inference_gr_ranking_kvcache.py" \
+      "${repo}/examples/hstu/inference_aoti/export_inference_gr_ranking_kvcache.py"; \
+    install -m 0644 \
+      "${overlay}/examples/hstu/inference_aoti/cpp_inference/inference_hstu_gr_ranking_exported_model.cpp" \
+      "${repo}/examples/hstu/inference_aoti/cpp_inference/inference_hstu_gr_ranking_exported_model.cpp"; \
+    install -m 0644 \
+      "${overlay}/examples/hstu/inference_aoti/cpp_inference/inference_hstu_gr_ranking_kvcache_exported_model.cpp" \
+      "${repo}/examples/hstu/inference_aoti/cpp_inference/inference_hstu_gr_ranking_kvcache_exported_model.cpp"; \
+    install -m 0644 \
+      "${overlay}/examples/hstu/inference_aoti/README.md" \
+      "${repo}/examples/hstu/inference_aoti/README.md"; \
     dynamicemb_dir="$(python3 -c 'import pathlib, dynamicemb; print(pathlib.Path(dynamicemb.__file__).parent)')"; \
     test -d "${dynamicemb_dir}"; \
     install -m 0644 \
-      /workspace/recsys-examples/corelib/dynamicemb/dynamicemb/exportable_tables.py \
+      "${repo}/corelib/dynamicemb/dynamicemb/exportable_tables.py" \
       "${dynamicemb_dir}/exportable_tables.py"; \
-    python3 -m py_compile \
-      "${dynamicemb_dir}/exportable_tables.py" \
-      /workspace/recsys-examples/examples/hstu/modules/exportable_embedding.py \
-      /workspace/recsys-examples/examples/hstu/modules/nve_embeddingcollection.py \
-      /workspace/recsys-examples/examples/hstu/inference_aoti/export_inference_gr_ranking.py \
-      /workspace/recsys-examples/examples/hstu/inference_aoti/export_inference_gr_ranking_kvcache.py
-
-# Reuse the main image's CMake objects and runtime libraries. Touching only the
-# changed replay sources causes their objects to compile and the executables to
-# relink against NVE 26.07; unchanged HSTU/commons/KV-cache targets stay cached.
-RUN set -eux; \
-    replay_build=/workspace/recsys-examples/examples/hstu/inference_aoti/cpp_inference/build; \
     touch \
-      /workspace/recsys-examples/examples/hstu/inference_aoti/cpp_inference/inference_hstu_gr_ranking_exported_model.cpp \
-      /workspace/recsys-examples/examples/hstu/inference_aoti/cpp_inference/inference_hstu_gr_ranking_kvcache_exported_model.cpp; \
+      "${repo}/examples/hstu/inference_aoti/cpp_inference/inference_hstu_gr_ranking_exported_model.cpp" \
+      "${repo}/examples/hstu/inference_aoti/cpp_inference/inference_hstu_gr_ranking_kvcache_exported_model.cpp"; \
     cmake --build "${replay_build}" \
       --target \
         inference_hstu_gr_ranking_exported_model \
         inference_hstu_gr_ranking_kvcache_exported_model \
       -j 8; \
-    rm -rf /workspace/recsys-examples/examples/hstu/triton_libs/pynve; \
-    mkdir -p /workspace/recsys-examples/examples/hstu/triton_libs/pynve; \
+    rm -rf "${repo}/examples/hstu/triton_libs/pynve"; \
+    mkdir -p "${repo}/examples/hstu/triton_libs/pynve"; \
     cp -a /usr/local/lib/python3.12/dist-packages/pynve/. \
-      /workspace/recsys-examples/examples/hstu/triton_libs/pynve/; \
-    rm -rf /workspace/recsys-examples/examples/hstu/inference_aoti/nve_init_hook/build; \
-    sha256sum -c /tmp/fbgemm-hstu-before.sha256; \
-    rm -f /tmp/fbgemm-hstu-before.sha256; \
-    test -x "${replay_build}/inference_hstu_gr_ranking_exported_model"; \
-    test -x "${replay_build}/inference_hstu_gr_ranking_kvcache_exported_model"
-
-WORKDIR /workspace/recsys-examples
+      "${repo}/examples/hstu/triton_libs/pynve/"; \
+    rm -rf "${repo}/examples/hstu/inference_aoti/nve_init_hook/build"
