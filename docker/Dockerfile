@@ -15,8 +15,6 @@ ARG TRITON_CLIENT_VERSION=2.69.0
 ARG UPSTREAM_PYTORCH_CONTAINER_VERSION=
 ARG DEFAULT_UPSTREAM_PYTORCH_CONTAINER_VERSION=26.05
 ARG TRITON_BUILD_JOBS=8
-ARG HSTU_MAX_JOBS=
-ARG HSTU_NVCC_THREADS=
 
 # ============================================================================
 # Stage 1: base_fbgemm — FBGEMM Path A + TorchRec (version-coupled with FBGEMM).
@@ -212,8 +210,6 @@ RUN set -eux; \
 # ============================================================================
 FROM ${BASE_TRITON_IMAGE} AS devel
 ARG TARGETPLATFORM
-ARG HSTU_MAX_JOBS
-ARG HSTU_NVCC_THREADS
 
 WORKDIR /workspace/deps
 
@@ -284,17 +280,13 @@ RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
       export HSTU_DISABLE_120=TRUE; \
       export HSTU_ARCH_LIST="8.0 9.0 10.0 12.0"; \
     fi && \
-    printf 'HSTU build limits: MAX_JOBS=%s NVCC_THREADS=%s\n' \
-      "${HSTU_MAX_JOBS:-auto}" "${HSTU_NVCC_THREADS:-4}" && \
-    MAX_JOBS="${HSTU_MAX_JOBS}" \
-    NVCC_THREADS="${HSTU_NVCC_THREADS}" \
     HSTU_DISABLE_86OR89=FALSE \
     HSTU_DISABLE_ARBITRARY=TRUE \
     HSTU_DISABLE_LOCAL=TRUE \
     HSTU_DISABLE_RAB=TRUE \
     HSTU_DISABLE_DRAB=TRUE \
     HSTU_DISABLE_FP16=TRUE \
-    pip install --verbose --no-build-isolation . && \
+    pip install --no-build-isolation . && \
     rm -rf /workspace/deps/fbgemm_hstu
 
 # ============================================================================
