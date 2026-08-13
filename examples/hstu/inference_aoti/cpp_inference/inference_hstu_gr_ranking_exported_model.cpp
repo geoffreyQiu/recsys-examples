@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <regex>
 #include <stdexcept>
 #include <string>
@@ -323,11 +324,9 @@ int main(int argc, char** argv) {
 
     load_required_libraries(cfg);
 
-    std::cout << std::endl;
-    std::cout << "Loading NVE layers from " << cfg.package_path << std::endl;
-    nve::LayerDirectory dir(cfg.package_path, cfg.device_index);
-    std::cout << "  Loaded " << dir.size() << " layer(s)" << std::endl;
-    std::cout << std::endl;
+    // Declared before the loader so the marker-owning directory outlives it.
+    auto resources = std::make_shared<nve::ResourceDirectory>();
+    std::unique_ptr<nve::LayerDirectory> layers;
 
     torch::inductor::AOTIModelPackageLoader loader(
         cfg.package_path + "/model.pt2",
@@ -335,6 +334,13 @@ int main(int argc, char** argv) {
         /*run_single_threaded=*/false,
         /*num_runners=*/1,
         cfg.device_index);
+
+    std::cout << std::endl;
+    std::cout << "Loading NVE layers from " << cfg.package_path << std::endl;
+    layers = std::make_unique<nve::LayerDirectory>(
+        cfg.package_path, loader, cfg.device_index, resources);
+    std::cout << "  Loaded " << layers->size() << " layer(s)" << std::endl;
+    std::cout << std::endl;
 
     auto call_spec = loader.get_call_spec();
     std::cout << "Input call spec:\n" << call_spec[0] << "\n\n";
