@@ -353,9 +353,20 @@ bool run_one_batch(torch::inductor::AOTIModelPackageLoader &loader,
       "[INFO] Batch " + std::to_string(batch_idx) +
       " loader.run returned outputs=" + std::to_string(outputs.size()));
   check_cuda_after("loader.run");
-  TORCH_CHECK(outputs.size() == 1,
-              "Expected one logits output from the no-offload model, got ",
+  TORCH_CHECK(outputs.size() == 2,
+              "Expected logits and offload task ID outputs, got ",
               outputs.size(), ".");
+  const torch::Tensor &offload_task_ids = outputs[1];
+  TORCH_CHECK(offload_task_ids.device().is_cpu(),
+              "Expected CPU offload task IDs, got device ",
+              offload_task_ids.device(), ".");
+  TORCH_CHECK(offload_task_ids.scalar_type() == torch::kInt64,
+              "Expected INT64 offload task IDs, got ",
+              offload_task_ids.scalar_type(), ".");
+  TORCH_CHECK(offload_task_ids.dim() == 1 &&
+                  offload_task_ids.numel() == user_ids.numel(),
+              "Expected one offload task ID per user (", user_ids.numel(),
+              "), got shape ", offload_task_ids.sizes(), ".");
 
   log_demo_debug("[INFO] Batch " + std::to_string(batch_idx) +
                  " logits copy to CPU begin");

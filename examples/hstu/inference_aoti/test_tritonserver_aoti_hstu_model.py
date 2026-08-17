@@ -356,6 +356,21 @@ def _run_input_cases(
             print(f"Request failed for batch_{batch_index:06d}")
             raise
         latency_ns = time.perf_counter_ns() - start_ns
+        offload_task_ids = result.as_numpy("OUTPUT__1")
+        if (
+            offload_task_ids is None
+            or offload_task_ids.dtype != np.int64
+            or offload_task_ids.shape != (batch_size,)
+        ):
+            actual = (
+                "missing"
+                if offload_task_ids is None
+                else f"shape={offload_task_ids.shape}, dtype={offload_task_ids.dtype}"
+            )
+            raise RuntimeError(
+                "Unexpected OUTPUT__1 offload task IDs: "
+                f"{actual}; expected shape={(batch_size,)}, dtype=int64"
+            )
         total_latency_ns += latency_ns
         profile_records.append(
             {
@@ -446,7 +461,10 @@ def main() -> int:
 
     import tritonclient.http as httpclient
 
-    outputs = [httpclient.InferRequestedOutput("OUTPUT__0")]
+    outputs = [
+        httpclient.InferRequestedOutput("OUTPUT__0"),
+        httpclient.InferRequestedOutput("OUTPUT__1"),
+    ]
 
     client = httpclient.InferenceServerClient(url=args.url)
     profile_records: list[dict[str, Any]] = []
@@ -537,6 +555,9 @@ def main() -> int:
 
     if result is None:
         raise RuntimeError("No Triton requests were sent")
+    print(
+        f"Validated OUTPUT__1 offload task IDs: all {request_sequence} requests"
+    )
 
     if args.profile_jsonl is not None:
         _write_profile_records(args.profile_jsonl, profile_records)

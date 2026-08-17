@@ -22,11 +22,24 @@ RUN ln -sf /bin/python3 /bin/python && \
     test -e /usr/local/cuda-13/compat/lib.real/libcuda.so.1 && \
     ln -s /usr/local/cuda-13/compat/lib.real/libcuda.so.1  /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
     pip3 install --no-cache-dir 'tritonclient[all]' && \
-    apt-get autoremove -y && apt-get clean && rm -rf /var/lib/apt/lists/*
+    apt-get autoremove -y && apt-get clean && \
+    rm -rf \
+      /var/lib/apt/lists/* \
+      /opt/tritonserver/backends/pytorch \
+      /usr/local/lib/python3.12/dist-packages/flexkv \
+      /usr/local/lib/python3.12/dist-packages/pynve \
+      /usr/local/lib/python3.12/dist-packages/hstu \
+      /usr/local/lib/python3.12/dist-packages/fbgemm_gpu \
+      /usr/local/lib/python3.12/dist-packages/torchrec \
+      /usr/local/lib/python3.12/dist-packages/torch \
+      /usr/local/lib/python3.12/dist-packages/torchgen \
+      /usr/local/lib/python3.12/dist-packages/torch_c_dlpack_ext
 
 COPY --from=pytorch_aoti /workspace/deps/FlexKV /workspace/deps/FlexKV
 COPY --from=pytorch_aoti /workspace/deps/nve /workspace/deps/nve
-COPY --from=pytorch_aoti /workspace/deps/pytorch_backend/build/install/backends/pytorch/libtriton_pytorch.so /opt/tritonserver/backends/pytorch/libtriton_pytorch.so
+# Keep the stock Triton 26.06 server/core, but replace its complete PyTorch
+# backend with the NVTX-enabled r26.07 backend built against the 26.06 APIs.
+COPY --from=pytorch_aoti /opt/tritonserver/backends/pytorch/ /opt/tritonserver/backends/pytorch/
 COPY --from=pytorch_aoti /workspace/recsys-examples /workspace/recsys-examples
 COPY --from=pytorch_aoti /usr/local/lib/python3.12/dist-packages/flexkv /usr/local/lib/python3.12/dist-packages/flexkv
 COPY --from=pytorch_aoti /usr/local/lib/python3.12/dist-packages/pynve /usr/local/lib/python3.12/dist-packages/pynve
@@ -37,9 +50,17 @@ COPY --from=pytorch_aoti /usr/local/lib/python3.12/dist-packages/torch /usr/loca
 COPY --from=pytorch_aoti /usr/local/lib/python3.12/dist-packages/torchgen /usr/local/lib/python3.12/dist-packages/torchgen
 COPY --from=pytorch_aoti /usr/local/lib/python3.12/dist-packages/torch_c_dlpack_ext /usr/local/lib/python3.12/dist-packages/torch_c_dlpack_ext
 
+ENV LD_LIBRARY_PATH=/opt/tritonserver/lib:/opt/tritonserver/backends/pytorch:/usr/local/cuda/lib64:/usr/local/lib/python3.12/dist-packages/torch/lib:/workspace/recsys-examples/examples/hstu/triton_libs/emb:/workspace/recsys-examples/examples/hstu/triton_libs/recsys_kvcache_manager:/workspace/recsys-examples/examples/hstu/triton_libs/hstu_attn:/workspace/recsys-examples/examples/hstu/triton_libs/fbgemm_gpu:/workspace/recsys-examples/examples/hstu/triton_libs/pynve:/workspace/recsys-examples/examples/hstu/triton_libs/lib:/workspace/recsys-examples/examples/hstu/triton_libs/system:/workspace/recsys-examples/examples/hstu/triton_libs:${LD_LIBRARY_PATH}
+
 WORKDIR /workspace/recsys-examples/examples/hstu
 
-RUN test -f "/workspace/recsys-examples/examples/hstu/triton_libs/emb/inference_emb_ops.so" && \
+RUN set -eux; \
+    test -f "/opt/tritonserver/backends/pytorch/libtriton_pytorch.so" && \
+    test -f "/usr/local/lib/python3.12/dist-packages/torch/lib/libtorch.so" && \
+    test -f "/usr/local/lib/python3.12/dist-packages/torch/lib/libtorch_cuda.so" && \
+    python3 -c 'import torch; print(torch.__version__); print(torch.version.cuda)' && \
+    test -e "/workspace/recsys-examples/examples/hstu/triton_libs/lib/libjpeg.so.62" && \
+    test -f "/workspace/recsys-examples/examples/hstu/triton_libs/emb/inference_emb_ops.so" && \
     test -f "/workspace/recsys-examples/examples/hstu/triton_libs/recsys_kvcache_manager/kvcache_manager_ops.so" && \
     test -f "/workspace/recsys-examples/examples/hstu/triton_libs/libhstu_cuda_ops_runtime.so" && \
     test -f "/workspace/recsys-examples/examples/hstu/triton_libs/libpaged_kvcache_ops_runtime.so" && \
@@ -49,12 +70,29 @@ RUN test -f "/workspace/recsys-examples/examples/hstu/triton_libs/emb/inference_
     test -f "/workspace/recsys-examples/examples/hstu/triton_libs/pynve/libnve-common.so" && \
     test -f "/workspace/recsys-examples/examples/hstu/triton_libs/pynve/libnve-torch-ops.so" && \
     test -f "/workspace/recsys-examples/examples/hstu/inference_aoti/nve_init_hook/build/libnve_init_hook.so" && \
+    grep -aFq 'ProcessRequests ' /opt/tritonserver/backends/pytorch/libtriton_pytorch.so && \
+    grep -aFq 'Execute ' /opt/tritonserver/backends/pytorch/libtriton_pytorch.so && \
+    grep -aFq 'ReadOutputTensors ' /opt/tritonserver/backends/pytorch/libtriton_pytorch.so && \
+    for target in \
+      /opt/tritonserver/backends/pytorch/libtriton_pytorch.so \
+      /workspace/recsys-examples/examples/hstu/triton_libs/emb/inference_emb_ops.so \
+      /workspace/recsys-examples/examples/hstu/triton_libs/recsys_kvcache_manager/kvcache_manager_ops.so \
+      /workspace/recsys-examples/examples/hstu/triton_libs/libhstu_cuda_ops_runtime.so \
+      /workspace/recsys-examples/examples/hstu/triton_libs/libpaged_kvcache_ops_runtime.so \
+      /workspace/recsys-examples/examples/hstu/triton_libs/hstu_attn/fbgemm_gpu_experimental_hstu.so \
+      /workspace/recsys-examples/examples/hstu/triton_libs/fbgemm_gpu/fbgemm_gpu_py.so \
+      /workspace/recsys-examples/examples/hstu/triton_libs/fbgemm_gpu/fbgemm_gpu_sparse_async_cumsum.so \
+      /workspace/recsys-examples/examples/hstu/triton_libs/pynve/libnve-common.so \
+      /workspace/recsys-examples/examples/hstu/triton_libs/pynve/libnve-torch-ops.so \
+      /workspace/recsys-examples/examples/hstu/inference_aoti/nve_init_hook/build/libnve_init_hook.so; do \
+        if ldd "${target}" | grep -Fq 'not found'; then \
+          ldd "${target}" | grep -F 'not found'; \
+          exit 1; \
+        fi; \
+    done && \
     sed -i 's#string_value: ".*libnve_init_hook.so"#string_value: "/workspace/recsys-examples/examples/hstu/inference_aoti/nve_init_hook/build/libnve_init_hook.so"#' \
       inference_aoti/triton_aoti/hstu_gr_ranking_kvcache/config.pbtxt
-
-ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/lib/python3.12/dist-packages/torch/lib:/workspace/recsys-examples/examples/hstu/triton_libs/fbgemm_gpu:/workspace/recsys-examples/examples/hstu/triton_libs/lib:/workspace/recsys-examples/examples/hstu/triton_libs:${LD_LIBRARY_PATH}
 
 ENV LD_PRELOAD=/workspace/recsys-examples/examples/hstu/triton_libs/pynve/libnve-common.so:/workspace/recsys-examples/examples/hstu/triton_libs/pynve/libnve-torch-ops.so:/workspace/recsys-examples/examples/hstu/triton_libs/emb/inference_emb_ops.so:/workspace/recsys-examples/examples/hstu/triton_libs/recsys_kvcache_manager/kvcache_manager_ops.so:/workspace/recsys-examples/examples/hstu/triton_libs/libhstu_cuda_ops_runtime.so:/workspace/recsys-examples/examples/hstu/triton_libs/libpaged_kvcache_ops_runtime.so:/workspace/recsys-examples/examples/hstu/triton_libs/hstu_attn/fbgemm_gpu_experimental_hstu.so:/workspace/recsys-examples/examples/hstu/triton_libs/fbgemm_gpu/fbgemm_gpu_py.so:/workspace/recsys-examples/examples/hstu/triton_libs/fbgemm_gpu/fbgemm_gpu_sparse_async_cumsum.so
 
 WORKDIR /workspace/recsys-examples/examples/hstu
-

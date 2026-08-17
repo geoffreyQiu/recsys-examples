@@ -3,20 +3,14 @@ ARG BASE_FBGEMM_IMAGE=base_fbgemm
 ARG BASE_TRITON_IMAGE=base_triton
 ARG DEVEL_IMAGE=devel
 
-# Triton r${TRITON_SERVER_VERSION} is built against local PyTorch libraries.
-# Effective upstream version priority:
-#   1. UPSTREAM_PYTORCH_CONTAINER_VERSION when explicitly supplied
-#   2. Version parsed from nvcr.io/nvidia/pytorch:xx.xx-py3 BASE_IMAGE
-#   3. DEFAULT_UPSTREAM_PYTORCH_CONTAINER_VERSION
+# Triton is built against the stock NVIDIA PyTorch 26.05 container.
 ARG TRITON_SERVER_VERSION=26.06
 ARG TRITON_CLIENT_VERSION=2.69.0
-ARG UPSTREAM_PYTORCH_CONTAINER_VERSION=
-ARG DEFAULT_UPSTREAM_PYTORCH_CONTAINER_VERSION=26.05
+ARG PYTORCH_BACKEND_TAG=r26.07
 ARG TRITON_BUILD_JOBS=8
 
 # ============================================================================
 # Stage 1: base_fbgemm — FBGEMM Path A + TorchRec (version-coupled with FBGEMM).
-# Override BASE_FBGEMM_IMAGE to consume a pre-built image and skip the build.
 # ============================================================================
 FROM ${BASE_IMAGE} AS base_fbgemm
 
@@ -36,15 +30,13 @@ RUN pip install --no-deps tensordict orjson && \
 
 # ============================================================================
 # Stage 2: base_triton — base_fbgemm + Triton core, PyTorch backend, and
-# Python backend. Override BASE_TRITON_IMAGE to consume a pre-built image.
+# Python backend.
 # ============================================================================
 FROM ${BASE_FBGEMM_IMAGE} AS base_triton
 
-ARG BASE_IMAGE
 ARG TRITON_SERVER_VERSION
 ARG TRITON_CLIENT_VERSION
-ARG UPSTREAM_PYTORCH_CONTAINER_VERSION
-ARG DEFAULT_UPSTREAM_PYTORCH_CONTAINER_VERSION
+ARG PYTORCH_BACKEND_TAG
 ARG TRITON_BUILD_JOBS
 
 USER root
@@ -83,29 +75,15 @@ RUN wget -O /tmp/boost.tar.gz \
     rm -rf /tmp/boost.tar.gz /tmp/boost_1_80_0 && \
     grep BOOST_LIB_VERSION /usr/include/boost/version.hpp
 
-# Build Triton directly against the PyTorch installation in this image.
-# Torch-TensorRT, TorchVision custom operators, and NVSHMEM are deliberately
-# disabled so their additional libraries and headers do not have to be staged.
-# Temporary customized PyTorch backend build:
-# ceeecb7 adds model-initialization-hook support for the PyTorch PT2 (AOTI)
-# backend. This feature is not included in Triton releases through 26.07.
-# Once it is included in release 26.08 or later, remove this override and use
-# only the standard, release-aligned PyTorch backend produced by build.py.
-# Until then, build ceeecb7 against the same backend/core/common release as the
-# Triton server and install it over the standard /opt/tritonserver backend.
+# Build Triton directly against the PyTorch installation in this image. The
+# r26.07 PyTorch backend includes the PT2/AOTI model-initialization hook, while
+# Triton's common/core/backend component APIs remain aligned with server r26.06.
+# Torch-TensorRT, TorchVision custom operators, and NVSHMEM are disabled so
+# their additional libraries and headers do not have to be staged.
 RUN set -eux; \
-    parsed_upstream=; \
-    case "${BASE_IMAGE}" in \
-      nvcr.io/nvidia/pytorch:[0-9][0-9].[0-9][0-9]-py3) \
-        parsed_upstream="${BASE_IMAGE#nvcr.io/nvidia/pytorch:}"; \
-        parsed_upstream="${parsed_upstream%-py3}";; \
-    esac; \
-    effective_upstream="${UPSTREAM_PYTORCH_CONTAINER_VERSION:-${parsed_upstream}}"; \
-    effective_upstream="${effective_upstream:-${DEFAULT_UPSTREAM_PYTORCH_CONTAINER_VERSION}}"; \
     pytorch_site=/usr/local/lib/python3.12/dist-packages/torch; \
     pytorch_includes="${pytorch_site}/include;${pytorch_site}/include/torch/csrc/api/include"; \
     echo "Triton container version: ${TRITON_SERVER_VERSION}"; \
-    echo "Effective upstream PyTorch container version: ${effective_upstream}"; \
     git clone --depth 1 --branch "r${TRITON_SERVER_VERSION}" \
       https://github.com/triton-inference-server/server.git /workspace/deps/triton-server-src; \
     mkdir -p /opt/triton-pytorch-libs; \
@@ -118,51 +96,17 @@ RUN set -eux; \
     python3 build.py -v \
       --no-container-build --build-dir=/workspace/triton-build --install-dir=/opt/tritonserver \
       --container-version="${TRITON_SERVER_VERSION}" \
-      --upstream-container-version="${effective_upstream}" \
+      --upstream-container-version=26.05 \
       --build-parallel="${TRITON_BUILD_JOBS}" \
       --enable-gpu --enable-logging --enable-stats --enable-metrics \
+      --enable-tracing --enable-nvtx \
       --endpoint=http --endpoint=grpc \
-      --backend="pytorch:r${TRITON_SERVER_VERSION}" --backend="python:r${TRITON_SERVER_VERSION}" \
+      --backend="pytorch:${PYTORCH_BACKEND_TAG}" --backend="python:r${TRITON_SERVER_VERSION}" \
       --extra-backend-cmake-arg="pytorch:TRITON_PYTORCH_INCLUDE_PATHS=${pytorch_includes}" \
       --extra-backend-cmake-arg=pytorch:TRITON_PYTORCH_LIB_PATHS=/opt/triton-pytorch-libs \
       --override-backend-cmake-arg=pytorch:TRITON_PYTORCH_ENABLE_TORCHTRT=OFF \
       --extra-backend-cmake-arg=pytorch:TRITON_PYTORCH_ENABLE_TORCHVISION=OFF \
       --extra-backend-cmake-arg=pytorch:TRITON_PYTORCH_NVSHMEM=OFF; \
-    standard_backend=/opt/tritonserver/backends/pytorch/libtriton_pytorch.so; \
-    test -f "${standard_backend}"; \
-    standard_backend_sha256="$(sha256sum "${standard_backend}" | awk '{print $1}')"; \
-    cd /workspace/deps; rm -rf pytorch_backend; \
-    git clone --depth 1 \
-      https://github.com/triton-inference-server/pytorch_backend.git pytorch_backend; \
-    cd pytorch_backend; \
-    git fetch --depth 1 origin r26.07; \
-    git checkout --detach ceeecb7; \
-    pinned_backend_commit="$(git rev-parse HEAD)"; \
-    test "${pinned_backend_commit}" = ceeecb748caa785b359095a74c05d55dace2591a; \
-    mkdir -p build; cd build; \
-    cmake \
-      -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX:PATH="$PWD/install" \
-      -DTRITON_PYTORCH_INCLUDE_PATHS="${pytorch_includes};/opt/pytorch/vision/torchvision/csrc" \
-      -DTRITON_PYTORCH_LIB_PATHS=/opt/triton-pytorch-libs \
-      -DTRITON_PYTORCH_ENABLE_TORCHTRT=OFF -DTRITON_PYTORCH_ENABLE_TORCHVISION=OFF \
-      -DTRITON_PYTORCH_NVSHMEM=OFF \
-      -DTRITON_BACKEND_REPO_TAG="r${TRITON_SERVER_VERSION}" \
-      -DTRITON_CORE_REPO_TAG="r${TRITON_SERVER_VERSION}" \
-      -DTRITON_COMMON_REPO_TAG="r${TRITON_SERVER_VERSION}" \
-      ..; \
-    cmake --build . --parallel "${TRITON_BUILD_JOBS}" --target install; \
-    pinned_backend="$PWD/install/backends/pytorch/libtriton_pytorch.so"; \
-    test -f "${pinned_backend}"; install -m 0755 "${pinned_backend}" "${standard_backend}"; \
-    pinned_backend_sha256="$(sha256sum "${standard_backend}" | awk '{print $1}')"; \
-    test "${pinned_backend_sha256}" = "$(sha256sum "${pinned_backend}" | awk '{print $1}')"; \
-    provenance=/opt/tritonserver/backends/pytorch/pinned-backend-build.txt; \
-    printf '%s\n' \
-      "commit=${pinned_backend_commit}" \
-      "repository_tags=r${TRITON_SERVER_VERSION}" \
-      "replaced_sha256=${standard_backend_sha256}" \
-      "installed_sha256=${pinned_backend_sha256}" \
-      > "${provenance}"; \
-    printf '%s\n' "${effective_upstream}" > /opt/tritonserver/upstream-pytorch-container-version; \
     rm -rf /workspace/triton-build /workspace/deps/triton-server-src /opt/triton-pytorch-libs
 
 ENV TRITON_SERVER_VERSION=${TRITON_SERVER_VERSION}
@@ -179,18 +123,22 @@ RUN env -u PIP_CONSTRAINT /usr/bin/python3 -m pip install \
 # Keep runtime verification separate so an assertion failure does not invalidate
 # the expensive Triton compilation layer above. Triton --help returns 1 in r26.06.
 RUN set -eux; \
-    provenance=/opt/tritonserver/backends/pytorch/pinned-backend-build.txt; \
     test -x /opt/tritonserver/bin/tritonserver \
       && test -f /opt/tritonserver/backends/pytorch/libtriton_pytorch.so; \
-    grep -q '^commit=ceeecb7' "${provenance}"; \
-    grep -q "^repository_tags=r${TRITON_SERVER_VERSION}$" "${provenance}"; \
     test -f /opt/tritonserver/backends/python/libtriton_python.so \
       && test -x /opt/tritonserver/backends/python/triton_python_backend_stub; \
     export LD_LIBRARY_PATH="/opt/tritonserver/lib:/opt/tritonserver/backends/pytorch:${LD_LIBRARY_PATH:-}"; \
     help_output=/tmp/tritonserver-help.txt; help_status=0; \
     /opt/tritonserver/bin/tritonserver --help > "${help_output}" 2>&1 || help_status=$?; \
     case "${help_status}" in 0|1) ;; *) exit "${help_status}";; esac; \
-    grep -q '^Usage: tritonserver' "${help_output}"; rm -f "${help_output}"; \
+    grep -q '^Usage: tritonserver' "${help_output}"; \
+    grep -q -- '--trace-config' "${help_output}"; \
+    rm -f "${help_output}"; \
+    command -v nsys >/dev/null; \
+    nsys --version >/dev/null 2>&1; \
+    strings /opt/tritonserver/backends/pytorch/libtriton_pytorch.so | grep -q 'ProcessRequests '; \
+    strings /opt/tritonserver/backends/pytorch/libtriton_pytorch.so | grep -q 'Execute '; \
+    strings /opt/tritonserver/backends/pytorch/libtriton_pytorch.so | grep -q 'ReadOutputTensors '; \
     for target in \
       /opt/tritonserver/bin/tritonserver \
       /opt/tritonserver/backends/pytorch/libtriton_pytorch.so \

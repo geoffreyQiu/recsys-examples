@@ -1,6 +1,6 @@
 # Triton PyTorch AOTI backend config
 # Model input  slots: input__0 (values), input__1 (lengths), input__2 (num_candidates), input__3 (user_ids), input__4 (total_history_lengths)
-#       output slots: output__0 (logits)
+#       output slots: output__0 (logits), output__1 (offload_task_ids)
 
 name: "hstu_gr_ranking_kvcache"
 platform: "torch_aoti"
@@ -42,6 +42,11 @@ output [
     name: "OUTPUT__0"
     data_type: TYPE_FP32
     dims: [ -1, 8 ]
+  },
+  {
+    name: "OUTPUT__1"
+    data_type: TYPE_INT64
+    dims: [ -1 ]
   }
 ]
 

@@ -522,13 +522,11 @@ def export_inference_gr_ranking(
             # === Warmup ===
             batch = next(dataloader_iter)
             batch, user_ids, total_history_lengths = prepare_on_gpu(batch)
-            logits, auxiliary_output = _split_model_outputs(
+            logits, offload_task_ids = _split_model_outputs(
                 model(batch, user_ids, total_history_lengths)
             )
-            if auxiliary_output is not None:
-                raise RuntimeError(
-                    "Expected the no-offload model to return logits only"
-                )
+            if offload_task_ids is None:
+                raise RuntimeError("Expected offload task IDs from the model")
             print(f"[INFO] Warmup logits shape: {tuple(logits.shape)}")
             if stop_after_warmup:
                 print("[INFO] Stopped after kvcache warmup.")
@@ -602,14 +600,12 @@ def export_inference_gr_ranking(
                     total_history_lengths,
                 ):
                     rebuilt = self._rebuild_batch(values, lengths, num_candidates)
-                    logits, auxiliary_output = _split_model_outputs(
+                    logits, offload_task_ids = _split_model_outputs(
                         self.inner(rebuilt, user_ids.cpu(), total_history_lengths.cpu())
                     )
-                    if auxiliary_output is not None:
-                        raise RuntimeError(
-                            "Expected the no-offload model to return logits only"
-                        )
-                    return logits.float().cpu()
+                    if offload_task_ids is None:
+                        raise RuntimeError("Expected offload task IDs from the model")
+                    return logits.float().cpu(), offload_task_ids.long().cpu()
 
             export_model = _PlainInputWrapper(model, batch)
             example_values = batch.features.values()
@@ -702,11 +698,22 @@ def export_inference_gr_ranking(
 
             with torch.inference_mode():
                 for batch, user_ids, total_history_lengths in inputs:
-                    logits, auxiliary_output = compiled_results[dump_idx]
-                    if auxiliary_output is not None:
+                    logits, offload_task_ids = compiled_results[dump_idx]
+                    if not isinstance(offload_task_ids, torch.Tensor):
                         raise RuntimeError(
-                            "Expected the compiled no-offload AOTI model to "
-                            "return logits only"
+                            "Expected the compiled AOTI model to return offload "
+                            "task IDs as its second tensor output"
+                        )
+                    expected_shape = (user_ids.numel(),)
+                    if (
+                        offload_task_ids.dtype != torch.int64
+                        or tuple(offload_task_ids.shape) != expected_shape
+                    ):
+                        raise RuntimeError(
+                            "Unexpected compiled offload task IDs: "
+                            f"shape={tuple(offload_task_ids.shape)}, "
+                            f"dtype={offload_task_ids.dtype}; "
+                            f"expected shape={expected_shape}, dtype=torch.int64"
                         )
 
                     if not feature_keys_dumped:
