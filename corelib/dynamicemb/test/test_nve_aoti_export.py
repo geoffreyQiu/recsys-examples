@@ -3,6 +3,7 @@
 
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,9 @@ import torch
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_nve_aoti_export_round_trip(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
+    hstu_root = repo_root / "examples/hstu"
+    if str(hstu_root) not in sys.path:
+        sys.path.insert(0, str(hstu_root))
     ops_dir = Path(
         os.environ.get(
             "DYNAMICEMB_OPS_LIB_DIR",
@@ -26,7 +30,9 @@ def test_nve_aoti_export_round_trip(tmp_path: Path) -> None:
     from dynamicemb.exportable_tables import (
         create_inference_embedding_collection,
     )
-    from pynve.torch.nve_export import export_aot, load_aot
+    pynve = pytest.importorskip("pynve")
+    from inference_aoti.nve_aoti_compat import load_aoti
+    from pynve.torch.nve_export import export_aot
     from torchrec.modules.embedding_configs import EmbeddingConfig
 
     device = torch.device("cuda", torch.cuda.current_device())
@@ -55,12 +61,19 @@ def test_nve_aoti_export_round_trip(tmp_path: Path) -> None:
     export_aot(model, (keys, offsets), str(export_dir))
 
     with (export_dir / "metadata.json").open() as metadata_file:
-        assert json.load(metadata_file)["version"] == 2
+        metadata = json.load(metadata_file)
+    if pynve.__version__.startswith("26.05."):
+        assert isinstance(metadata, list)
+        assert metadata and all("cache_type" in layer for layer in metadata)
+    else:
+        assert metadata["version"] == 2
+        assert metadata["layers"]
 
-    compiled_loader, loaded_nve_layers = load_aot(export_dir, device=device)
-    assert len(loaded_nve_layers) == 1
+    session = load_aoti(export_dir, device=device)
+    assert session.num_layers == 1
 
     with torch.inference_mode():
-        outputs = compiled_loader.run([keys, offsets])
+        outputs = session.run([keys, offsets])
     assert len(outputs) == 1
     torch.testing.assert_close(outputs[0], reference)
+    session.close()

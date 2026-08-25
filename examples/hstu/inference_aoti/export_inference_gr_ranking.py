@@ -17,8 +17,10 @@ import enum
 import os
 import sys
 import warnings
+from pathlib import Path
 
 import gin
+import pynve
 import torch
 import torch.distributed as dist
 from commons.datasets import get_data_loader
@@ -30,7 +32,7 @@ from megatron.core import parallel_state
 from model import get_ranking_model
 from model.inference_ranking_gr import apply_inference
 from modules.metrics import get_multi_event_metric_module
-from pynve.torch.nve_export import export_aot, load_aot
+from pynve.torch.nve_export import export_aot
 from torch.export import Dim, ShapesCollection
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from utils import NetworkArgs, TensorModelParallelArgs
@@ -38,6 +40,14 @@ from utils import NetworkArgs, TensorModelParallelArgs
 sys.path.append("./training/")
 from pretrain_gr_ranking import create_ranking_config
 from trainer.utils import create_hstu_config, get_dataset_and_embedding_args
+
+from inference_aoti.nve_aoti_compat import (
+    NveCompatibilityError,
+    OutputDirectoryError,
+    _runtime_generation,
+    load_aoti,
+    prepare_output_directories,
+)
 
 warnings.filterwarnings("default", category=UserWarning)
 torch.set_warn_always(False)
@@ -183,9 +193,18 @@ def get_exportable_model_for_inference(
 
 def export_inference_gr_ranking(
     checkpoint_dir: str,
+    export_dir: str,
+    dump_dir: str,
     max_bs: int = 1,
     debug_flattened_inputs: bool = False,
 ):
+    export_dir, dump_dir = prepare_output_directories(export_dir, dump_dir)
+    generation = _runtime_generation()
+    print(
+        f"[INFO] Selected NVE {generation} (pynve {pynve.__version__}) from "
+        f"{Path(pynve.__file__).resolve()}"
+    )
+
     def _save_tensor_cpp_compatible(tensor: torch.Tensor, path: str) -> None:
         """Save a tensor in a format compatible with C++ torch::load().
 
@@ -371,7 +390,6 @@ def export_inference_gr_ranking(
             debug_print_flattened_export_args(batch, embeddings)
 
         # export & aoti_compile_and_package
-        export_dir = os.path.join(os.path.dirname(__file__), "hstu_gr_ranking_model")
         export_aot(
             export_model,
             example_inputs,
@@ -389,14 +407,12 @@ def export_inference_gr_ranking(
         print("       └── weights/{resource_id}.nve  # NVE weight data (LinearUVM)")
 
         # === Test Compiled Model ===
-        compiled_loader, loaded_nve_layers = load_aot(
+        compiled_session = load_aoti(
             export_dir,
             device=torch.device("cuda", torch.cuda.current_device()),
         )
-        print(f"[INFO] Loaded {len(loaded_nve_layers)} NVE layer(s) for AOTI")
+        print(f"[INFO] Loaded {compiled_session.num_layers} NVE layer(s) for AOTI")
 
-        dump_dir = os.path.join(os.path.dirname(__file__), "export_test_dump")
-        os.makedirs(dump_dir, exist_ok=True)
         feature_keys_dumped = False
         dump_idx = 0
 
@@ -410,7 +426,7 @@ def export_inference_gr_ranking(
                 inputs.append(batch)
 
                 with torch.inference_mode():
-                    compiled_outputs = compiled_loader.run(
+                    compiled_outputs = compiled_session.run(
                         [
                             batch.features.values(),
                             batch.features.lengths(),
@@ -495,7 +511,7 @@ def export_inference_gr_ranking(
             start = time.perf_counter()
             with torch.inference_mode():
                 for b in inputs:
-                    compiled_outputs = compiled_loader.run(
+                    compiled_outputs = compiled_session.run(
                         [
                             b.features.values(),
                             b.features.lengths(),
@@ -550,6 +566,8 @@ def export_inference_gr_ranking(
         for item in results:
             del item
 
+        compiled_session.close()
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Inference End-to-end Example")
@@ -558,6 +576,8 @@ if __name__ == "__main__":
     parser.add_argument("--disable_auc", action="store_true")
     parser.add_argument("--max_bs", type=int, default=2)
     parser.add_argument("--debug_flattened_inputs", action="store_true")
+    parser.add_argument("--export_dir", type=str, required=True)
+    parser.add_argument("--dump_dir", type=str, required=True)
 
     args = parser.parse_args()
     gin.parse_config_file(args.gin_config_file)
@@ -569,9 +589,15 @@ if __name__ == "__main__":
         )
         args.max_bs = 2
 
-    export_inference_gr_ranking(
-        checkpoint_dir=args.checkpoint_dir,
-        max_bs=args.max_bs,
-        debug_flattened_inputs=args.debug_flattened_inputs,
-    )
+    try:
+        export_inference_gr_ranking(
+            checkpoint_dir=args.checkpoint_dir,
+            export_dir=args.export_dir,
+            dump_dir=args.dump_dir,
+            max_bs=args.max_bs,
+            debug_flattened_inputs=args.debug_flattened_inputs,
+        )
+    except (NveCompatibilityError, OutputDirectoryError) as error:
+        print(str(error), file=sys.stderr)
+        raise SystemExit(1) from error
     print("[INFO] Finished.")
