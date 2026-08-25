@@ -13,6 +13,10 @@ ARG TRITON_CLIENT_VERSION=2.69.0
 ARG UPSTREAM_PYTORCH_CONTAINER_VERSION=
 ARG DEFAULT_UPSTREAM_PYTORCH_CONTAINER_VERSION=26.05
 ARG TRITON_BUILD_JOBS=8
+ARG NVE_2605_COMMIT=bb74e7f8a90e3b7173501d3cdd9ae14ed04b4b2d
+ARG NVE_2607_COMMIT=4c1f956f0ae977bb40425273d2fcfded4c590002
+ARG NVTX_COMMIT=7d113f290f89eeeae9c957011c497101f3948d9e
+ARG NLOHMANN_JSON_COMMIT=9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03
 
 # ============================================================================
 # Stage 1: base_fbgemm — FBGEMM Path A + TorchRec (version-coupled with FBGEMM).
@@ -208,6 +212,10 @@ RUN set -eux; \
 # ============================================================================
 FROM ${BASE_TRITON_IMAGE} AS devel
 ARG TARGETPLATFORM
+ARG NVE_2605_COMMIT
+ARG NVE_2607_COMMIT
+ARG NVTX_COMMIT
+ARG NLOHMANN_JSON_COMMIT
 
 WORKDIR /workspace/deps
 
@@ -253,22 +261,103 @@ RUN git clone https://github.com/jiayus-nvidia/flash-attention.git flash-attenti
     git checkout ${FLASH_ATTN_ARBITRARY_MASK_COMMIT} && \
     pip install --no-deps --no-build-isolation -e ./flash_attn/cute
 
-# -- Layer 4, 5: FlexKV and NVE. PYNVE_DISABLE_AVX512 only meaningful on x86;
-# leave it unset on arm64 (AVX512 doesn't exist there).
+# -- Layer 4: FlexKV.
 COPY third_party/FlexKV /workspace/deps/FlexKV
-COPY third_party/nv-embedding-cache /workspace/deps/nve
-COPY docker/nve_standalone_features.cmake /workspace/deps/nve_standalone_features.cmake
 RUN cd FlexKV && mkdir -p build && cd build && \
     TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" cmake .. && \
     TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" cmake --build . -j8 && \
     cd .. && mkdir -p flexkv/lib && cp -P build/lib/*.so* flexkv/lib/ && \
-    MAX_JOBS=8 FLEXKV_DEBUG=0 TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" python3 setup.py install && \
-    cd /workspace/deps/nve && \
-    cd third_party/ && git clone https://github.com/NVIDIA/NVTX.git NVTX && cd .. && \
-    if [ "${TARGETPLATFORM}" = "linux/arm64" ]; then AVX512_ENV=""; else AVX512_ENV="PYNVE_DISABLE_AVX512=1"; fi && \
-    env CMAKE_TOOLCHAIN_FILE=/workspace/deps/nve_standalone_features.cmake \
-    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" PYNVE_WITH_TORCH_BINDINGS=1 ${AVX512_ENV} \
-    CPLUS_INCLUDE_PATH=$(realpath ./third_party/NVTX/c/include/):${CPLUS_INCLUDE_PATH} pip install --no-deps .
+    MAX_JOBS=8 FLEXKV_DEBUG=0 TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" python3 setup.py install
+
+# -- Layer 5: independently pinned NVE 26.05/26.07 source trees and neutral
+# build dependencies. Both NVE trees must have complete recursive submodules.
+RUN set -eux; \
+    git clone https://github.com/NVIDIA/nv-embedding-cache.git nve-26.05; \
+    git -C nve-26.05 checkout --detach "${NVE_2605_COMMIT}"; \
+    test "$(git -C nve-26.05 rev-parse HEAD)" = "${NVE_2605_COMMIT}"; \
+    git -C nve-26.05 submodule sync --recursive; \
+    git -C nve-26.05 submodule update --init --recursive; \
+    if git -C nve-26.05 submodule status --recursive | grep -Eq '^[+-U]'; then exit 1; fi; \
+    test "$(git -C nve-26.05/third_party/json rev-parse HEAD)" = "${NLOHMANN_JSON_COMMIT}"; \
+    git clone https://github.com/NVIDIA/nv-embedding-cache.git nve-26.07; \
+    git -C nve-26.07 checkout --detach "${NVE_2607_COMMIT}"; \
+    test "$(git -C nve-26.07 rev-parse HEAD)" = "${NVE_2607_COMMIT}"; \
+    git -C nve-26.07 submodule sync --recursive; \
+    git -C nve-26.07 submodule update --init --recursive; \
+    if git -C nve-26.07 submodule status --recursive | grep -Eq '^[+-U]'; then exit 1; fi; \
+    test "$(git -C nve-26.07/third_party/json rev-parse HEAD)" = "${NLOHMANN_JSON_COMMIT}"; \
+    git clone https://github.com/NVIDIA/NVTX.git NVTX; \
+    git -C NVTX checkout --detach "${NVTX_COMMIT}"; \
+    test "$(git -C NVTX rev-parse HEAD)" = "${NVTX_COMMIT}"; \
+    git clone https://github.com/nlohmann/json.git nlohmann-json; \
+    git -C nlohmann-json checkout --detach "${NLOHMANN_JSON_COMMIT}"; \
+    test "$(git -C nlohmann-json rev-parse HEAD)" = "${NLOHMANN_JSON_COMMIT}"
+
+# Build into two isolated Python prefixes. NVE's upstream default feature set
+# is used for both builds and includes libnve-plugin-nvhm.so.
+RUN set -eux; \
+    python3 -m pip uninstall -y pynve || true; \
+    rm -rf \
+      /usr/local/lib/python3.12/dist-packages/pynve \
+      /usr/local/lib/python3.12/dist-packages/pynve-*.dist-info \
+      /usr/local/lib/python3.12/dist-packages/pynve-*.egg-info \
+      /usr/local/lib/python3.12/dist-packages/pynve*.egg-link \
+      /opt/nve/26.05 \
+      /opt/nve/26.07; \
+    find /usr/local/lib/python3.12/dist-packages -maxdepth 1 \
+      -type f -iname '*pynve*.pth' -delete; \
+    unset NVE_FEATURES NVE_DISABLE_PLUGINS NVE_DISABLE_NVHM_PLUGIN \
+      CMAKE_TOOLCHAIN_FILE PYNVE_DISABLE_TORCH_BINDINGS; \
+    if [ "${TARGETPLATFORM}" = "linux/arm64" ]; then \
+      unset PYNVE_DISABLE_AVX512; \
+    else \
+      export PYNVE_DISABLE_AVX512=1; \
+    fi; \
+    for version in 26.05 26.07; do \
+      source_dir="/workspace/deps/nve-${version}"; \
+      build_dir="/workspace/build/pynve-${version}"; \
+      install_dir="/opt/nve/${version}/python"; \
+      mkdir -p "${install_dir}"; \
+      cd "${source_dir}"; \
+      PYNVE_BUILD_DIR="${build_dir}" \
+      TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" \
+      CPLUS_INCLUDE_PATH="/workspace/deps/NVTX/c/include${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}" \
+      python3 -m pip install --no-build-isolation --no-deps \
+        --target "${install_dir}" .; \
+    done; \
+    rm -rf /workspace/build; \
+    test -f /opt/nve/26.05/python/pynve/libnve-plugin-nvhm.so; \
+    test -f /opt/nve/26.07/python/pynve/libnve-plugin-nvhm.so; \
+    PYTHONPATH=/opt/nve/26.05/python python3 -c \
+      'import pathlib, sys, pynve, pynve.torch; assert pynve.__version__ == "26.05.0"; assert pynve.torch.HAS_TORCH_OPS; assert pathlib.Path(pynve.__file__).resolve().is_relative_to(pathlib.Path("/opt/nve/26.05/python")); assert all("/opt/nve/26.07" not in path for path in sys.path)'; \
+    PYTHONPATH=/opt/nve/26.07/python python3 -c \
+      'import pathlib, sys, pynve, pynve.torch; assert pynve.__version__ == "26.07.0"; assert pynve.torch.HAS_TORCH_OPS; assert pathlib.Path(pynve.__file__).resolve().is_relative_to(pathlib.Path("/opt/nve/26.07/python")); assert all("/opt/nve/26.05" not in path for path in sys.path)'; \
+    if env -u PYTHONPATH python3 -I -c 'import pynve' 2>/dev/null; then \
+      echo 'unexpected unversioned pynve installation' >&2; exit 1; \
+    fi; \
+    for version in 26.05 26.07; do \
+      other_version=26.07; \
+      if [ "${version}" = 26.07 ]; then other_version=26.05; fi; \
+      for library in /opt/nve/${version}/python/pynve/*.so; do \
+        dependencies="$(ldd "${library}")"; \
+        if printf '%s\n' "${dependencies}" | grep -q 'not found'; then \
+          printf '%s\n' "${dependencies}"; exit 1; \
+        fi; \
+        if printf '%s\n' "${dependencies}" | grep -q "/opt/nve/${other_version}/"; then \
+          printf '%s\n' "${dependencies}"; exit 1; \
+        fi; \
+        if printf '%s\n' "${dependencies}" | grep -q 'libnve-common.so'; then \
+          printf '%s\n' "${dependencies}" | grep -q "/opt/nve/${version}/python/pynve/libnve-common.so"; \
+        fi; \
+        if printf '%s\n' "${dependencies}" | grep -q 'libnve-torch-ops.so'; then \
+          printf '%s\n' "${dependencies}" | grep -q "/opt/nve/${version}/python/pynve/libnve-torch-ops.so"; \
+        fi; \
+      done; \
+    done
+
+# The development image selects 26.07 by default. Commands selecting 26.05
+# replace this value rather than appending to it.
+ENV PYTHONPATH=/opt/nve/26.07/python:/workspace/recsys-examples/examples:/workspace/recsys-examples/examples/hstu
 
 # Install fbgemm_gpu_hstu (package: fbgemm_gpu_hstu, import: hstu) from submodule.
 COPY third_party/FBGEMM /workspace/deps/fbgemm_hstu
@@ -317,16 +406,64 @@ RUN cd /workspace/recsys-examples/corelib/dynamicemb && \
     cmake .. && make -j
 
 # ============================================================================
-# AOTI additions: standalone C++ replay and existing runtime-library staging.
-# The Triton model-init hook is not built for the NVE 26.06/26.07 upgrade.
+# AOTI additions: version-independent C++ replay, two versioned NVE loader
+# plugins, the 26.05 Triton init hook, and existing runtime-library staging.
 # ============================================================================
 RUN cd /workspace/recsys-examples/corelib/recsys_kvcache_manager && \
     mkdir -p build && cd build && \
     cmake .. && make -j
 
 RUN export CMAKE_PREFIX_PATH="$(python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "share", "cmake"))')" && \
-    cmake -S "./examples/hstu/inference_aoti/cpp_inference" -B "./examples/hstu/inference_aoti/cpp_inference/build" && \
-    cmake --build "./examples/hstu/inference_aoti/cpp_inference/build" -j 8
+    cmake -S "./examples/hstu/inference_aoti/cpp_inference" \
+      -B "./examples/hstu/inference_aoti/cpp_inference/build" \
+      -DNVE_2605_ROOT=/workspace/deps/nve-26.05 \
+      -DNVE_2607_ROOT=/workspace/deps/nve-26.07 \
+      -DNVE_2605_LIB_DIR=/opt/nve/26.05/python/pynve \
+      -DNVE_2607_LIB_DIR=/opt/nve/26.07/python/pynve \
+      -DNVTX_INCLUDE_DIR=/workspace/deps/NVTX/c/include \
+      -DNLOHMANN_JSON_ROOT=/workspace/deps/nlohmann-json && \
+    cmake --build "./examples/hstu/inference_aoti/cpp_inference/build" -j 8 && \
+    cmake --install "./examples/hstu/inference_aoti/cpp_inference/build" && \
+    for executable in \
+      ./examples/hstu/inference_aoti/cpp_inference/build/inference_hstu_gr_ranking_exported_model \
+      ./examples/hstu/inference_aoti/cpp_inference/build/inference_hstu_gr_ranking_kvcache_exported_model \
+      ./examples/hstu/inference_aoti/cpp_inference/build/libhstu_cuda_ops_runtime.so \
+      ./examples/hstu/inference_aoti/cpp_inference/build/libpaged_kvcache_ops_runtime.so; do \
+        if readelf -d "${executable}" | grep -q 'libnve'; then \
+          echo "unexpected NVE dependency on ${executable}" >&2; exit 1; \
+        fi; \
+    done && \
+    for version in 26.05 26.07; do \
+      plugin="/opt/nve/${version}/replay/librecsys_nve_loader.so"; \
+      other_version=26.07; \
+      if [ "${version}" = 26.07 ]; then other_version=26.05; fi; \
+      test -f "${plugin}"; \
+      dependencies="$(ldd "${plugin}")"; \
+      printf '%s\n' "${dependencies}" | grep -q "/opt/nve/${version}/python/pynve/libnve-common.so"; \
+      printf '%s\n' "${dependencies}" | grep -q "/opt/nve/${version}/python/pynve/libnve-torch-ops.so"; \
+      if printf '%s\n' "${dependencies}" | grep -q "/opt/nve/${other_version}/"; then \
+        printf '%s\n' "${dependencies}"; exit 1; \
+      fi; \
+      if printf '%s\n' "${dependencies}" | grep -q 'not found'; then \
+        printf '%s\n' "${dependencies}"; exit 1; \
+      fi; \
+      exported_symbols="$(nm -D --defined-only --format=posix "${plugin}" | awk '{print $1}')"; \
+      test "${exported_symbols}" = recsys_nve_loader_get_api_v1; \
+    done
+
+RUN set -eux; \
+    torch_root="$(python3 -c 'import pathlib, torch; print(pathlib.Path(torch.__file__).parent)')"; \
+    export CPLUS_INCLUDE_PATH="/workspace/deps/NVTX/c/include:${torch_root}/include:${torch_root}/include/torch/csrc/api/include${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}"; \
+    cmake -S ./examples/hstu/inference_aoti/nve_init_hook \
+      -B ./examples/hstu/inference_aoti/nve_init_hook/build \
+      -DNVE_ROOT=/workspace/deps/nve-26.05 \
+      -DNVE_LIB_DIR=/opt/nve/26.05/python/pynve; \
+    cmake --build ./examples/hstu/inference_aoti/nve_init_hook/build -j 8; \
+    test -f ./examples/hstu/inference_aoti/nve_init_hook/build/libnve_init_hook.so; \
+    if ldd ./examples/hstu/inference_aoti/nve_init_hook/build/libnve_init_hook.so | grep -q 'not found'; then \
+      ldd ./examples/hstu/inference_aoti/nve_init_hook/build/libnve_init_hook.so | grep 'not found'; \
+      exit 1; \
+    fi
 
 RUN cd ./examples/hstu && \
     mkdir -p \
@@ -343,7 +480,7 @@ RUN cd ./examples/hstu && \
     cp -P /workspace/recsys-examples/examples/hstu/inference_aoti/cpp_inference/build/libpaged_kvcache_ops_runtime.so triton_libs/ && \
     cp -a /usr/local/lib/python3.12/dist-packages/hstu/. triton_libs/hstu_attn/ && \
     cp -a /usr/local/lib/python3.12/dist-packages/fbgemm_gpu/. triton_libs/fbgemm_gpu/ && \
-    cp -a /usr/local/lib/python3.12/dist-packages/pynve/. triton_libs/pynve/ && \
+    cp -a /opt/nve/26.05/python/pynve/. triton_libs/pynve/ && \
     find /usr/local/lib -maxdepth 1 \( -type f -o -type l \) \( -name '*.so' -o -name '*.so.*' \) -exec cp -P {} triton_libs/lib/ \; && \
     cp -P /usr/lib/$(uname -m)-linux-gnu/libpng16.so.16* triton_libs/system/
 

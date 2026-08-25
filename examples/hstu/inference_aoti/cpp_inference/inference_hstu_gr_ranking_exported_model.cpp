@@ -9,13 +9,12 @@
 #include <cstdio>
 #include <filesystem>
 #include <iostream>
-#include <memory>
 #include <regex>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-#include "python/pynve/torch_bindings/nve_loader.hpp"
+#include "nve_loader_plugin.h"
 
 namespace {
 
@@ -114,7 +113,7 @@ struct DemoConfig {
 DemoConfig parse_args(int argc, char** argv) {
   if (argc < 3) {
     throw std::invalid_argument(
-        "Usage: inferece_hstu_gr_ranking_exported_model <hstu_gr_ranking_model.pt2> <dump_dir> "
+        "Usage: inference_hstu_gr_ranking_exported_model <aoti_package_dir> <dump_dir> "
         "[model_name] [device_index] [batch_index] "
         "[inference_emb_ops.so] [libhstu_cuda_ops_runtime.so]");
   }
@@ -324,51 +323,60 @@ int main(int argc, char** argv) {
 
     load_required_libraries(cfg);
 
-    // Declared before the loader so the marker-owning directory outlives it.
-    auto resources = std::make_shared<nve::ResourceDirectory>();
-    std::unique_ptr<nve::LayerDirectory> layers;
-
-    torch::inductor::AOTIModelPackageLoader loader(
-        cfg.package_path + "/model.pt2",
-        cfg.model_name,
-        /*run_single_threaded=*/false,
-        /*num_runners=*/1,
-        cfg.device_index);
-
-    std::cout << std::endl;
-    std::cout << "Loading NVE layers from " << cfg.package_path << std::endl;
-    layers = std::make_unique<nve::LayerDirectory>(
-        cfg.package_path, loader, cfg.device_index, resources);
-    std::cout << "  Loaded " << layers->size() << " layer(s)" << std::endl;
-    std::cout << std::endl;
-
-    auto call_spec = loader.get_call_spec();
-    std::cout << "Input call spec:\n" << call_spec[0] << "\n\n";
-    std::cout << "Output call spec:\n" << call_spec[1] << "\n\n";
-
-    std::vector<int> batch_indices;
-    if (cfg.batch_index >= 0) {
-      batch_indices = {cfg.batch_index};
-    } else {
-      batch_indices = discover_batch_indices(cfg.dump_dir);
+    // The manager is declared before the AOTI loader so its opaque layer state
+    // outlives the loader on every normal and exceptional exit.
+    recsys::nve_loader::NveLoaderPlugin nve_plugin(cfg.package_path);
+    nve_plugin.prepare_native_ops();
+    if (nve_plugin.init_phase() == RECSYS_NVE_INIT_BEFORE_AOTI) {
+      nve_plugin.create_state(nullptr, cfg.device_index);
     }
 
-    TORCH_CHECK(!batch_indices.empty(), "No dumped batches found in ", cfg.dump_dir);
-
-    int passed = 0;
-    int total = 0;
-    for (int idx : batch_indices) {
-      ++total;
-      if (run_one_batch(loader, cfg.dump_dir, idx, device)) {
-        ++passed;
+    int result = 1;
+    {
+      torch::inductor::AOTIModelPackageLoader loader(
+          cfg.package_path + "/model.pt2",
+          cfg.model_name,
+          /*run_single_threaded=*/false,
+          /*num_runners=*/1,
+          cfg.device_index);
+      if (nve_plugin.init_phase() == RECSYS_NVE_INIT_AFTER_AOTI) {
+        nve_plugin.create_state(&loader, cfg.device_index);
       }
-    }
-    std::cout << "[INFO] max_abs_diff<=0.0625 passed " << passed << "/" << total << " batches.\n";
+      std::cout << "[INFO] Loaded NVE " << nve_plugin.selected_version()
+                << " state from " << cfg.package_path << '\n';
 
-    // Benchmark with all batches in a single run.
-    run_one_round(loader, cfg.dump_dir, batch_indices, device);
+      auto call_spec = loader.get_call_spec();
+      std::cout << "Input call spec:\n" << call_spec[0] << "\n\n";
+      std::cout << "Output call spec:\n" << call_spec[1] << "\n\n";
 
-    return (passed == total) ? 0 : 2;
+      std::vector<int> batch_indices;
+      if (cfg.batch_index >= 0) {
+        batch_indices = {cfg.batch_index};
+      } else {
+        batch_indices = discover_batch_indices(cfg.dump_dir);
+      }
+
+      TORCH_CHECK(
+          !batch_indices.empty(), "No dumped batches found in ", cfg.dump_dir);
+
+      int passed = 0;
+      int total = 0;
+      for (int idx : batch_indices) {
+        ++total;
+        if (run_one_batch(loader, cfg.dump_dir, idx, device)) {
+          ++passed;
+        }
+      }
+      std::cout << "[INFO] max_abs_diff<=0.0625 passed " << passed << "/"
+                << total << " batches.\n";
+
+      // Benchmark with all batches in a single run.
+      run_one_round(loader, cfg.dump_dir, batch_indices, device);
+
+      result = (passed == total) ? 0 : 2;
+    }  // The AOTI loader is destroyed before NVE state on every path.
+    nve_plugin.destroy_state();
+    return result;
   } catch (const c10::Error& e) {
     std::cerr << "PyTorch error: " << e.what() << std::endl;
     return 1;
