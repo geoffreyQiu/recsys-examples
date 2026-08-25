@@ -6,7 +6,10 @@ export, native replay, and Triton command sequences.
 
 ## Installed layout
 
-The development image builds both pinned NVE source trees independently:
+The development image builds both pinned NVE source trees independently. NVE
+26.07 is copied from the parent repository's pinned
+`third_party/nv-embedding-cache` submodule, while NVE 26.05 is cloned at its
+pinned commit inside the Docker build:
 
 ```text
 /workspace/deps/nve-26.05

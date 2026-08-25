@@ -14,7 +14,6 @@ ARG UPSTREAM_PYTORCH_CONTAINER_VERSION=
 ARG DEFAULT_UPSTREAM_PYTORCH_CONTAINER_VERSION=26.05
 ARG TRITON_BUILD_JOBS=8
 ARG NVE_2605_COMMIT=bb74e7f8a90e3b7173501d3cdd9ae14ed04b4b2d
-ARG NVE_2607_COMMIT=4c1f956f0ae977bb40425273d2fcfded4c590002
 ARG NVTX_COMMIT=7d113f290f89eeeae9c957011c497101f3948d9e
 ARG NLOHMANN_JSON_COMMIT=9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03
 
@@ -213,7 +212,6 @@ RUN set -eux; \
 FROM ${BASE_TRITON_IMAGE} AS devel
 ARG TARGETPLATFORM
 ARG NVE_2605_COMMIT
-ARG NVE_2607_COMMIT
 ARG NVTX_COMMIT
 ARG NLOHMANN_JSON_COMMIT
 
@@ -269,8 +267,10 @@ RUN cd FlexKV && mkdir -p build && cd build && \
     cd .. && mkdir -p flexkv/lib && cp -P build/lib/*.so* flexkv/lib/ && \
     MAX_JOBS=8 FLEXKV_DEBUG=0 TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" python3 setup.py install
 
-# -- Layer 5: independently pinned NVE 26.05/26.07 source trees and neutral
-# build dependencies. Both NVE trees must have complete recursive submodules.
+# -- Layer 5: pinned NVE 26.05/26.07 source trees and neutral build
+# dependencies. The parent repository pins 26.07 through its NVE submodule;
+# 26.05 remains a separate Docker checkout.
+COPY third_party/nv-embedding-cache /workspace/deps/nve-26.07
 RUN set -eux; \
     git clone https://github.com/NVIDIA/nv-embedding-cache.git nve-26.05; \
     git -C nve-26.05 checkout --detach "${NVE_2605_COMMIT}"; \
@@ -279,13 +279,6 @@ RUN set -eux; \
     git -C nve-26.05 submodule update --init --recursive; \
     if git -C nve-26.05 submodule status --recursive | grep -Eq '^[+-U]'; then exit 1; fi; \
     test "$(git -C nve-26.05/third_party/json rev-parse HEAD)" = "${NLOHMANN_JSON_COMMIT}"; \
-    git clone https://github.com/NVIDIA/nv-embedding-cache.git nve-26.07; \
-    git -C nve-26.07 checkout --detach "${NVE_2607_COMMIT}"; \
-    test "$(git -C nve-26.07 rev-parse HEAD)" = "${NVE_2607_COMMIT}"; \
-    git -C nve-26.07 submodule sync --recursive; \
-    git -C nve-26.07 submodule update --init --recursive; \
-    if git -C nve-26.07 submodule status --recursive | grep -Eq '^[+-U]'; then exit 1; fi; \
-    test "$(git -C nve-26.07/third_party/json rev-parse HEAD)" = "${NLOHMANN_JSON_COMMIT}"; \
     git clone https://github.com/NVIDIA/NVTX.git NVTX; \
     git -C NVTX checkout --detach "${NVTX_COMMIT}"; \
     test "$(git -C NVTX rev-parse HEAD)" = "${NVTX_COMMIT}"; \
