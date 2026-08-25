@@ -64,6 +64,20 @@ merge stale model or replay data.
 Run from the repository root on the Docker host:
 
 ```bash
+(
+  set -euo pipefail
+  readonly REPO_ROOT="$PWD"
+
+  git -C "$REPO_ROOT" submodule sync --recursive
+  git -C "$REPO_ROOT" submodule update --init --recursive
+)
+```
+
+NVE 26.07 is copied from the pinned `third_party/nv-embedding-cache`
+submodule. NVE 26.05 remains a separate pinned checkout inside the Docker
+build.
+
+```bash
 set -euo pipefail
 
 DOCKER_BUILDKIT=1 docker build --progress=plain \
