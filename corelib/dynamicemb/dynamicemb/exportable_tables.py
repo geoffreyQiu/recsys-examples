@@ -47,6 +47,17 @@ def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
 
+def _linear_uvm_constructor_kwargs() -> Dict[str, object]:
+    """Return the LinearUVM selector for the imported NVE generation."""
+    if hasattr(nve_layers, "LayerType"):
+        return {"layer_type": nve_layers.LayerType.LinearUVM}
+    if hasattr(nve_layers, "CacheType"):
+        return {"cache_type": nve_layers.CacheType.LinearUVM}
+    raise RuntimeError(
+        "Unsupported pynve.torch.nve_layers API: expected LayerType or CacheType"
+    )
+
+
 def _resolve_capacity(opt: "DynamicEmbTableOptions") -> int:
     """Return the capacity for a single table option.
 
@@ -351,10 +362,10 @@ class InferenceEmbeddingCollection(torch.nn.Module):
                 num_embeddings=total_rows,
                 embedding_size=self.emb_dim_,
                 data_type=output_dtype,
-                layer_type=nve_layers.LayerType.LinearUVM,
                 gpu_cache_size=int(self.gpu_cache_size_),
                 optimize_for_training=False,
                 device=device,
+                **_linear_uvm_constructor_kwargs(),
             )
         else:
             if self.pooling_mode_ == 1:
@@ -365,11 +376,11 @@ class InferenceEmbeddingCollection(torch.nn.Module):
                 num_embeddings=total_rows,
                 embedding_size=self.emb_dim_,
                 data_type=output_dtype,
-                layer_type=nve_layers.LayerType.LinearUVM,
                 mode=mode,
                 gpu_cache_size=int(self.gpu_cache_size_),
                 optimize_for_training=False,
                 device=device,
+                **_linear_uvm_constructor_kwargs(),
             )
 
     def load_from_embedding_table(self, table_weights: torch.Tensor) -> None:

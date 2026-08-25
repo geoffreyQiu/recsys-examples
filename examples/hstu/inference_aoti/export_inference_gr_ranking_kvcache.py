@@ -19,9 +19,11 @@ import os
 import sys
 import time
 import warnings
+from pathlib import Path
 from typing import Optional
 
 import gin
+import pynve
 import torch
 import torch.distributed as dist
 from commons.datasets import get_data_loader
@@ -52,7 +54,7 @@ from model import get_ranking_model
 from model.export_kvcached_inference_ranking_gr import ExportKVCachedInferenceRankingGR
 from modules.inference_dense_module import InferenceDenseModule
 from modules.metrics import get_multi_event_metric_module
-from pynve.torch.nve_export import export_aot, load_aot
+from pynve.torch.nve_export import export_aot
 from recsys_kvcache_manager.kvcache_config import KVCacheConfig, get_kvcache_config
 from torch.export import Dim, ShapesCollection
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
@@ -61,6 +63,14 @@ from utils import NetworkArgs, TensorModelParallelArgs
 sys.path.append("./training/")
 from pretrain_gr_ranking import create_ranking_config
 from trainer.utils import create_hstu_config, get_dataset_and_embedding_args
+
+from inference_aoti.nve_aoti_compat import (
+    NveCompatibilityError,
+    OutputDirectoryError,
+    _runtime_generation,
+    load_aoti,
+    prepare_output_directories,
+)
 
 warnings.filterwarnings("default", category=UserWarning)
 torch.set_warn_always(False)
@@ -397,10 +407,19 @@ def get_exportable_model_for_inference(
 
 def export_inference_gr_ranking(
     checkpoint_dir: str,
+    export_dir: str,
+    dump_dir: str,
     max_bs: int = 1,
     stop_after_warmup: bool = False,
     kvcache_config_file: Optional[str] = None,
 ):
+    export_dir, dump_dir = prepare_output_directories(export_dir, dump_dir)
+    generation = _runtime_generation()
+    print(
+        f"[INFO] Selected NVE {generation} (pynve {pynve.__version__}) from "
+        f"{Path(pynve.__file__).resolve()}"
+    )
+
     def _split_model_outputs(outputs):
         if isinstance(outputs, torch.Tensor):
             return outputs, None
@@ -461,6 +480,7 @@ def export_inference_gr_ranking(
         return batch
 
     model = None
+    compiled_session = None
     with torch.inference_mode():
         from register_hstubatch_pytree_example import register_hstu_export_pytrees
 
@@ -647,9 +667,6 @@ def export_inference_gr_ranking(
             print(f"[INFO] Dynamic shapes: {dynamic_shapes}")
 
             # export & aoti_compile_and_package
-            export_dir = os.path.join(
-                os.path.dirname(__file__), "hstu_gr_ranking_kvcache_model"
-            )
             export_aot(
                 export_model,
                 example_inputs,
@@ -667,16 +684,14 @@ def export_inference_gr_ranking(
             print("       └── weights/{resource_id}.nve  # NVE weight data (LinearUVM)")
 
             # === Test Compiled Model ===
-            compiled_loader, loaded_nve_layers = load_aot(
+            compiled_session = load_aoti(
                 export_dir,
                 device=torch.device("cuda", torch.cuda.current_device()),
             )
             print(
-                f"[INFO] Loaded {len(loaded_nve_layers)} NVE layer(s) for AOTI"
+                f"[INFO] Loaded {compiled_session.num_layers} NVE layer(s) for AOTI"
             )
 
-            dump_dir = os.path.join(os.path.dirname(__file__), "export_test_dump")
-            os.makedirs(dump_dir, exist_ok=True)
             feature_keys_dumped = False
             dump_idx = 0
 
@@ -693,7 +708,7 @@ def export_inference_gr_ranking(
             compiled_results = []
             with torch.inference_mode():
                 for batch, user_ids, total_history_lengths in inputs:
-                    compiled_outputs = compiled_loader.run(
+                    compiled_outputs = compiled_session.run(
                         [
                             batch.features.values(),
                             batch.features.lengths(),
@@ -763,6 +778,8 @@ def export_inference_gr_ranking(
             )
 
         finally:
+            if compiled_session is not None:
+                compiled_session.close()
             shutdown_flexkv_runtime_and_server(model)
 
 
@@ -779,6 +796,8 @@ if __name__ == "__main__":
         help="Static YAML config shared with the C++ KV-cache runtime.",
     )
     parser.add_argument("--stop_after_warmup", action="store_true")
+    parser.add_argument("--export_dir", type=str, required=True)
+    parser.add_argument("--dump_dir", type=str, required=True)
 
     args = parser.parse_args()
     gin.parse_config_file(args.gin_config_file)
@@ -790,10 +809,16 @@ if __name__ == "__main__":
         )
         args.max_bs = 2
 
-    export_inference_gr_ranking(
-        checkpoint_dir=args.checkpoint_dir,
-        max_bs=args.max_bs,
-        stop_after_warmup=args.stop_after_warmup,
-        kvcache_config_file=args.kvcache_config_file,
-    )
+    try:
+        export_inference_gr_ranking(
+            checkpoint_dir=args.checkpoint_dir,
+            export_dir=args.export_dir,
+            dump_dir=args.dump_dir,
+            max_bs=args.max_bs,
+            stop_after_warmup=args.stop_after_warmup,
+            kvcache_config_file=args.kvcache_config_file,
+        )
+    except (NveCompatibilityError, OutputDirectoryError) as error:
+        print(str(error), file=sys.stderr)
+        raise SystemExit(1) from error
     print("[INFO] Finished.")
