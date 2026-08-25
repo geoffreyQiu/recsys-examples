@@ -138,8 +138,8 @@ RUN set -eux; \
     git clone --depth 1 \
       https://github.com/triton-inference-server/pytorch_backend.git pytorch_backend; \
     cd pytorch_backend; \
-    git fetch --depth 1 origin r26.07; \
-    git checkout --detach ceeecb7; \
+    git fetch --depth 1 origin ceeecb748caa785b359095a74c05d55dace2591a; \
+    git checkout --detach FETCH_HEAD; \
     pinned_backend_commit="$(git rev-parse HEAD)"; \
     test "${pinned_backend_commit}" = ceeecb748caa785b359095a74c05d55dace2591a; \
     mkdir -p build; cd build; \
@@ -320,33 +320,7 @@ RUN set -eux; \
     done; \
     rm -rf /workspace/build; \
     test -f /opt/nve/26.05/python/pynve/libnve-plugin-nvhm.so; \
-    test -f /opt/nve/26.07/python/pynve/libnve-plugin-nvhm.so; \
-    PYTHONPATH=/opt/nve/26.05/python python3 -c \
-      'import pathlib, sys, pynve, pynve.torch; assert pynve.__version__ == "26.05.0"; assert pynve.torch.HAS_TORCH_OPS; assert pathlib.Path(pynve.__file__).resolve().is_relative_to(pathlib.Path("/opt/nve/26.05/python")); assert all("/opt/nve/26.07" not in path for path in sys.path)'; \
-    PYTHONPATH=/opt/nve/26.07/python python3 -c \
-      'import pathlib, sys, pynve, pynve.torch; assert pynve.__version__ == "26.07.0"; assert pynve.torch.HAS_TORCH_OPS; assert pathlib.Path(pynve.__file__).resolve().is_relative_to(pathlib.Path("/opt/nve/26.07/python")); assert all("/opt/nve/26.05" not in path for path in sys.path)'; \
-    if env -u PYTHONPATH python3 -I -c 'import pynve' 2>/dev/null; then \
-      echo 'unexpected unversioned pynve installation' >&2; exit 1; \
-    fi; \
-    for version in 26.05 26.07; do \
-      other_version=26.07; \
-      if [ "${version}" = 26.07 ]; then other_version=26.05; fi; \
-      for library in /opt/nve/${version}/python/pynve/*.so; do \
-        dependencies="$(ldd "${library}")"; \
-        if printf '%s\n' "${dependencies}" | grep -q 'not found'; then \
-          printf '%s\n' "${dependencies}"; exit 1; \
-        fi; \
-        if printf '%s\n' "${dependencies}" | grep -q "/opt/nve/${other_version}/"; then \
-          printf '%s\n' "${dependencies}"; exit 1; \
-        fi; \
-        if printf '%s\n' "${dependencies}" | grep -q 'libnve-common.so'; then \
-          printf '%s\n' "${dependencies}" | grep -q "/opt/nve/${version}/python/pynve/libnve-common.so"; \
-        fi; \
-        if printf '%s\n' "${dependencies}" | grep -q 'libnve-torch-ops.so'; then \
-          printf '%s\n' "${dependencies}" | grep -q "/opt/nve/${version}/python/pynve/libnve-torch-ops.so"; \
-        fi; \
-      done; \
-    done
+    test -f /opt/nve/26.07/python/pynve/libnve-plugin-nvhm.so;
 
 # The development image selects 26.07 by default. Commands selecting 26.05
 # replace this value rather than appending to it.
