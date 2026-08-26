@@ -75,6 +75,10 @@ from inference_aoti.nve_aoti_compat import (
 warnings.filterwarnings("default", category=UserWarning)
 torch.set_warn_always(False)
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_EXPORT_DIR = SCRIPT_DIR / "hstu_gr_ranking_kvcache_model"
+DEFAULT_DUMP_DIR = SCRIPT_DIR / "export_test_dump"
+
 
 def start_flexkv_server(
     kvcache_config: KVCacheConfig,
@@ -407,12 +411,16 @@ def get_exportable_model_for_inference(
 
 def export_inference_gr_ranking(
     checkpoint_dir: str,
-    export_dir: str,
-    dump_dir: str,
     max_bs: int = 1,
     stop_after_warmup: bool = False,
     kvcache_config_file: Optional[str] = None,
+    export_dir: str | os.PathLike[str] | None = None,
+    dump_dir: str | os.PathLike[str] | None = None,
 ):
+    if export_dir is None:
+        export_dir = DEFAULT_EXPORT_DIR
+    if dump_dir is None:
+        dump_dir = DEFAULT_DUMP_DIR
     export_dir, dump_dir = prepare_output_directories(export_dir, dump_dir)
     generation = _runtime_generation()
     print(
@@ -796,8 +804,18 @@ if __name__ == "__main__":
         help="Static YAML config shared with the C++ KV-cache runtime.",
     )
     parser.add_argument("--stop_after_warmup", action="store_true")
-    parser.add_argument("--export_dir", type=str, required=True)
-    parser.add_argument("--dump_dir", type=str, required=True)
+    parser.add_argument(
+        "--export_dir",
+        type=str,
+        default=str(DEFAULT_EXPORT_DIR),
+        help="Model export directory (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--dump_dir",
+        type=str,
+        default=str(DEFAULT_DUMP_DIR),
+        help="Replay dump directory (default: %(default)s).",
+    )
 
     args = parser.parse_args()
     gin.parse_config_file(args.gin_config_file)

@@ -55,9 +55,12 @@ schema-v2 object with `version: 2`, `resources`, and `layer_type`. Python reload
 and native replay inspect this NVE-owned file and reject a runtime/artifact
 mismatch. Artifacts are not portable across NVE generations.
 
-`--export_dir` and `--dump_dir` must be distinct and non-nested. Each may be
-absent or empty; the exporter refuses a non-empty destination so a rerun cannot
-merge stale model or replay data.
+`--export_dir` and `--dump_dir` are optional. When omitted, the non-KV exporter
+uses `hstu_gr_ranking_model`, the KV-cache exporter uses
+`hstu_gr_ranking_kvcache_model`, and both use `export_test_dump`, all beside the
+exporter scripts. Default or explicit destinations must be distinct,
+non-nested, and absent or empty; the exporter refuses a non-empty destination
+so a rerun cannot merge stale model or replay data.
 
 ## Build the images
 
