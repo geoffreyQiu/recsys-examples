@@ -555,6 +555,7 @@ def export_inference_gr_ranking(
         for item in results:
             del item
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Inference End-to-end Example")
     parser.add_argument("--gin_config_file", type=str, required=True)
