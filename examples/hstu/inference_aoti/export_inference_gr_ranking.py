@@ -38,9 +38,6 @@ from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from utils import NetworkArgs, TensorModelParallelArgs
 
 sys.path.append("./training/")
-from pretrain_gr_ranking import create_ranking_config
-from trainer.utils import create_hstu_config, get_dataset_and_embedding_args
-
 from inference_aoti.nve_aoti_compat import (
     NveCompatibilityError,
     OutputDirectoryError,
@@ -48,6 +45,8 @@ from inference_aoti.nve_aoti_compat import (
     load_aoti,
     prepare_output_directories,
 )
+from pretrain_gr_ranking import create_ranking_config
+from trainer.utils import create_hstu_config, get_dataset_and_embedding_args
 
 warnings.filterwarnings("default", category=UserWarning)
 torch.set_warn_always(False)
@@ -199,14 +198,14 @@ def export_inference_gr_ranking(
     checkpoint_dir: str,
     max_bs: int = 1,
     debug_flattened_inputs: bool = False,
-    export_dir: str | os.PathLike[str] | None = None,
-    dump_dir: str | os.PathLike[str] | None = None,
+    export_dir_: str | os.PathLike[str] | None = None,
+    dump_dir_: str | os.PathLike[str] | None = None,
 ):
-    if export_dir is None:
-        export_dir = DEFAULT_EXPORT_DIR
-    if dump_dir is None:
-        dump_dir = DEFAULT_DUMP_DIR
-    export_dir, dump_dir = prepare_output_directories(export_dir, dump_dir)
+    if export_dir_ is None:
+        export_dir_ = DEFAULT_EXPORT_DIR
+    if dump_dir_ is None:
+        dump_dir_ = DEFAULT_DUMP_DIR
+    export_dir, dump_dir = prepare_output_directories(export_dir_, dump_dir_)
     generation = _runtime_generation()
     print(
         f"[INFO] Selected NVE {generation} (pynve {pynve.__version__}) from "
@@ -610,8 +609,8 @@ if __name__ == "__main__":
     try:
         export_inference_gr_ranking(
             checkpoint_dir=args.checkpoint_dir,
-            export_dir=args.export_dir,
-            dump_dir=args.dump_dir,
+            export_dir_=args.export_dir,
+            dump_dir_=args.dump_dir,
             max_bs=args.max_bs,
             debug_flattened_inputs=args.debug_flattened_inputs,
         )

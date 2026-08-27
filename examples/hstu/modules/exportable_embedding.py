@@ -82,7 +82,6 @@ from modules.nve_compat import needs_legacy_embedding_lookup_fake_override
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
-
 if needs_legacy_embedding_lookup_fake_override():
     # Import pynve.torch first so NVE owns the schema and installs its default
     # fake. HSTU intentionally replaces only the legacy two-argument fake.

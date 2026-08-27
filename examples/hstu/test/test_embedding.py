@@ -20,11 +20,11 @@ import pytest
 import torch
 from configs.inference_config import EmbeddingBackend, InferenceEmbeddingConfig
 from modules.inference_embedding import InferenceEmbedding
-from modules.nve_embeddingcollection import InferenceNVEEmbeddingCollection
 from modules.nve_compat import (
     imported_nve_generation,
     needs_legacy_embedding_lookup_fake_override,
 )
+from modules.nve_embeddingcollection import InferenceNVEEmbeddingCollection
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 

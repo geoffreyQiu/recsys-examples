@@ -15,7 +15,6 @@ if str(HSTU_ROOT) not in sys.path:
 
 from inference_aoti import nve_aoti_compat  # noqa: E402
 
-
 LEGACY_METADATA = [
     {
         "id": 0,

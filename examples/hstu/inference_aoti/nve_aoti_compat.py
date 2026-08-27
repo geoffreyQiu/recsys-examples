@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 from typing import Any, Sequence
 
+import torch
 from modules.nve_compat import imported_nve_generation
 
 
@@ -79,11 +80,7 @@ def _classify_metadata(metadata: Any) -> str:
 
     if isinstance(metadata, dict):
         version = metadata.get("version")
-        if (
-            not isinstance(version, int)
-            or isinstance(version, bool)
-            or version != 2
-        ):
+        if not isinstance(version, int) or isinstance(version, bool) or version != 2:
             raise NveCompatibilityError(
                 f"NVE artifact metadata error: unsupported schema version {version!r}"
             )
@@ -134,9 +131,7 @@ def _runtime_contract(generation: str) -> str:
         return _LEGACY_ARTIFACT_CONTRACT
     if generation in {"26.06", "26.07"}:
         return _SCHEMA_V2_ARTIFACT_CONTRACT
-    raise NveCompatibilityError(
-        f"Unsupported NVE runtime generation {generation!r}"
-    )
+    raise NveCompatibilityError(f"Unsupported NVE runtime generation {generation!r}")
 
 
 def _runtime_generation() -> str:
@@ -146,9 +141,7 @@ def _runtime_generation() -> str:
         raise NveCompatibilityError(str(error)) from error
 
 
-def _normalize_outputs(outputs: Any) -> list["torch.Tensor"]:
-    import torch
-
+def _normalize_outputs(outputs: Any) -> list[torch.Tensor]:
     if isinstance(outputs, torch.Tensor):
         return [outputs]
     if isinstance(outputs, (tuple, list)) and all(
@@ -172,7 +165,7 @@ class AotiSession:
     def num_layers(self) -> int:
         return len(self._layers)
 
-    def run(self, inputs: Sequence["torch.Tensor"]) -> list["torch.Tensor"]:
+    def run(self, inputs: Sequence[torch.Tensor]) -> list[torch.Tensor]:
         if self._loader is None:
             raise RuntimeError("AOTI session is closed")
         if hasattr(self._loader, "run"):
@@ -204,7 +197,7 @@ class AotiSession:
 
 def load_aoti(
     package_dir: str | os.PathLike[str],
-    device: "torch.device",
+    device: torch.device,
 ) -> AotiSession:
     """Load an AOTI package only with a contract-compatible NVE runtime."""
     package_dir = os.fspath(package_dir)
@@ -224,7 +217,6 @@ def load_aoti(
         loader, layers = load_aot(package_dir, device=device)
         return AotiSession(loader, layers)
 
-    import torch
     from pynve.torch.nve_export import load_nve_layers
 
     if device.type != "cuda":
