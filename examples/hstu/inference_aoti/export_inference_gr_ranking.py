@@ -39,8 +39,6 @@ from utils import NetworkArgs, TensorModelParallelArgs
 
 sys.path.append("./training/")
 from inference_aoti.nve_aoti_compat import (
-    NveCompatibilityError,
-    OutputDirectoryError,
     _runtime_generation,
     load_aoti,
     prepare_output_directories,
@@ -198,13 +196,9 @@ def export_inference_gr_ranking(
     checkpoint_dir: str,
     max_bs: int = 1,
     debug_flattened_inputs: bool = False,
-    export_dir_: str | os.PathLike[str] | None = None,
-    dump_dir_: str | os.PathLike[str] | None = None,
+    export_dir_: str | os.PathLike[str] = DEFAULT_EXPORT_DIR,
+    dump_dir_: str | os.PathLike[str] = DEFAULT_DUMP_DIR,
 ):
-    if export_dir_ is None:
-        export_dir_ = DEFAULT_EXPORT_DIR
-    if dump_dir_ is None:
-        dump_dir_ = DEFAULT_DUMP_DIR
     export_dir, dump_dir = prepare_output_directories(export_dir_, dump_dir_)
     generation = _runtime_generation()
     print(
@@ -411,14 +405,14 @@ def export_inference_gr_ranking(
         print(
             "       ├── metadata.json              # NVE layer metadata (id, num_embeddings, emb_size, etc.)"
         )
-        print("       └── weights/{resource_id}.nve  # NVE weight data (LinearUVM)")
+        print("       └── weights/*.nve              # NVE weight data (LinearUVM)")
 
         # === Test Compiled Model ===
-        compiled_session = load_aoti(
+        aoti_model_runtime, nve_layers = load_aoti(
             export_dir,
             device=torch.device("cuda", torch.cuda.current_device()),
         )
-        print(f"[INFO] Loaded {compiled_session.num_layers} NVE layer(s) for AOTI")
+        print(f"[INFO] Loaded {len(nve_layers)} NVE layer(s) for AOTI")
 
         feature_keys_dumped = False
         dump_idx = 0
@@ -433,19 +427,13 @@ def export_inference_gr_ranking(
                 inputs.append(batch)
 
                 with torch.inference_mode():
-                    compiled_outputs = compiled_session.run(
+                    logits = aoti_model_runtime.run(
                         [
                             batch.features.values(),
                             batch.features.lengths(),
                             batch.num_candidates,
                         ]
-                    )
-                    if len(compiled_outputs) != 1:
-                        raise RuntimeError(
-                            "Expected the compiled AOTI model to return one tensor, "
-                            f"got {len(compiled_outputs)}"
-                        )
-                    logits = compiled_outputs[0]
+                    )[0]
                     ref_logits = model(batch)
                     ref_logits_cpu = ref_logits.detach().cpu()
 
@@ -518,19 +506,13 @@ def export_inference_gr_ranking(
             start = time.perf_counter()
             with torch.inference_mode():
                 for b in inputs:
-                    compiled_outputs = compiled_session.run(
+                    logits = aoti_model_runtime.run(
                         [
                             b.features.values(),
                             b.features.lengths(),
                             b.num_candidates,
                         ]
-                    )
-                    if len(compiled_outputs) != 1:
-                        raise RuntimeError(
-                            "Expected the compiled AOTI model to return one tensor, "
-                            f"got {len(compiled_outputs)}"
-                        )
-                    logits = compiled_outputs[0]
+                    )[0]
                     results.append(logits)
             torch.cuda.synchronize()
             end = time.perf_counter()
@@ -573,9 +555,6 @@ def export_inference_gr_ranking(
         for item in results:
             del item
 
-        compiled_session.close()
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Inference End-to-end Example")
     parser.add_argument("--gin_config_file", type=str, required=True)
@@ -606,15 +585,11 @@ if __name__ == "__main__":
         )
         args.max_bs = 2
 
-    try:
-        export_inference_gr_ranking(
-            checkpoint_dir=args.checkpoint_dir,
-            export_dir_=args.export_dir,
-            dump_dir_=args.dump_dir,
-            max_bs=args.max_bs,
-            debug_flattened_inputs=args.debug_flattened_inputs,
-        )
-    except (NveCompatibilityError, OutputDirectoryError) as error:
-        print(str(error), file=sys.stderr)
-        raise SystemExit(1) from error
+    export_inference_gr_ranking(
+        checkpoint_dir=args.checkpoint_dir,
+        export_dir_=args.export_dir,
+        dump_dir_=args.dump_dir,
+        max_bs=args.max_bs,
+        debug_flattened_inputs=args.debug_flattened_inputs,
+    )
     print("[INFO] Finished.")
