@@ -6,13 +6,6 @@
 #pragma once
 
 #include <stddef.h>
-#include <stdint.h>
-
-#define RECSYS_NVE_LOADER_ABI_VERSION UINT32_C(1)
-
-typedef uint32_t RecsysNveInitPhase;
-#define RECSYS_NVE_INIT_BEFORE_AOTI UINT32_C(1)
-#define RECSYS_NVE_INIT_AFTER_AOTI UINT32_C(2)
 
 #ifdef __cplusplus
 #define RECSYS_NVE_NOEXCEPT noexcept
@@ -27,26 +20,14 @@ extern "C" {
 #define RECSYS_NVE_EXPORT
 #endif
 
-typedef struct RecsysNveLoaderApiV1 {
-  uint32_t abi_version;
-  uint32_t struct_size;
-  const char* nve_version;
-  RecsysNveInitPhase init_phase;
-  int (*prepare_native_ops)(char* error, size_t error_size);
-  int (*create_state)(
-      const char* package_dir,
-      void* aoti_loader_or_null,
-      int device_index,
-      void** state,
-      char* error,
-      size_t error_size);
-  void (*destroy_state)(void* state) RECSYS_NVE_NOEXCEPT;
-} RecsysNveLoaderApiV1;
-
-typedef const RecsysNveLoaderApiV1* (*RecsysNveLoaderGetApiV1)(void)
-    RECSYS_NVE_NOEXCEPT;
-
-RECSYS_NVE_EXPORT const RecsysNveLoaderApiV1* recsys_nve_loader_get_api_v1(void)
+RECSYS_NVE_EXPORT int recsys_nve_loader_create_state(
+    const char* package_dir,
+    void* aoti_loader_or_null,
+    int device_index,
+    void** state,
+    char* error,
+    size_t error_size);
+RECSYS_NVE_EXPORT void recsys_nve_loader_destroy_state(void* state)
     RECSYS_NVE_NOEXCEPT;
 
 #ifdef __cplusplus
@@ -64,14 +45,10 @@ class NveLoaderPlugin {
 
   NveLoaderPlugin(const NveLoaderPlugin&) = delete;
   NveLoaderPlugin& operator=(const NveLoaderPlugin&) = delete;
-  NveLoaderPlugin(NveLoaderPlugin&&) noexcept;
-  NveLoaderPlugin& operator=(NveLoaderPlugin&&) noexcept;
 
   const std::string& selected_version() const noexcept;
-  RecsysNveInitPhase init_phase() const noexcept;
-  void prepare_native_ops();
+  bool requires_aoti_loader() const noexcept;
   void create_state(void* aoti_loader_or_null, int device_index);
-  void destroy_state() noexcept;
 
  private:
   struct Impl;

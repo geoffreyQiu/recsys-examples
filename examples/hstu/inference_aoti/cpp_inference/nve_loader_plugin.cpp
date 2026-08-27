@@ -46,42 +46,16 @@ const char* contract_name(NveArtifactContract contract) {
 
 NveArtifactContract classify_metadata(const nlohmann::json& metadata) {
   if (metadata.is_array()) {
-    if (metadata.empty()) {
-      metadata_error("legacy layer list is empty");
-    }
-    for (const auto& layer : metadata) {
-      if (!layer.is_object() || !layer.contains("cache_type") ||
-          layer.contains("layer_type")) {
-        metadata_error(
-            "legacy layers must contain cache_type and must not contain layer_type");
-      }
-    }
     return NveArtifactContract::kLegacyV1;
   }
 
   if (metadata.is_object()) {
     auto version = metadata.find("version");
-    if (version == metadata.end() || !version->is_number_integer() ||
-        version->get<int>() != 2) {
-      metadata_error("unsupported schema version");
+    if (version != metadata.end() && version->is_number_integer() &&
+        version->get<int>() == 2) {
+      return NveArtifactContract::kSchemaV2;
     }
-    auto resources_it = metadata.find("resources");
-    if (resources_it == metadata.end() || !resources_it->is_object()) {
-      metadata_error("schema v2 resources must be an object");
-    }
-    auto layers_it = metadata.find("layers");
-    if (layers_it == metadata.end() || !layers_it->is_array() ||
-        layers_it->empty()) {
-      metadata_error("schema v2 layers must be a non-empty list");
-    }
-    for (const auto& layer : *layers_it) {
-      if (!layer.is_object() || !layer.contains("layer_type") ||
-          layer.contains("cache_type")) {
-        metadata_error(
-            "schema v2 layers must contain layer_type and must not contain cache_type");
-      }
-    }
-    return NveArtifactContract::kSchemaV2;
+    metadata_error("unsupported schema version");
   }
 
   metadata_error("expected a legacy array or schema-v2 object");
@@ -113,7 +87,7 @@ NveArtifactContract contract_for_version(const std::string& version) {
   throw std::runtime_error("Unsupported NVE version=" + version);
 }
 
-std::string selected_version() {
+std::string selected_version_from_env() {
   const char* value = std::getenv("NVE_VERSION");
   if (value == nullptr || value[0] == '\0') {
     throw std::runtime_error(
@@ -129,13 +103,6 @@ std::string selected_version() {
   return selected;
 }
 
-const std::string& process_selected_version() {
-  // Function-local static initialization is thread-safe and deliberately
-  // freezes NVE_VERSION at the first replay-manager construction.
-  static const std::string selected = selected_version();
-  return selected;
-}
-
 const char* plugin_path_for(const std::string& version) {
   if (version == "26.05") {
     return kNve2605Plugin;
@@ -143,16 +110,25 @@ const char* plugin_path_for(const std::string& version) {
   return version == "26.06" ? kNve2606Plugin : kNve2607Plugin;
 }
 
-RecsysNveInitPhase expected_phase_for(const std::string& version) {
-  return contract_for_version(version) == NveArtifactContract::kLegacyV1
-      ? RECSYS_NVE_INIT_BEFORE_AOTI
-      : RECSYS_NVE_INIT_AFTER_AOTI;
-}
-
 std::string dl_error_or_unknown() {
   const char* error = dlerror();
   return error == nullptr ? "unknown dynamic-loader error" : error;
 }
+
+void* required_symbol(void* handle, const char* name) {
+  dlerror();
+  void* symbol = dlsym(handle, name);
+  const char* error = dlerror();
+  if (error != nullptr || symbol == nullptr) {
+    throw std::runtime_error(
+        "NVE loader plugin is missing " + std::string(name) + ": " +
+        (error == nullptr ? "symbol not found" : error));
+  }
+  return symbol;
+}
+
+using CreateStateFn = decltype(&recsys_nve_loader_create_state);
+using DestroyStateFn = decltype(&recsys_nve_loader_destroy_state);
 
 }  // namespace
 
@@ -162,7 +138,7 @@ struct NveLoaderPlugin::Impl {
       throw std::runtime_error("NVE package directory must not be empty");
     }
 
-    selected_version = process_selected_version();
+    selected_version = selected_version_from_env();
     const auto runtime_contract = contract_for_version(selected_version);
     const auto required_contract = artifact_contract(package_dir);
     if (runtime_contract != required_contract) {
@@ -172,89 +148,31 @@ struct NveLoaderPlugin::Impl {
           contract_name(required_contract));
     }
 
-    plugin_path = plugin_path_for(selected_version);
+    const char* plugin_path = plugin_path_for(selected_version);
     dlerror();
-    int flags = RTLD_NOW | RTLD_LOCAL;
-#ifdef RTLD_NODELETE
-    flags |= RTLD_NODELETE;
-#endif
-    handle = dlopen(plugin_path.c_str(), flags);
+    void* handle = dlopen(plugin_path, RTLD_NOW | RTLD_LOCAL);
     if (handle == nullptr) {
       throw std::runtime_error(
           "Failed to load NVE " + selected_version + " plugin " + plugin_path +
           ": " + dl_error_or_unknown());
     }
+    // Do not dlclose: PyTorch retains operators registered by the plugin.
 
-    dlerror();
-    auto* symbol = dlsym(handle, "recsys_nve_loader_get_api_v1");
-    const char* symbol_error = dlerror();
-    if (symbol_error != nullptr || symbol == nullptr) {
-      throw std::runtime_error(
-          "NVE loader plugin is missing recsys_nve_loader_get_api_v1: " +
-          std::string(symbol_error == nullptr ? "symbol not found" : symbol_error));
-    }
-    auto getter = reinterpret_cast<RecsysNveLoaderGetApiV1>(symbol);
-    api = getter();
-    validate_api();
+    create_state_fn = reinterpret_cast<CreateStateFn>(
+        required_symbol(handle, "recsys_nve_loader_create_state"));
+    destroy_state_fn = reinterpret_cast<DestroyStateFn>(
+        required_symbol(handle, "recsys_nve_loader_destroy_state"));
   }
 
-  ~Impl() { destroy_state(); }
-
-  void validate_api() const {
-    if (api == nullptr) {
-      throw std::runtime_error("NVE loader plugin returned a null API table");
+  ~Impl() {
+    if (state != nullptr) {
+      destroy_state_fn(state);
     }
-    if (api->abi_version != RECSYS_NVE_LOADER_ABI_VERSION) {
-      throw std::runtime_error("NVE loader plugin ABI version mismatch");
-    }
-    if (api->struct_size < sizeof(RecsysNveLoaderApiV1)) {
-      throw std::runtime_error("NVE loader plugin API table is truncated");
-    }
-    if (api->nve_version == nullptr || selected_version != api->nve_version) {
-      throw std::runtime_error("NVE loader plugin claimed the wrong generation");
-    }
-    if (api->init_phase != expected_phase_for(selected_version)) {
-      throw std::runtime_error("NVE loader plugin claimed the wrong init phase");
-    }
-    if (api->prepare_native_ops == nullptr || api->create_state == nullptr ||
-        api->destroy_state == nullptr) {
-      throw std::runtime_error("NVE loader plugin API table is incomplete");
-    }
-  }
-
-  void prepare_native_ops() {
-    if (prepared) {
-      return;
-    }
-    std::array<char, 1024> error{};
-    if (api->prepare_native_ops(error.data(), error.size()) != 0) {
-      throw std::runtime_error(
-          error[0] == '\0' ? "NVE native-op preparation failed" : error.data());
-    }
-    prepared = true;
   }
 
   void create_state(void* loader, int device_index) {
-    if (!prepared) {
-      throw std::runtime_error(
-          "NVE native operators must be prepared before state creation");
-    }
-    if (state != nullptr) {
-      throw std::runtime_error("NVE loader state was already created");
-    }
-    const bool wants_loader = api->init_phase == RECSYS_NVE_INIT_AFTER_AOTI;
-    if (wants_loader != (loader != nullptr)) {
-      if (wants_loader) {
-        throw std::runtime_error(
-            "NVE " + selected_version + " state requires an AOTI loader");
-      }
-      throw std::runtime_error(
-          "NVE " + selected_version +
-          " state must be created before the AOTI loader");
-    }
-
     std::array<char, 1024> error{};
-    if (api->create_state(
+    if (create_state_fn(
             package_dir.c_str(),
             loader,
             device_index,
@@ -270,50 +188,29 @@ struct NveLoaderPlugin::Impl {
     }
   }
 
-  void destroy_state() noexcept {
-    if (state != nullptr && api != nullptr && api->destroy_state != nullptr) {
-      api->destroy_state(state);
-      state = nullptr;
-    }
-  }
-
   std::string package_dir;
   std::string selected_version;
-  std::string plugin_path;
-  void* handle = nullptr;  // Intentionally retained; never dlclose NVE operators.
-  const RecsysNveLoaderApiV1* api = nullptr;
+  CreateStateFn create_state_fn = nullptr;
+  DestroyStateFn destroy_state_fn = nullptr;
   void* state = nullptr;
-  bool prepared = false;
 };
 
 NveLoaderPlugin::NveLoaderPlugin(std::string package_dir)
     : impl_(std::make_unique<Impl>(std::move(package_dir))) {}
 
 NveLoaderPlugin::~NveLoaderPlugin() = default;
-NveLoaderPlugin::NveLoaderPlugin(NveLoaderPlugin&&) noexcept = default;
-NveLoaderPlugin& NveLoaderPlugin::operator=(NveLoaderPlugin&&) noexcept = default;
 
 const std::string& NveLoaderPlugin::selected_version() const noexcept {
   return impl_->selected_version;
 }
 
-RecsysNveInitPhase NveLoaderPlugin::init_phase() const noexcept {
-  return impl_->api->init_phase;
-}
-
-void NveLoaderPlugin::prepare_native_ops() {
-  impl_->prepare_native_ops();
+bool NveLoaderPlugin::requires_aoti_loader() const noexcept {
+  return impl_->selected_version != "26.05";
 }
 
 void NveLoaderPlugin::create_state(
     void* aoti_loader_or_null, int device_index) {
   impl_->create_state(aoti_loader_or_null, device_index);
-}
-
-void NveLoaderPlugin::destroy_state() noexcept {
-  if (impl_ != nullptr) {
-    impl_->destroy_state();
-  }
 }
 
 }  // namespace recsys::nve_loader
