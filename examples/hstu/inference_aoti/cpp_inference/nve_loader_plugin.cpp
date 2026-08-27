@@ -17,19 +17,34 @@
 
 #include <nlohmann/json.hpp>
 
+#if !defined(RECSYS_NVE_2605_PLUGIN_PATH) || \
+    !defined(RECSYS_NVE_2606_PLUGIN_PATH) || \
+    !defined(RECSYS_NVE_2607_PLUGIN_PATH)
+#error "CMake must provide all versioned NVE replay-plugin paths"
+#endif
+
 namespace recsys::nve_loader {
 namespace {
 
-constexpr const char* kNve2605Plugin =
-    "/opt/nve/26.05/replay/librecsys_nve_loader.so";
-constexpr const char* kNve2607Plugin =
-    "/opt/nve/26.07/replay/librecsys_nve_loader.so";
+constexpr const char* kNve2605Plugin = RECSYS_NVE_2605_PLUGIN_PATH;
+constexpr const char* kNve2606Plugin = RECSYS_NVE_2606_PLUGIN_PATH;
+constexpr const char* kNve2607Plugin = RECSYS_NVE_2607_PLUGIN_PATH;
+
+enum class NveArtifactContract {
+  kLegacyV1,
+  kSchemaV2,
+};
 
 [[noreturn]] void metadata_error(const std::string& detail) {
   throw std::runtime_error("NVE artifact metadata error: " + detail);
 }
 
-std::string classify_metadata(const nlohmann::json& metadata) {
+const char* contract_name(NveArtifactContract contract) {
+  return contract == NveArtifactContract::kLegacyV1 ? "legacy-v1"
+                                                    : "schema-v2";
+}
+
+NveArtifactContract classify_metadata(const nlohmann::json& metadata) {
   if (metadata.is_array()) {
     if (metadata.empty()) {
       metadata_error("legacy layer list is empty");
@@ -41,7 +56,7 @@ std::string classify_metadata(const nlohmann::json& metadata) {
             "legacy layers must contain cache_type and must not contain layer_type");
       }
     }
-    return "26.05";
+    return NveArtifactContract::kLegacyV1;
   }
 
   if (metadata.is_object()) {
@@ -66,13 +81,13 @@ std::string classify_metadata(const nlohmann::json& metadata) {
             "schema v2 layers must contain layer_type and must not contain cache_type");
       }
     }
-    return "26.07";
+    return NveArtifactContract::kSchemaV2;
   }
 
   metadata_error("expected a legacy array or schema-v2 object");
 }
 
-std::string artifact_generation(const std::string& package_dir) {
+NveArtifactContract artifact_contract(const std::string& package_dir) {
   const auto metadata_path =
       std::filesystem::path(package_dir) / "metadata.json";
   std::ifstream input(metadata_path);
@@ -88,35 +103,50 @@ std::string artifact_generation(const std::string& package_dir) {
   }
 }
 
-std::string selected_generation() {
+NveArtifactContract contract_for_version(const std::string& version) {
+  if (version == "26.05") {
+    return NveArtifactContract::kLegacyV1;
+  }
+  if (version == "26.06" || version == "26.07") {
+    return NveArtifactContract::kSchemaV2;
+  }
+  throw std::runtime_error("Unsupported NVE version=" + version);
+}
+
+std::string selected_version() {
   const char* value = std::getenv("NVE_VERSION");
   if (value == nullptr || value[0] == '\0') {
     throw std::runtime_error(
-        "NVE_VERSION must be set to exactly 26.05 or 26.07");
+        "NVE_VERSION must be set to exactly 26.05, 26.06, or 26.07");
   }
   const std::string selected(value);
-  if (selected != "26.05" && selected != "26.07") {
+  if (selected != "26.05" && selected != "26.06" &&
+      selected != "26.07") {
     throw std::runtime_error(
         "Unsupported NVE_VERSION=" + selected +
-        "; expected exactly 26.05 or 26.07");
+        "; expected exactly 26.05, 26.06, or 26.07");
   }
   return selected;
 }
 
-const std::string& process_selected_generation() {
+const std::string& process_selected_version() {
   // Function-local static initialization is thread-safe and deliberately
   // freezes NVE_VERSION at the first replay-manager construction.
-  static const std::string selected = selected_generation();
+  static const std::string selected = selected_version();
   return selected;
 }
 
-const char* plugin_path_for(const std::string& generation) {
-  return generation == "26.05" ? kNve2605Plugin : kNve2607Plugin;
+const char* plugin_path_for(const std::string& version) {
+  if (version == "26.05") {
+    return kNve2605Plugin;
+  }
+  return version == "26.06" ? kNve2606Plugin : kNve2607Plugin;
 }
 
-RecsysNveInitPhase expected_phase_for(const std::string& generation) {
-  return generation == "26.05" ? RECSYS_NVE_INIT_BEFORE_AOTI
-                               : RECSYS_NVE_INIT_AFTER_AOTI;
+RecsysNveInitPhase expected_phase_for(const std::string& version) {
+  return contract_for_version(version) == NveArtifactContract::kLegacyV1
+      ? RECSYS_NVE_INIT_BEFORE_AOTI
+      : RECSYS_NVE_INIT_AFTER_AOTI;
 }
 
 std::string dl_error_or_unknown() {
@@ -132,12 +162,14 @@ struct NveLoaderPlugin::Impl {
       throw std::runtime_error("NVE package directory must not be empty");
     }
 
-    selected_version = process_selected_generation();
-    const std::string required_version = artifact_generation(package_dir);
-    if (selected_version != required_version) {
+    selected_version = process_selected_version();
+    const auto runtime_contract = contract_for_version(selected_version);
+    const auto required_contract = artifact_contract(package_dir);
+    if (runtime_contract != required_contract) {
       throw std::runtime_error(
-          "NVE version mismatch: selected runtime " + selected_version +
-          ", artifact requires " + required_version);
+          "NVE contract mismatch: selected runtime " + selected_version +
+          " uses " + contract_name(runtime_contract) + ", artifact requires " +
+          contract_name(required_contract));
     }
 
     plugin_path = plugin_path_for(selected_version);
@@ -212,10 +244,13 @@ struct NveLoaderPlugin::Impl {
     }
     const bool wants_loader = api->init_phase == RECSYS_NVE_INIT_AFTER_AOTI;
     if (wants_loader != (loader != nullptr)) {
+      if (wants_loader) {
+        throw std::runtime_error(
+            "NVE " + selected_version + " state requires an AOTI loader");
+      }
       throw std::runtime_error(
-          wants_loader
-              ? "NVE 26.07 state requires an AOTI loader"
-              : "NVE 26.05 state must be created before the AOTI loader");
+          "NVE " + selected_version +
+          " state must be created before the AOTI loader");
     }
 
     std::array<char, 1024> error{};

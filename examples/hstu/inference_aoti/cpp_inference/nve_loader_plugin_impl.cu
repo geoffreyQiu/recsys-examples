@@ -16,8 +16,9 @@
 #include <string>
 
 #if !defined(RECSYS_NVE_GENERATION)
-#error "RECSYS_NVE_GENERATION must be 2605 or 2607"
-#elif RECSYS_NVE_GENERATION != 2605 && RECSYS_NVE_GENERATION != 2607
+#error "RECSYS_NVE_GENERATION must be 2605, 2606, or 2607"
+#elif RECSYS_NVE_GENERATION != 2605 && RECSYS_NVE_GENERATION != 2606 && \
+    RECSYS_NVE_GENERATION != 2607
 #error "Unsupported RECSYS_NVE_GENERATION"
 #endif
 
@@ -97,7 +98,11 @@ struct PluginState {
   std::shared_ptr<nve::ResourceDirectory> resources;
   std::unique_ptr<nve::LayerDirectory> layers;
 };
+#if RECSYS_NVE_GENERATION == 2606
+constexpr const char* kNveVersion = "26.06";
+#else
 constexpr const char* kNveVersion = "26.07";
+#endif
 constexpr RecsysNveInitPhase kInitPhase = RECSYS_NVE_INIT_AFTER_AOTI;
 #endif
 
@@ -141,7 +146,11 @@ int create_state(
         std::make_unique<nve::LayerDirectory>(package_dir, device_index);
 #else
     if (aoti_loader_or_null == nullptr) {
-      set_error(error, error_size, "NVE 26.07 state requires an AOTI loader");
+      set_error(
+          error,
+          error_size,
+          std::string("NVE ") + kNveVersion +
+              " state requires an AOTI loader");
       return 1;
     }
     auto* loader = static_cast<torch::inductor::AOTIModelPackageLoader*>(

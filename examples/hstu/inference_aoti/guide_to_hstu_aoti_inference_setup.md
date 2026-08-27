@@ -1,198 +1,346 @@
-# HSTU AOTI Dual-NVE Build and Loader Guide
+# HSTU KV-Cache AOTI End-to-End Build and Run Guide
 
-This guide describes how the development image builds and selects NVE 26.05
-and 26.07. The [AOTI README](./README.md) contains the complete copy-and-paste
-export, native replay, and Triton command sequences.
+This guide expands the quick workflow in [README.md](./README.md). It follows the current repo layout for exporting `hstu_gr_ranking_kvcache_model`, replaying `export_test_dump`, and serving the exported package with Triton Server.
 
-## Installed layout
+This end-to-end Triton workflow selects NVE 26.05 because the current model-init
+hook supports only its legacy artifact contract. Standalone Python export and
+native replay also support NVE 26.06 and 26.07 as described in the
+[README NVE section](./README.md#nve-support).
 
-The development image builds both pinned NVE source trees independently. NVE
-26.07 is copied from the parent repository's pinned
-`third_party/nv-embedding-cache` submodule, while NVE 26.05 is cloned at its
-pinned commit inside the Docker build:
+## Build
 
-```text
-/workspace/deps/nve-26.05
-/workspace/deps/nve-26.07
-/workspace/deps/NVTX
-/workspace/deps/nlohmann-json
-```
+### Step 1: Build and Install Custom Ops Used by HSTU Inference
 
-The Python packages and native libraries are installed under separate roots:
+The HSTU model inference relies on these custom torch ops:
 
-```text
-/opt/nve/26.05/python/pynve
-/opt/nve/26.07/python/pynve
-```
+1. DynamicEmb inference ops
+2. HSTU runtime ops from the C++ demo build
+3. Paged KV-cache ops from `examples/commons`
+4. FBGEMM shared libraries
+5. KV-cache manager ops from `corelib/recsys_kvcache_manager`
 
-Both builds use NVE's upstream default features, including
-`libnve-plugin-nvhm.so`, so normal hierarchical HSTU inference can construct
-its default `NVEParameterServer` backend. There is no unversioned `pynve`
-package in the development image and neither NVE library directory appears in
-the global `LD_LIBRARY_PATH` or `LD_PRELOAD`.
-
-The image default is:
-
-```text
-PYTHONPATH=/opt/nve/26.07/python:/workspace/recsys-examples/examples:/workspace/recsys-examples/examples/hstu
-```
-
-Selecting 26.05 replaces that value for a fresh Python process:
+The Python package variants are built and installed by `docker/Dockerfile`. The commands below show the AOTI-oriented torch binding builds that are also performed by the Docker image.
 
 ```bash
-PYTHONPATH=/opt/nve/26.05/python:/workspace/recsys-examples/examples:/workspace/recsys-examples/examples/hstu python3 ...
+# DynamicEmb ops
+cd ${REPO}/corelib/dynamicemb
+mkdir -p torch_binding_build && cd torch_binding_build
+cmake .. && make -j
+
+# KV-cache manager ops
+cd ${REPO}/corelib/recsys_kvcache_manager/
+mkdir -p build && cd build
+cmake .. && make -j
 ```
 
-The two `/workspace/recsys-examples` entries are code roots, not NVE
-installations. Version selection still comes from exactly one `/opt/nve` root.
+The HSTU runtime op and paged KV-cache ops from `examples/commons` are built in `inference_aoti/cpp_inference` together with the C++ replay executables in step 3.
 
-Appending `/opt/nve/26.05/python` to the image's inherited `PYTHONPATH` is not
-supported because it leaves both generations visible and makes import order
-the selector.
+Expected outputs:
 
-## Python constructor and export compatibility
+```text
+${REPO}/corelib/dynamicemb/torch_binding_build/inference_emb_ops.so
+${REPO}/corelib/recsys_kvcache_manager/build/kvcache_manager_ops.so
+```
 
-The source maps the two constructor APIs as follows:
+### Step 2: Run Python Export for KV-Cache AOTI
 
-| Logical layer | NVE 26.05 | NVE 26.07 |
-| --- | --- | --- |
-| GPU-only | `cache_type=CacheType.NoCache` | `layer_type=LayerType.GPULayer` |
-| Linear UVM | `cache_type=CacheType.LinearUVM` | `layer_type=LayerType.LinearUVM` |
-| Hierarchical | `cache_type=CacheType.Hierarchical`, `remote_interface=...` | `layer_type=LayerType.Hierarchical`, `storage=...` |
-
-NVE 26.05 and 26.07 also expose incompatible
-`nve_ops::embedding_lookup` schemas. HSTU imports NVE first and installs its
-dynamic-size two-argument fake with `allow_override=True` only under 26.05.
-Under 26.07, HSTU performs no duplicate registration and retains NVE's native
-four-argument fake.
-
-Both exporters call the selected package's `export_aot`. Reload is routed
-through `nve_aoti_compat.py`:
-
-1. Parse `<package>/metadata.json`.
-2. Classify only an unambiguous 26.05 legacy shape or 26.07 schema-v2 shape.
-3. Compare it with the imported `pynve` generation.
-4. For 26.05, recreate/register legacy layers and then construct the ordinary
-   AOTI package loader.
-5. For 26.07, call NVE's marker-aware `load_aot`.
-6. Keep loaded layers alive and normalize the runner result to a tensor list.
-7. Release the AOTI loader before releasing its NVE layers.
-
-## Native replay build
-
-The Docker build configures the native targets with exact versioned roots:
+Run the export workflow from the HSTU directory:
 
 ```bash
 set -euo pipefail
-cd /workspace/recsys-examples
+cd "${HSTU_DIR}"
 
+export NVE_INSTALL_ROOT=/opt/nve
+export NVE_VERSION=26.05
+export PYTHONPATH="${NVE_INSTALL_ROOT}/${NVE_VERSION}/python:${REPO}/examples:${HSTU_DIR}"
+export DYNAMICEMB_OPS_LIB_DIR="${REPO}/corelib/dynamicemb/torch_binding_build"
+export KVCACHE_MANAGER_CONFIG_FILE="${KVCACHE_CONFIG}"
+
+python3 inference_aoti/export_inference_gr_ranking_kvcache.py \
+  --gin_config_file "${GIN}" \
+  --checkpoint_dir "${CKPT}" \
+  --max_bs 2 \
+  --kvcache_config_file "${KVCACHE_MANAGER_CONFIG_FILE}"
+```
+
+`KVCACHE_MANAGER_CONFIG_FILE` must be set before Python starts because the fake
+KV-cache ops used by `torch.export` read the YAML config during module import.
+
+This step performs all of the following:
+
+1. Builds the exportable model wrapper for KV-cache inference
+2. Exports the model through `torch.export`
+3. Produces the packaged KV-cache AOTI archive under `inference_aoti/hstu_gr_ranking_kvcache_model/`
+4. Produces replay tensors under `inference_aoti/export_test_dump/`
+
+
+### Step 3: Build the C++ Replay Executable
+
+```bash
+set -euo pipefail
+
+export PATH=/usr/local/cuda/bin:${PATH}
+export NVE_INSTALL_ROOT=/opt/nve
 export CMAKE_PREFIX_PATH="$(python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "share", "cmake"))')"
 
-cmake -S ./examples/hstu/inference_aoti/cpp_inference \
-  -B ./examples/hstu/inference_aoti/cpp_inference/build \
-  -DNVE_2605_ROOT=/workspace/deps/nve-26.05 \
-  -DNVE_2607_ROOT=/workspace/deps/nve-26.07 \
-  -DNVE_2605_LIB_DIR=/opt/nve/26.05/python/pynve \
-  -DNVE_2607_LIB_DIR=/opt/nve/26.07/python/pynve \
-  -DNVTX_INCLUDE_DIR=/workspace/deps/NVTX/c/include \
-  -DNLOHMANN_JSON_ROOT=/workspace/deps/nlohmann-json
-
-cmake --build ./examples/hstu/inference_aoti/cpp_inference/build -j 8
-cmake --install ./examples/hstu/inference_aoti/cpp_inference/build
+cmake -S "${HSTU_DIR}/inference_aoti/cpp_inference" \
+  -B "${HSTU_DIR}/inference_aoti/cpp_inference/build" \
+  -DNVE_INSTALL_ROOT="${NVE_INSTALL_ROOT}"
+cmake --build "${HSTU_DIR}/inference_aoti/cpp_inference/build" -j 8
+cmake --install "${HSTU_DIR}/inference_aoti/cpp_inference/build"
 ```
 
-This produces two NVE-independent workflow executables:
+Expected outputs:
+
+1. `examples/hstu/inference_aoti/cpp_inference/build/inference_hstu_gr_ranking_kvcache_exported_model`
+2. `examples/hstu/inference_aoti/cpp_inference/build/libhstu_cuda_ops_runtime.so`
+3. `examples/hstu/inference_aoti/cpp_inference/build/libpaged_kvcache_ops_runtime.so`
+4. `/opt/nve/26.05/replay/librecsys_nve_loader.so`
+5. `/opt/nve/26.07/replay/librecsys_nve_loader.so`
+
+
+### Step 4: Verify with the C++ AOTI Replay
+
+#### Step 4.1: Start the FlexKV Runtime Service
+
+The C++ replay executable demonstrates a deployment scenario where the KV-cache server is separate from the inference process. Configure the runtime in `inference_aoti/kvcache_cpp_runtime.yaml`, then start the FlexKV server:
+
+```bash
+cd ${HSTU_DIR}
+export FLEXKV_LOG_LEVEL=WARNING
+export KVCACHE_MANAGER_CONFIG_FILE=${KVCACHE_CONFIG}
+python3 inference_aoti/start_flexkv_server_for_kvcache_cpp.py --config_file ${KVCACHE_MANAGER_CONFIG_FILE} > kv.log 2>&1 &
+```
+
+#### Step 4.2: Run the C++ Replay Verification
+
+Run the replay executable against the exported package and dumped tensors:
+
+```bash
+NVE_VERSION=26.05 \
+  ${HSTU_DIR}/inference_aoti/cpp_inference/build/inference_hstu_gr_ranking_kvcache_exported_model \
+  ${HSTU_DIR}/inference_aoti/hstu_gr_ranking_kvcache_model \
+  ${HSTU_DIR}/inference_aoti/export_test_dump
+```
+
+The executable will:
+
+1. Load NVE metadata and weights
+2. Load the packaged AOTI model
+3. Replay each dumped batch
+4. Compare C++ outputs against exported reference tensors
+5. Report `max_abs_diff` for each batch
+
+### Step 5: Triton Server Demo for the KV-Cache AOTI Model
+
+This section shows how to deploy the exported AOTI model with Triton Server. It has four major parts:
+
+1. Build the PyTorch backend with the model-init hook required by NVE layer loading.
+2. Set up the Triton Server runtime dependencies.
+3. Stage the exported AOTI model.
+4. Launch Triton with the exported model, custom operator libraries, and FlexKV runtime.
+
+The Triton image, staged NVE libraries, and model-init hook in this section are
+all fixed to NVE 26.05.
+
+
+#### Step 5.1: Build the Modified Triton PyTorch Backend
+
+If your environment requires the modified backend described in the local guidebook, build it first.
+
+In the nvidia pytorch container:
+
+```bash
+## pytorch backend with model init hook support ##
+python3 -m pip install --upgrade "cmake>=3.31.8"
+cp /usr/local/lib/libjpeg.so.62 /usr/local/lib/python3.12/dist-packages/torch/lib/libjpeg.so.62
+
+git clone git@github.com:triton-inference-server/pytorch_backend.git
+cd pytorch_backend && git checkout ceeecb7
+mkdir -p build && cd build
+cmake \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX:PATH="$PWD/install" \
+  -DTRITON_PYTORCH_INCLUDE_PATHS="/usr/local/lib/python3.12/dist-packages/torch/include;/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include;/opt/pytorch/vision/torchvision/csrc" \
+  -DTRITON_PYTORCH_LIB_PATHS="/usr/local/lib/python3.12/dist-packages/torch/lib" \
+  -DTRITON_PYTORCH_ENABLE_TORCHVISION=OFF \
+  -DTRITON_BACKEND_REPO_TAG=r26.06 \
+  -DTRITON_CORE_REPO_TAG=r26.06 \
+  -DTRITON_COMMON_REPO_TAG=r26.06 \
+  ..
+cmake --build . -j"$(nproc)" --target install
+
+
+## nve init hook (nve layer loader) used by HSTU aoti model ##
+cd ${HSTU_DIR}/inference_aoti/nve_init_hook
+cmake -S . -B build \
+  -DNVE_ROOT=/workspace/deps/nve-26.05 \
+  -DNVE_LIB_DIR=/opt/nve/26.05/python/pynve
+cmake --build build -j 8
+```
+
+Expected backend output:
 
 ```text
-examples/hstu/inference_aoti/cpp_inference/build/inference_hstu_gr_ranking_exported_model
-examples/hstu/inference_aoti/cpp_inference/build/inference_hstu_gr_ranking_kvcache_exported_model
+${PYTORCH_BACKEND}/build/install/backends/pytorch
+${HSTU_DIR}/inference_aoti/nve_init_hook/build/libnve_init_hook.so
 ```
 
-It also compiles one CUDA adapter source twice and installs two plugins:
+#### Step 5.2: Setup the Triton Server Container
+
+Copy the previously built `libtriton_pytorch.so` into the container, or mount the PyTorch backend install directory into the container.
+
+On the host:
+
+```bash
+docker run --rm -it \
+  --gpus all \
+  --ipc=host \
+  --network=host \
+  --shm-size=8G \
+  -p 8000:8000 -p 8001:8001 -p 8002:8002 \
+  --tmpfs /tmp:exec \
+  --name triton_hstu \
+  nvcr.io/nvidia/tritonserver:26.06-py3
+```
+
+Inside the triton server runtime container:
+
+```bash
+cp ${PYTORCH_BACKEND}/build/install/backends/pytorch/libtriton_pytorch.so \
+  /opt/tritonserver/backends/pytorch/libtriton_pytorch.so
+```
+
+Install runtime dependencies expected by the HSTU KV-cache demo path. PyTorch is required by FlexKV.
+
+```bash
+apt-get update -y --fix-missing
+apt-get install -y libzmq3-dev liburing-dev libxxhash-dev libssl-dev
+apt-get install -y cmake patchelf
+pip3 install pandas rich cloudpickle psutil cython
+pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
+pip3 install 'tritonclient[all]'
+```
+
+### Step 5.3: Stage the Exported Model and Libraries for Triton Server
+
+After completing the export flow from Step 2, copy the generated AOTI package into the versioned Triton model directory:
+
+```bash
+cd ${HSTU_DIR}
+rm -rf inference_aoti/triton_aoti/hstu_gr_ranking_kvcache/1/
+cp -apr inference_aoti/hstu_gr_ranking_kvcache_model inference_aoti/triton_aoti/hstu_gr_ranking_kvcache/1
+```
+
+This layout is required because Triton expects a versioned model directory under the repository.
+
+The Triton model config must remain aligned with the export contract.
+If the export wrapper changes its output contract, update the Triton model config ([triton_aoti/hstu_gr_ranking_kvcache/config.pbtxt](./triton_aoti/hstu_gr_ranking_kvcache/config.pbtxt)) accordingly.
+
+The HSTU AOTI model also expects the following runtime libraries to be visible through `LD_LIBRARY_PATH` and `LD_PRELOAD`:
+
 
 ```text
-/opt/nve/26.05/replay/librecsys_nve_loader.so
-/opt/nve/26.07/replay/librecsys_nve_loader.so
+${HSTU_DIR}/triton_libs
+├─── libhstu_cuda_ops_runtime.so
+├─── libpaged_kvcache_ops_runtime.so
+├─── emb
+│    └─── inference_emb_ops.so
+├─── recsys_kvcache_manager
+│    └─── kvcache_manager_ops.so
+├─── hstu_attn
+│    └─── fbgemm_gpu_experimental_hstu.so
+├─── fbgemm_gpu
+│    ├─── fbgemm_gpu_py.so
+│    ├─── fbgemm_gpu_sparse_async_cumsum.so
+│    └─── ...
+├─── pynve
+│    ├─── libnve-common.so
+│    └─── libnve-torch-ops.so
+├─── lib/...
+└─── ...
 ```
 
-The executable and its main-side manager include no NVE headers and have no
-NVE `DT_NEEDED` entry. The manager accepts only `NVE_VERSION=26.05` or
-`NVE_VERSION=26.07`; an environment value cannot name an arbitrary DSO. Each
-plugin has a relative RUNPATH to its matching `../python/pynve` directory.
+Example LD_PRELOAD value:
 
-## Native lifecycle
-
-Native-op registration and generation-specific layer-state construction are
-separate phases:
-
-| Step | NVE 26.05 | NVE 26.07 |
-| --- | --- | --- |
-| Validate | Check `NVE_VERSION` and legacy metadata | Check `NVE_VERSION` and schema-v2 metadata |
-| Load | `dlopen` 26.05 plugin and prepare native ops | `dlopen` 26.07 plugin and prepare native ops |
-| Before AOTI | Construct legacy `LayerDirectory(package, device)` | No layer state yet |
-| AOTI | Construct `AOTIModelPackageLoader` | Construct `AOTIModelPackageLoader` after native ops are registered |
-| After AOTI | Replay | Construct marker-aware `LayerDirectory(package, loader, device, resources)`, then replay |
-| Shutdown | Destroy AOTI loader, then layer state | Destroy AOTI loader, then marker/resource state |
-
-The selected plugin and its registered operator libraries remain resident
-until process termination. In-process version switching and `dlclose` after
-operator registration are unsupported.
-
-## Exact scenario matrix
-
-The four exporter/replayer pairs use these fixed selectors and paths. Each
-exporter command also requires the common Gin/checkpoint arguments shown in
-the [README export section](./README.md#export-all-four-python-scenarios).
-
-| Scenario | Export selector and output arguments | Replay selector and positional arguments |
-| --- | --- | --- |
-| 26.05 non-KV | `PYTHONPATH=/opt/nve/26.05/python:/workspace/recsys-examples/examples:/workspace/recsys-examples/examples/hstu`, `--export_dir /exported_hstu_model/nve-26.05/non-kv/model`, `--dump_dir /exported_hstu_model/nve-26.05/non-kv/replay` | `NVE_VERSION=26.05`, package `/exported_hstu_model/nve-26.05/non-kv/model`, dump `/exported_hstu_model/nve-26.05/non-kv/replay` |
-| 26.07 non-KV | `PYTHONPATH=/opt/nve/26.07/python:/workspace/recsys-examples/examples:/workspace/recsys-examples/examples/hstu`, `--export_dir /exported_hstu_model/nve-26.07/non-kv/model`, `--dump_dir /exported_hstu_model/nve-26.07/non-kv/replay` | `NVE_VERSION=26.07`, package `/exported_hstu_model/nve-26.07/non-kv/model`, dump `/exported_hstu_model/nve-26.07/non-kv/replay` |
-| 26.05 KV-cache | `PYTHONPATH=/opt/nve/26.05/python:/workspace/recsys-examples/examples:/workspace/recsys-examples/examples/hstu`, `--export_dir /exported_hstu_model/nve-26.05/kv-cache/model`, `--dump_dir /exported_hstu_model/nve-26.05/kv-cache/replay` | `NVE_VERSION=26.05`, package `/exported_hstu_model/nve-26.05/kv-cache/model`, dump `/exported_hstu_model/nve-26.05/kv-cache/replay` |
-| 26.07 KV-cache | `PYTHONPATH=/opt/nve/26.07/python:/workspace/recsys-examples/examples:/workspace/recsys-examples/examples/hstu`, `--export_dir /exported_hstu_model/nve-26.07/kv-cache/model`, `--dump_dir /exported_hstu_model/nve-26.07/kv-cache/replay` | `NVE_VERSION=26.07`, package `/exported_hstu_model/nve-26.07/kv-cache/model`, dump `/exported_hstu_model/nve-26.07/kv-cache/replay` |
-
-KV-cache replay additionally requires the FlexKV service configured by:
-
-```text
-/workspace/recsys-examples/examples/hstu/inference_aoti/kvcache_cpp_runtime.yaml
+```bash
+TRITON_LIBS=${HSTU_DIR}/triton_libs
+LD_PRELOAD="$TRITON_LIBS/pynve/libnve-common.so:$TRITON_LIBS/pynve/libnve-torch-ops.so:$TRITON_LIBS/emb/inference_emb_ops.so:$TRITON_LIBS/recsys_kvcache_manager/kvcache_manager_ops.so:$TRITON_LIBS/libhstu_cuda_ops_runtime.so:$TRITON_LIBS/libpaged_kvcache_ops_runtime.so:$TRITON_LIBS/hstu_attn/fbgemm_gpu_experimental_hstu.so:$TRITON_LIBS/fbgemm_gpu/fbgemm_gpu_py.so:$TRITON_LIBS/fbgemm_gpu/fbgemm_gpu_sparse_async_cumsum.so"
 ```
 
-## Triton is fixed to NVE 26.05
+The libraries are gathered from the NVIDIA PyTorch container used in steps 1-4:
 
-The Docker build compiles the unchanged init hook with:
+1. `emb/inference_emb_ops.so`: from `${REPO}/corelib/dynamicemb/torch_binding_build`
+2. `recsys_kvcache_manager/kvcache_manager_ops.so`: from `${REPO}/corelib/recsys_kvcache_manager/build` or the installed `recsys_kvcache_manager` package
+3. `fbgemm_gpu/`: from `/usr/local/lib/python3.12/dist-packages/fbgemm_gpu/`
+4. `hstu_attn/`: from `/usr/local/lib/python3.12/dist-packages/hstu/`
+5. `pynve/`: from `/opt/nve/26.05/python/pynve/`
+6. `libhstu_cuda_ops_runtime.so`: from `${HSTU_DIR}/inference_aoti/cpp_inference/build`
+7. `libpaged_kvcache_ops_runtime.so`: from `${HSTU_DIR}/inference_aoti/cpp_inference/build`
+8. `libpng16.so.16`: from `/usr/lib/x86_64-linux-gnu/`
+9. `lib/`: from `/usr/local/lib/`
 
-```text
-NVE_ROOT=/workspace/deps/nve-26.05
-NVE_LIB_DIR=/opt/nve/26.05/python/pynve
+Before launching Triton, verify the expected critical files exist:
+
+```bash
+export TRITON_LIBS=${HSTU_DIR}/triton_libs
+
+test -f ${TRITON_LIBS}/emb/inference_emb_ops.so
+test -f ${TRITON_LIBS}/recsys_kvcache_manager/kvcache_manager_ops.so
+test -f ${TRITON_LIBS}/libhstu_cuda_ops_runtime.so
+test -f ${TRITON_LIBS}/libpaged_kvcache_ops_runtime.so
+test -f ${TRITON_LIBS}/hstu_attn/fbgemm_gpu_experimental_hstu.so
+test -f ${TRITON_LIBS}/fbgemm_gpu/fbgemm_gpu_py.so
+test -f ${TRITON_LIBS}/fbgemm_gpu/fbgemm_gpu_sparse_async_cumsum.so
+test -f ${TRITON_LIBS}/pynve/libnve-common.so
+test -f ${TRITON_LIBS}/pynve/libnve-torch-ops.so
 ```
 
-`docker/Dockerfile.tritonserver` copies that 26.05 source to the existing
-`/workspace/deps/nve` runtime location, copies the 26.05 package to global
-`site-packages/pynve`, and populates `examples/hstu/triton_libs/pynve` from
-26.05 only. It does not copy the 26.07 prefix or submodule source tree.
+### Step 5.4: Triton Server AOTI Model Test
 
-The two supported Triton demos are:
+The Triton model uses the same KV-cache runtime contract as the native replay executable.
 
-| Workflow | Artifact | Model | Client selector |
-| --- | --- | --- | --- |
-| Non-KV | `/exported_hstu_model/nve-26.05/non-kv/model` | `hstu_gr_ranking` | `--workflow non-kv` |
-| KV-cache | `/exported_hstu_model/nve-26.05/kv-cache/model` | `hstu_gr_ranking_kvcache` | `--workflow kv-cache` |
+Start the FlexKV server runtime in background:
 
-Use the complete server and client commands in the
-[README Triton section](./README.md#run-the-2605-only-triton-demos). NVE 26.07
-cannot use the current hook because marker rebinding needs an AOTI loader that
-does not exist when the backend calls the hook.
-
-## Expected failures
-
-The Python compatibility loader and native manager fail with a concise error
-for missing, empty, mixed, or unsupported metadata. A cross-generation load
-uses this form:
-
-```text
-NVE version mismatch: selected runtime 26.07, artifact requires 26.05
+```bash
+cd ${HSTU_DIR}
+export FLEXKV_LOG_LEVEL=WARNING
+export KVCACHE_MANAGER_CONFIG_FILE=${KVCACHE_CONFIG}
+python3 inference_aoti/start_flexkv_server_for_kvcache_cpp.py --config_file ${KVCACHE_MANAGER_CONFIG_FILE} > kvcache_server.log 2>&1 &
 ```
 
-Native replay also fails before state construction for a missing/unsupported
-`NVE_VERSION`, plugin ABI or structure mismatch, wrong claimed generation,
-wrong init phase, or incomplete function table.
+Check `kvcache_server.log` for the status.
+
+Setup `LD_PRELOAD` and `LD_LIBRARY_PATH` to ensure the required custom ops and runtime libraries are visible to Triton, and start the Triton Server in background:
+
+```bash
+cd ${HSTU_DIR}
+rm -f triton_server.log
+export TRITON_LIBS=${HSTU_DIR}/triton_libs
+
+LD_PRELOAD="$TRITON_LIBS/pynve/libnve-common.so:$TRITON_LIBS/pynve/libnve-torch-ops.so:$TRITON_LIBS/emb/inference_emb_ops.so:$TRITON_LIBS/recsys_kvcache_manager/kvcache_manager_ops.so:$TRITON_LIBS/libhstu_cuda_ops_runtime.so:$TRITON_LIBS/libpaged_kvcache_ops_runtime.so:$TRITON_LIBS/hstu_attn/fbgemm_gpu_experimental_hstu.so:$TRITON_LIBS/fbgemm_gpu/fbgemm_gpu_py.so:$TRITON_LIBS/fbgemm_gpu/fbgemm_gpu_sparse_async_cumsum.so" \
+LD_LIBRARY_PATH="/usr/local/cuda/compat/lib.real:/opt/hpcx/ucc/lib/:/opt/hpcx/ucx/lib/:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/lib/python3.12/dist-packages/torch/lib/:$TRITON_LIBS/fbgemm_gpu/:$TRITON_LIBS/lib:$TRITON_LIBS" \
+tritonserver --model-repository=${HSTU_DIR}/inference_aoti/triton_aoti/ > triton_server.log 2>&1 &
+```
+
+Check `triton_server.log` for the status.
+
+Run the request replay client against the dumped tensors:
+
+```bash
+cd ${HSTU_DIR}
+python3 inference_aoti/test_tritonserver_aoti_hstu_model.py \
+  --workflow kv-cache \
+  --dump_dir inference_aoti/export_test_dump \
+  --url localhost:8000 \
+  --model_name hstu_gr_ranking_kvcache \
+  --batch_size 2
+```
+
+This request path validates that:
+
+1. Triton can load the exported AOTI package
+2. the NVE model-init hook is working
+3. the custom operator libraries are visible
+4. the KV-cache runtime service is reachable
+5. the model input/output contract matches the dumped replay data
