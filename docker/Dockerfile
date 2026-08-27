@@ -323,8 +323,9 @@ RUN set -eux; \
     test -f /opt/nve/26.07/python/pynve/libnve-plugin-nvhm.so;
 
 # The development image selects 26.07 by default. Commands selecting 26.05
-# replace this value rather than appending to it.
-ENV PYTHONPATH=/opt/nve/26.07/python:/workspace/recsys-examples/examples:/workspace/recsys-examples/examples/hstu
+# replace this value rather than appending to it. Keep "." ahead of the HSTU
+# path so sibling examples resolve their own local modules.
+ENV PYTHONPATH=/opt/nve/26.07/python:.:/workspace/recsys-examples/examples:/workspace/recsys-examples/examples/hstu
 
 # Install fbgemm_gpu_hstu (package: fbgemm_gpu_hstu, import: hstu) from submodule.
 COPY third_party/FBGEMM /workspace/deps/fbgemm_hstu
