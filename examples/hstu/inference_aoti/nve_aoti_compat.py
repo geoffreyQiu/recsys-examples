@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 from typing import Any, Sequence
 
+from modules.nve_compat import imported_nve_generation
+
 
 class NveCompatibilityError(RuntimeError):
     """Raised when an NVE runtime or artifact has an unsupported contract."""
@@ -17,6 +19,10 @@ class NveCompatibilityError(RuntimeError):
 
 class OutputDirectoryError(RuntimeError):
     """Raised when exporter output paths could merge or overwrite data."""
+
+
+_LEGACY_ARTIFACT_CONTRACT = "legacy-v1"
+_SCHEMA_V2_ARTIFACT_CONTRACT = "schema-v2"
 
 
 def prepare_output_directories(
@@ -69,7 +75,7 @@ def _classify_metadata(metadata: Any) -> str:
                     "NVE artifact metadata error: legacy layers must contain "
                     "cache_type and must not contain layer_type"
                 )
-        return "26.05"
+        return _LEGACY_ARTIFACT_CONTRACT
 
     if isinstance(metadata, dict):
         version = metadata.get("version")
@@ -100,14 +106,14 @@ def _classify_metadata(metadata: Any) -> str:
                     "NVE artifact metadata error: schema v2 layers must contain "
                     "layer_type and must not contain cache_type"
                 )
-        return "26.07"
+        return _SCHEMA_V2_ARTIFACT_CONTRACT
 
     raise NveCompatibilityError(
         "NVE artifact metadata error: expected a legacy array or schema-v2 object"
     )
 
 
-def _artifact_generation(package_dir: str | os.PathLike[str]) -> str:
+def _artifact_contract(package_dir: str | os.PathLike[str]) -> str:
     metadata_path = Path(package_dir) / "metadata.json"
     try:
         with metadata_path.open(encoding="utf-8") as metadata_file:
@@ -123,34 +129,21 @@ def _artifact_generation(package_dir: str | os.PathLike[str]) -> str:
     return _classify_metadata(metadata)
 
 
-def _runtime_generation() -> str:
-    import pynve
-
-    version = str(getattr(pynve, "__version__", "unknown"))
-    generation = next(
-        (
-            candidate
-            for candidate in ("26.05", "26.07")
-            if version == candidate or version.startswith(f"{candidate}.")
-        ),
-        None,
+def _runtime_contract(generation: str) -> str:
+    if generation == "26.05":
+        return _LEGACY_ARTIFACT_CONTRACT
+    if generation in {"26.06", "26.07"}:
+        return _SCHEMA_V2_ARTIFACT_CONTRACT
+    raise NveCompatibilityError(
+        f"Unsupported NVE runtime generation {generation!r}"
     )
-    if generation is None:
-        raise NveCompatibilityError(
-            f"Unsupported pynve version {version!r}; expected 26.05.x or 26.07.x"
-        )
 
-    package_file = getattr(pynve, "__file__", None)
-    if package_file is None:
-        raise NveCompatibilityError("The imported pynve package has no __file__")
-    resolved_file = Path(package_file).resolve()
-    expected_prefix = Path(f"/opt/nve/{generation}/python").resolve()
-    if not resolved_file.is_relative_to(expected_prefix):
-        raise NveCompatibilityError(
-            f"pynve {version} was imported from {resolved_file}; expected it below "
-            f"{expected_prefix}"
-        )
-    return generation
+
+def _runtime_generation() -> str:
+    try:
+        return imported_nve_generation()
+    except RuntimeError as error:
+        raise NveCompatibilityError(str(error)) from error
 
 
 def _normalize_outputs(outputs: Any) -> list["torch.Tensor"]:
@@ -213,17 +206,19 @@ def load_aoti(
     package_dir: str | os.PathLike[str],
     device: "torch.device",
 ) -> AotiSession:
-    """Load an AOTI package only with its matching selected NVE runtime."""
+    """Load an AOTI package only with a contract-compatible NVE runtime."""
     package_dir = os.fspath(package_dir)
-    artifact_generation = _artifact_generation(package_dir)
+    artifact_contract = _artifact_contract(package_dir)
     runtime_generation = _runtime_generation()
-    if runtime_generation != artifact_generation:
+    runtime_contract = _runtime_contract(runtime_generation)
+    if runtime_contract != artifact_contract:
         raise NveCompatibilityError(
-            "NVE version mismatch: selected runtime "
-            f"{runtime_generation}, artifact requires {artifact_generation}"
+            "NVE contract mismatch: selected runtime "
+            f"{runtime_generation} uses {runtime_contract}, artifact requires "
+            f"{artifact_contract}"
         )
 
-    if runtime_generation == "26.07":
+    if runtime_contract == _SCHEMA_V2_ARTIFACT_CONTRACT:
         from pynve.torch.nve_export import load_aot
 
         loader, layers = load_aot(package_dir, device=device)

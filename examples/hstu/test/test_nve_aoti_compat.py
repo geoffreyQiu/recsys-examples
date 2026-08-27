@@ -43,12 +43,15 @@ def _write_metadata(directory: Path, metadata) -> None:
 
 @pytest.mark.parametrize(
     ("metadata", "expected"),
-    [(LEGACY_METADATA, "26.05"), (SCHEMA_V2_METADATA, "26.07")],
+    [
+        (LEGACY_METADATA, "legacy-v1"),
+        (SCHEMA_V2_METADATA, "schema-v2"),
+    ],
 )
-def test_artifact_generation(tmp_path: Path, metadata, expected: str) -> None:
+def test_artifact_contract(tmp_path: Path, metadata, expected: str) -> None:
     package_dir = tmp_path / expected
     _write_metadata(package_dir, metadata)
-    assert nve_aoti_compat._artifact_generation(package_dir) == expected
+    assert nve_aoti_compat._artifact_contract(package_dir) == expected
 
 
 @pytest.mark.parametrize(
@@ -77,7 +80,7 @@ def test_invalid_metadata_is_rejected(tmp_path: Path, metadata) -> None:
         nve_aoti_compat.NveCompatibilityError,
         match="NVE artifact metadata error",
     ):
-        nve_aoti_compat._artifact_generation(package_dir)
+        nve_aoti_compat._artifact_contract(package_dir)
 
 
 def test_missing_metadata_is_rejected(tmp_path: Path) -> None:
@@ -85,7 +88,19 @@ def test_missing_metadata_is_rejected(tmp_path: Path) -> None:
         nve_aoti_compat.NveCompatibilityError,
         match="missing .*metadata.json",
     ):
-        nve_aoti_compat._artifact_generation(tmp_path)
+        nve_aoti_compat._artifact_contract(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("generation", "expected"),
+    [
+        ("26.05", "legacy-v1"),
+        ("26.06", "schema-v2"),
+        ("26.07", "schema-v2"),
+    ],
+)
+def test_runtime_contract(generation: str, expected: str) -> None:
+    assert nve_aoti_compat._runtime_contract(generation) == expected
 
 
 def test_output_directories_are_created_only_after_both_validate(
@@ -136,8 +151,8 @@ def test_runtime_artifact_mismatch_fails_before_loading(
     with pytest.raises(
         nve_aoti_compat.NveCompatibilityError,
         match=(
-            "NVE version mismatch: selected runtime 26.07, "
-            "artifact requires 26.05"
+            "NVE contract mismatch: selected runtime 26.07 uses schema-v2, "
+            "artifact requires legacy-v1"
         ),
     ):
         nve_aoti_compat.load_aoti(package_dir, torch.device("cuda", 0))

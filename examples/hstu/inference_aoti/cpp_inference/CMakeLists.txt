@@ -5,16 +5,26 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_PREFIX_PATH "${CMAKE_PREFIX_PATH};$ENV{Torch_DIR}")
 
+set(NVE_INSTALL_ROOT "/opt/nve"
+    CACHE PATH "Root containing versioned NVE runtime installations")
 set(NVE_2605_ROOT "/workspace/deps/nve-26.05"
     CACHE PATH "NVE 26.05 source tree")
+set(NVE_2606_ROOT "/workspace/deps/nve-26.06"
+    CACHE PATH "Optional NVE 26.06 source tree")
 set(NVE_2607_ROOT "/workspace/deps/nve-26.07"
     CACHE PATH "NVE 26.07 source tree")
-set(NVE_2605_LIB_DIR "/opt/nve/26.05/python/pynve"
+set(NVE_2605_LIB_DIR "${NVE_INSTALL_ROOT}/26.05/python/pynve"
     CACHE PATH "NVE 26.05 native-library directory")
-set(NVE_2607_LIB_DIR "/opt/nve/26.07/python/pynve"
+set(NVE_2606_LIB_DIR "${NVE_INSTALL_ROOT}/26.06/python/pynve"
+    CACHE PATH "Optional NVE 26.06 native-library directory")
+set(NVE_2607_LIB_DIR "${NVE_INSTALL_ROOT}/26.07/python/pynve"
     CACHE PATH "NVE 26.07 native-library directory")
-set(NVE_2605_REPLAY_DIR "/opt/nve/26.05/replay")
-set(NVE_2607_REPLAY_DIR "/opt/nve/26.07/replay")
+set(NVE_2605_REPLAY_DIR "${NVE_INSTALL_ROOT}/26.05/replay"
+    CACHE PATH "NVE 26.05 replay-plugin directory")
+set(NVE_2606_REPLAY_DIR "${NVE_INSTALL_ROOT}/26.06/replay"
+    CACHE PATH "NVE 26.06 replay-plugin directory")
+set(NVE_2607_REPLAY_DIR "${NVE_INSTALL_ROOT}/26.07/replay"
+    CACHE PATH "NVE 26.07 replay-plugin directory")
 set(NLOHMANN_JSON_ROOT "/workspace/deps/nlohmann-json"
     CACHE PATH "Neutral nlohmann/json checkout")
 set(NVTX_INCLUDE_DIR "/workspace/deps/NVTX/c/include"
@@ -46,6 +56,17 @@ find_library(NVE_2605_TORCH_OPS_LIB nve-torch-ops
   PATHS "${NVE_2605_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
 find_library(NVE_2605_COMMON_LIB nve-common
   PATHS "${NVE_2605_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
+if(IS_DIRECTORY "${NVE_2606_ROOT}" AND IS_DIRECTORY "${NVE_2606_LIB_DIR}")
+  find_library(NVE_2606_TORCH_OPS_LIB nve-torch-ops
+    PATHS "${NVE_2606_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
+  find_library(NVE_2606_COMMON_LIB nve-common
+    PATHS "${NVE_2606_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
+  set(NVE_2606_AVAILABLE ON)
+else()
+  set(NVE_2606_AVAILABLE OFF)
+  message(STATUS
+    "NVE 26.06 source or native libraries not found; skipping its replay plugin")
+endif()
 find_library(NVE_2607_TORCH_OPS_LIB nve-torch-ops
   PATHS "${NVE_2607_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
 find_library(NVE_2607_COMMON_LIB nve-common
@@ -99,6 +120,11 @@ target_include_directories(recsys_nve_loader_manager PUBLIC
 )
 target_link_libraries(recsys_nve_loader_manager
   PRIVATE nlohmann_json::nlohmann_json ${CMAKE_DL_LIBS}
+)
+target_compile_definitions(recsys_nve_loader_manager PRIVATE
+  RECSYS_NVE_2605_PLUGIN_PATH="${NVE_2605_REPLAY_DIR}/librecsys_nve_loader.so"
+  RECSYS_NVE_2606_PLUGIN_PATH="${NVE_2606_REPLAY_DIR}/librecsys_nve_loader.so"
+  RECSYS_NVE_2607_PLUGIN_PATH="${NVE_2607_REPLAY_DIR}/librecsys_nve_loader.so"
 )
 target_compile_features(recsys_nve_loader_manager PUBLIC cxx_std_17)
 set_target_properties(recsys_nve_loader_manager PROPERTIES
@@ -182,11 +208,21 @@ add_versioned_nve_loader_plugin(
   "${NVE_2605_ROOT}" "${NVE_2605_LIB_DIR}" "${NVE_2605_REPLAY_DIR}"
   "${NVE_2605_TORCH_OPS_LIB}" "${NVE_2605_COMMON_LIB}"
 )
+set(RECSYS_NVE_LOADER_TARGETS recsys_nve_loader_2605)
+if(NVE_2606_AVAILABLE)
+  add_versioned_nve_loader_plugin(
+    recsys_nve_loader_2606 2606
+    "${NVE_2606_ROOT}" "${NVE_2606_LIB_DIR}" "${NVE_2606_REPLAY_DIR}"
+    "${NVE_2606_TORCH_OPS_LIB}" "${NVE_2606_COMMON_LIB}"
+  )
+  list(APPEND RECSYS_NVE_LOADER_TARGETS recsys_nve_loader_2606)
+endif()
 add_versioned_nve_loader_plugin(
   recsys_nve_loader_2607 2607
   "${NVE_2607_ROOT}" "${NVE_2607_LIB_DIR}" "${NVE_2607_REPLAY_DIR}"
   "${NVE_2607_TORCH_OPS_LIB}" "${NVE_2607_COMMON_LIB}"
 )
+list(APPEND RECSYS_NVE_LOADER_TARGETS recsys_nve_loader_2607)
 
 add_executable(
   inference_hstu_gr_ranking_exported_model
@@ -264,11 +300,9 @@ target_compile_options(
 
 add_dependencies(
   inference_hstu_gr_ranking_exported_model
-  recsys_nve_loader_2605
-  recsys_nve_loader_2607
+  ${RECSYS_NVE_LOADER_TARGETS}
 )
 add_dependencies(
   inference_hstu_gr_ranking_kvcache_exported_model
-  recsys_nve_loader_2605
-  recsys_nve_loader_2607
+  ${RECSYS_NVE_LOADER_TARGETS}
 )
