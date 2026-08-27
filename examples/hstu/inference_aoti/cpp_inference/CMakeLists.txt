@@ -25,8 +25,8 @@ set(NVE_2606_REPLAY_DIR "${NVE_INSTALL_ROOT}/26.06/replay"
     CACHE PATH "NVE 26.06 replay-plugin directory")
 set(NVE_2607_REPLAY_DIR "${NVE_INSTALL_ROOT}/26.07/replay"
     CACHE PATH "NVE 26.07 replay-plugin directory")
-set(NLOHMANN_JSON_ROOT "/workspace/deps/nlohmann-json"
-    CACHE PATH "Neutral nlohmann/json checkout")
+set(NLOHMANN_JSON_ROOT "${NVE_2607_ROOT}/third_party/json"
+    CACHE PATH "nlohmann/json checkout bundled with NVE 26.07")
 set(NVTX_INCLUDE_DIR "/workspace/deps/NVTX/c/include"
     CACHE PATH "Pinned NVTX C/C++ include directory")
 

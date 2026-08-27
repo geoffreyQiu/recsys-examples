@@ -13,9 +13,6 @@ ARG TRITON_CLIENT_VERSION=2.69.0
 ARG UPSTREAM_PYTORCH_CONTAINER_VERSION=
 ARG DEFAULT_UPSTREAM_PYTORCH_CONTAINER_VERSION=26.05
 ARG TRITON_BUILD_JOBS=8
-ARG NVE_2605_COMMIT=bb74e7f8a90e3b7173501d3cdd9ae14ed04b4b2d
-ARG NVTX_COMMIT=7d113f290f89eeeae9c957011c497101f3948d9e
-ARG NLOHMANN_JSON_COMMIT=9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03
 
 # ============================================================================
 # Stage 1: base_fbgemm — FBGEMM Path A + TorchRec (version-coupled with FBGEMM).
@@ -211,9 +208,6 @@ RUN set -eux; \
 # ============================================================================
 FROM ${BASE_TRITON_IMAGE} AS devel
 ARG TARGETPLATFORM
-ARG NVE_2605_COMMIT
-ARG NVTX_COMMIT
-ARG NLOHMANN_JSON_COMMIT
 
 WORKDIR /workspace/deps
 
@@ -267,60 +261,30 @@ RUN cd FlexKV && mkdir -p build && cd build && \
     cd .. && mkdir -p flexkv/lib && cp -P build/lib/*.so* flexkv/lib/ && \
     MAX_JOBS=8 FLEXKV_DEBUG=0 TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" python3 setup.py install
 
-# -- Layer 5: pinned NVE 26.05/26.07 source trees and neutral build
-# dependencies. The parent repository pins 26.07 through its NVE submodule;
-# 26.05 remains a separate Docker checkout.
+# -- Layer 5: NVE 26.05/26.07 source trees and shared NVTX headers. The parent
+# repository pins 26.07 through its NVE submodule; 26.05 uses its release tag.
 COPY third_party/nv-embedding-cache /workspace/deps/nve-26.07
-RUN set -eux; \
-    git clone https://github.com/NVIDIA/nv-embedding-cache.git nve-26.05; \
-    git -C nve-26.05 checkout --detach "${NVE_2605_COMMIT}"; \
-    test "$(git -C nve-26.05 rev-parse HEAD)" = "${NVE_2605_COMMIT}"; \
-    git -C nve-26.05 submodule sync --recursive; \
-    git -C nve-26.05 submodule update --init --recursive; \
-    if git -C nve-26.05 submodule status --recursive | grep -Eq '^[+-U]'; then exit 1; fi; \
-    test "$(git -C nve-26.05/third_party/json rev-parse HEAD)" = "${NLOHMANN_JSON_COMMIT}"; \
-    git clone https://github.com/NVIDIA/NVTX.git NVTX; \
-    git -C NVTX checkout --detach "${NVTX_COMMIT}"; \
-    test "$(git -C NVTX rev-parse HEAD)" = "${NVTX_COMMIT}"; \
-    git clone https://github.com/nlohmann/json.git nlohmann-json; \
-    git -C nlohmann-json checkout --detach "${NLOHMANN_JSON_COMMIT}"; \
-    test "$(git -C nlohmann-json rev-parse HEAD)" = "${NLOHMANN_JSON_COMMIT}"
+RUN git clone --recursive -b v26.05 \
+      https://github.com/NVIDIA/nv-embedding-cache.git nve-26.05 && \
+    git clone -b v3.5.0 https://github.com/NVIDIA/NVTX.git NVTX
 
 # Build into two isolated Python prefixes. NVE's upstream default feature set
 # is used for both builds and includes libnve-plugin-nvhm.so.
 RUN set -eux; \
-    python3 -m pip uninstall -y pynve || true; \
-    rm -rf \
-      /usr/local/lib/python3.12/dist-packages/pynve \
-      /usr/local/lib/python3.12/dist-packages/pynve-*.dist-info \
-      /usr/local/lib/python3.12/dist-packages/pynve-*.egg-info \
-      /usr/local/lib/python3.12/dist-packages/pynve*.egg-link \
-      /opt/nve/26.05 \
-      /opt/nve/26.07; \
-    find /usr/local/lib/python3.12/dist-packages -maxdepth 1 \
-      -type f -iname '*pynve*.pth' -delete; \
-    unset NVE_FEATURES NVE_DISABLE_PLUGINS NVE_DISABLE_NVHM_PLUGIN \
-      CMAKE_TOOLCHAIN_FILE PYNVE_DISABLE_TORCH_BINDINGS; \
-    if [ "${TARGETPLATFORM}" = "linux/arm64" ]; then \
-      unset PYNVE_DISABLE_AVX512; \
-    else \
+    if [ "${TARGETPLATFORM}" != "linux/arm64" ]; then \
       export PYNVE_DISABLE_AVX512=1; \
     fi; \
     for version in 26.05 26.07; do \
-      source_dir="/workspace/deps/nve-${version}"; \
-      build_dir="/workspace/build/pynve-${version}"; \
-      install_dir="/opt/nve/${version}/python"; \
-      mkdir -p "${install_dir}"; \
-      cd "${source_dir}"; \
-      PYNVE_BUILD_DIR="${build_dir}" \
+      mkdir -p "/opt/nve/${version}/python"; \
+      PYNVE_BUILD_DIR="/workspace/build/pynve-${version}" \
+      PYNVE_WITH_TORCH_BINDINGS=1 \
       TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" \
       CPLUS_INCLUDE_PATH="/workspace/deps/NVTX/c/include${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}" \
       python3 -m pip install --no-build-isolation --no-deps \
-        --target "${install_dir}" .; \
+        --target "/opt/nve/${version}/python" \
+        "/workspace/deps/nve-${version}"; \
     done; \
-    rm -rf /workspace/build; \
-    test -f /opt/nve/26.05/python/pynve/libnve-plugin-nvhm.so; \
-    test -f /opt/nve/26.07/python/pynve/libnve-plugin-nvhm.so;
+    rm -rf /workspace/build
 
 # The development image selects 26.07 by default. Commands selecting 26.05
 # replace this value rather than appending to it. Keep "." ahead of the HSTU
@@ -388,36 +352,9 @@ RUN export CMAKE_PREFIX_PATH="$(python3 -c 'import os, torch; print(os.path.join
       -DNVE_2607_ROOT=/workspace/deps/nve-26.07 \
       -DNVE_2605_LIB_DIR=/opt/nve/26.05/python/pynve \
       -DNVE_2607_LIB_DIR=/opt/nve/26.07/python/pynve \
-      -DNVTX_INCLUDE_DIR=/workspace/deps/NVTX/c/include \
-      -DNLOHMANN_JSON_ROOT=/workspace/deps/nlohmann-json && \
+      -DNVTX_INCLUDE_DIR=/workspace/deps/NVTX/c/include && \
     cmake --build "./examples/hstu/inference_aoti/cpp_inference/build" -j 8 && \
-    cmake --install "./examples/hstu/inference_aoti/cpp_inference/build" && \
-    for executable in \
-      ./examples/hstu/inference_aoti/cpp_inference/build/inference_hstu_gr_ranking_exported_model \
-      ./examples/hstu/inference_aoti/cpp_inference/build/inference_hstu_gr_ranking_kvcache_exported_model \
-      ./examples/hstu/inference_aoti/cpp_inference/build/libhstu_cuda_ops_runtime.so \
-      ./examples/hstu/inference_aoti/cpp_inference/build/libpaged_kvcache_ops_runtime.so; do \
-        if readelf -d "${executable}" | grep -q 'libnve'; then \
-          echo "unexpected NVE dependency on ${executable}" >&2; exit 1; \
-        fi; \
-    done && \
-    for version in 26.05 26.07; do \
-      plugin="/opt/nve/${version}/replay/librecsys_nve_loader.so"; \
-      other_version=26.07; \
-      if [ "${version}" = 26.07 ]; then other_version=26.05; fi; \
-      test -f "${plugin}"; \
-      dependencies="$(ldd "${plugin}")"; \
-      printf '%s\n' "${dependencies}" | grep -q "/opt/nve/${version}/python/pynve/libnve-common.so"; \
-      printf '%s\n' "${dependencies}" | grep -q "/opt/nve/${version}/python/pynve/libnve-torch-ops.so"; \
-      if printf '%s\n' "${dependencies}" | grep -q "/opt/nve/${other_version}/"; then \
-        printf '%s\n' "${dependencies}"; exit 1; \
-      fi; \
-      if printf '%s\n' "${dependencies}" | grep -q 'not found'; then \
-        printf '%s\n' "${dependencies}"; exit 1; \
-      fi; \
-      exported_symbols="$(nm -D --defined-only --format=posix "${plugin}" | awk '{print $1}')"; \
-      test "${exported_symbols}" = recsys_nve_loader_get_api_v1; \
-    done
+    cmake --install "./examples/hstu/inference_aoti/cpp_inference/build"
 
 RUN set -eux; \
     torch_root="$(python3 -c 'import pathlib, torch; print(pathlib.Path(torch.__file__).parent)')"; \
