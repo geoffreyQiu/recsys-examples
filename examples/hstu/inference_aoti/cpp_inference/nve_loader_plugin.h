@@ -5,14 +5,8 @@
 
 #pragma once
 
-#include <stddef.h>
-
-#ifdef __cplusplus
-#define RECSYS_NVE_NOEXCEPT noexcept
-extern "C" {
-#else
-#define RECSYS_NVE_NOEXCEPT
-#endif
+#include <cstddef>
+#include <string>
 
 #if defined(__GNUC__) || defined(__clang__)
 #define RECSYS_NVE_EXPORT __attribute__((visibility("default")))
@@ -20,21 +14,18 @@ extern "C" {
 #define RECSYS_NVE_EXPORT
 #endif
 
-RECSYS_NVE_EXPORT int recsys_nve_loader_create_state(
+extern "C" {
+
+RECSYS_NVE_EXPORT void* recsys_nve_loader_create_state(
     const char* package_dir,
     void* aoti_loader_or_null,
     int device_index,
-    void** state,
     char* error,
-    size_t error_size);
+    std::size_t error_size) noexcept;
 RECSYS_NVE_EXPORT void recsys_nve_loader_destroy_state(void* state)
-    RECSYS_NVE_NOEXCEPT;
+    noexcept;
 
-#ifdef __cplusplus
 }  // extern "C"
-
-#include <memory>
-#include <string>
 
 namespace recsys::nve_loader {
 
@@ -51,9 +42,15 @@ class NveLoaderPlugin {
   void create_state(void* aoti_loader_or_null, int device_index);
 
  private:
-  struct Impl;
-  std::unique_ptr<Impl> impl_;
+  using CreateStateFn = decltype(&recsys_nve_loader_create_state);
+  using DestroyStateFn = decltype(&recsys_nve_loader_destroy_state);
+
+  std::string package_dir_;
+  std::string selected_version_;
+  bool uses_api_v2_ = false;
+  CreateStateFn create_state_fn_ = nullptr;
+  DestroyStateFn destroy_state_fn_ = nullptr;
+  void* state_ = nullptr;
 };
 
 }  // namespace recsys::nve_loader
-#endif
