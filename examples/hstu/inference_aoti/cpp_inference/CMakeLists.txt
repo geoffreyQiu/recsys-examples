@@ -15,7 +15,6 @@ set(NVE_2607_LIB_DIR "${NVE_INSTALL_ROOT}/26.07/python/pynve" CACHE PATH "NVE 26
 set(NVE_2605_REPLAY_DIR "${NVE_INSTALL_ROOT}/26.05/replay")
 set(NVE_2606_REPLAY_DIR "${NVE_INSTALL_ROOT}/26.06/replay")
 set(NVE_2607_REPLAY_DIR "${NVE_INSTALL_ROOT}/26.07/replay")
-set(NLOHMANN_JSON_INCLUDE_DIR "${NVE_2607_ROOT}/third_party/json/include")
 set(NVTX_INCLUDE_DIR "/workspace/deps/NVTX/c/include")
 
 find_package(Torch REQUIRED)
@@ -93,14 +92,9 @@ set_target_properties(paged_kvcache_ops_runtime PROPERTIES
 
 # This manager has no NVE include path or link dependency.
 add_library(recsys_nve_loader_manager STATIC nve_loader_plugin.cpp)
-target_include_directories(recsys_nve_loader_manager PRIVATE
-  "${NLOHMANN_JSON_INCLUDE_DIR}"
-)
 target_link_libraries(recsys_nve_loader_manager PRIVATE ${CMAKE_DL_LIBS})
 target_compile_definitions(recsys_nve_loader_manager PRIVATE
-  RECSYS_NVE_2605_PLUGIN_PATH="${NVE_2605_REPLAY_DIR}/librecsys_nve_loader.so"
-  RECSYS_NVE_2606_PLUGIN_PATH="${NVE_2606_REPLAY_DIR}/librecsys_nve_loader.so"
-  RECSYS_NVE_2607_PLUGIN_PATH="${NVE_2607_REPLAY_DIR}/librecsys_nve_loader.so"
+  RECSYS_NVE_INSTALL_ROOT="${NVE_INSTALL_ROOT}"
 )
 
 add_executable(inference_hstu_gr_ranking_exported_model inference_hstu_gr_ranking_exported_model.cpp)
@@ -173,7 +167,7 @@ if(NOT NVE_CACHE_LINE_SIZE)
 endif()
 
 function(add_versioned_nve_loader_plugin
-    target generation nve_root nve_lib_dir replay_dir torch_ops_lib common_lib)
+    target loader_api nve_root nve_lib_dir replay_dir torch_ops_lib common_lib)
   add_library(${target} MODULE nve_loader_plugin_impl.cu)
   set(version_script "${CMAKE_CURRENT_BINARY_DIR}/${target}.map")
   file(GENERATE OUTPUT "${version_script}" CONTENT
@@ -186,7 +180,7 @@ function(add_versioned_nve_loader_plugin
     ${TORCH_INCLUDE_DIRS}
   )
   target_compile_definitions(${target} PRIVATE
-    RECSYS_NVE_GENERATION=${generation}
+    RECSYS_NVE_LOADER_API=${loader_api}
     NVE_FEATURE_HT_PART_FNV1A=1
     NVE_FEATURE_HT_PART_MURMUR=1
     NVE_FEATURE_HT_PART_RRXMRRXMSX0=1
@@ -227,21 +221,21 @@ function(add_versioned_nve_loader_plugin
 endfunction()
 
 add_versioned_nve_loader_plugin(
-  recsys_nve_loader_2605 2605
+  recsys_nve_loader_2605 1
   "${NVE_2605_ROOT}" "${NVE_2605_LIB_DIR}" "${NVE_2605_REPLAY_DIR}"
   "${NVE_2605_TORCH_OPS_LIB}" "${NVE_2605_COMMON_LIB}"
 )
 set(RECSYS_NVE_LOADER_TARGETS recsys_nve_loader_2605)
 if(NVE_2606_AVAILABLE)
   add_versioned_nve_loader_plugin(
-    recsys_nve_loader_2606 2606
+    recsys_nve_loader_2606 2
     "${NVE_2606_ROOT}" "${NVE_2606_LIB_DIR}" "${NVE_2606_REPLAY_DIR}"
     "${NVE_2606_TORCH_OPS_LIB}" "${NVE_2606_COMMON_LIB}"
   )
   list(APPEND RECSYS_NVE_LOADER_TARGETS recsys_nve_loader_2606)
 endif()
 add_versioned_nve_loader_plugin(
-  recsys_nve_loader_2607 2607
+  recsys_nve_loader_2607 2
   "${NVE_2607_ROOT}" "${NVE_2607_LIB_DIR}" "${NVE_2607_REPLAY_DIR}"
   "${NVE_2607_TORCH_OPS_LIB}" "${NVE_2607_COMMON_LIB}"
 )
