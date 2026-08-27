@@ -91,9 +91,7 @@ def _make_inputs(
 ):
     return [
         _make_input(httpclient, input_name, array)
-        for (input_name, _), array in zip(
-            WORKFLOW_INPUT_TENSORS[workflow], input_case
-        )
+        for (input_name, _), array in zip(WORKFLOW_INPUT_TENSORS[workflow], input_case)
     ]
 
 
@@ -526,7 +524,7 @@ def main() -> int:
     outputs = [httpclient.InferRequestedOutput("OUTPUT__0")]
 
     client = httpclient.InferenceServerClient(url=args.url)
-    profile_records: list[dict[str, Any]] = []
+    profile_records = []
     request_sequence = 0
 
     warmup_batch_size = _logical_batch_size(warmup_case[1])

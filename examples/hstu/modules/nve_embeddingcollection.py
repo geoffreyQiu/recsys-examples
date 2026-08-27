@@ -22,12 +22,11 @@ from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 try:
     import pynve.torch.nve_ps as nve_ps
-    from pynve.torch.nve_layers import NVEmbedding
-
     from modules.nve_compat import (
         gpu_only_constructor_kwargs,
         hierarchical_constructor_kwargs,
     )
+    from pynve.torch.nve_layers import NVEmbedding
 
     def get_nve_local_ps(vocab_size, embedding_dim, torch_dtype):
         return nve_ps.NVEParameterServer(vocab_size, embedding_dim, torch_dtype)

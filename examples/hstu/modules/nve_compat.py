@@ -7,7 +7,6 @@ import os
 import site
 from pathlib import Path
 
-
 _DEFAULT_NVE_INSTALL_ROOT = Path("/opt/nve")
 _SUPPORTED_GENERATIONS = ("26.05", "26.06", "26.07")
 

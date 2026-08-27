@@ -30,7 +30,6 @@ from dynamicemb_extensions import table_insert
 from torch.nn import ModuleDict
 from torchrec.modules.embedding_configs import EmbeddingConfig
 
-
 _NVE_CACHE_NUM_WAYS = 8
 _NVE_CACHE_ALIGNMENT_BYTES = 16
 _NVE_CACHE_TAG_BYTES = 8
