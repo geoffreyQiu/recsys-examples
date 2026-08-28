@@ -62,10 +62,7 @@ from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from utils import NetworkArgs, TensorModelParallelArgs
 
 sys.path.append("./training/")
-from inference_aoti.nve_aoti_compat import (
-    load_aoti,
-    prepare_output_directories,
-)
+from inference_aoti.nve_aoti_compat import load_aoti, prepare_output_directories
 from pretrain_gr_ranking import create_ranking_config
 from trainer.utils import create_hstu_config, get_dataset_and_embedding_args
 
