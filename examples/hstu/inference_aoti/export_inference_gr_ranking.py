@@ -32,6 +32,7 @@ from megatron.core import parallel_state
 from model import get_ranking_model
 from model.inference_ranking_gr import apply_inference
 from modules.metrics import get_multi_event_metric_module
+from modules.nve_compat import imported_nve_generation
 from pynve.torch.nve_export import export_aot
 from torch.export import Dim, ShapesCollection
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
@@ -39,7 +40,6 @@ from utils import NetworkArgs, TensorModelParallelArgs
 
 sys.path.append("./training/")
 from inference_aoti.nve_aoti_compat import (
-    _runtime_generation,
     load_aoti,
     prepare_output_directories,
 )
@@ -200,7 +200,7 @@ def export_inference_gr_ranking(
     dump_dir_: str | os.PathLike[str] = DEFAULT_DUMP_DIR,
 ):
     export_dir, dump_dir = prepare_output_directories(export_dir_, dump_dir_)
-    generation = _runtime_generation()
+    generation = imported_nve_generation()
     print(
         f"[INFO] Selected NVE {generation} (pynve {pynve.__version__}) from "
         f"{Path(pynve.__file__).resolve()}"
