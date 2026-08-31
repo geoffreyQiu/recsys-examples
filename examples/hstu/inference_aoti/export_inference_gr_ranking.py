@@ -347,15 +347,7 @@ def export_inference_gr_ranking(
             export_dir,
             dynamic_shapes=dynamic_shapes,
         )
-        print(f"[INFO] Exported and packaged the model to:")
-        print(f"       {export_dir}/")
-        print(
-            "       ├── model.pt2                  # AOT-compiled model package for AOTIModelPackageLoader"
-        )
-        print(
-            "       ├── metadata.json              # NVE layer metadata (id, num_embeddings, emb_size, etc.)"
-        )
-        print("       └── weights/*.nve              # NVE weight data (LinearUVM)")
+        print("[INFO] Exported and packaged the AOTI model.")
 
         # === Test Compiled Model ===
         aoti_model_runtime, nve_layers = load_aoti(
@@ -427,9 +419,7 @@ def export_inference_gr_ranking(
                 break
         # torch.cuda.profiler.stop()
 
-        print(
-            f"[INFO] Dumped {dump_idx} request-major test batches to {dump_dir}."
-        )
+        print(f"[INFO] Dumped {dump_idx} request-major test batches.")
 
         eval_metric_dict = eval_module.compute()
         print(
