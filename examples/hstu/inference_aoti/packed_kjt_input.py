@@ -46,11 +46,18 @@ def kjt_to_request_major(
 
 
 class HSTUPackedInputWrapper(torch.nn.Module):
-    """Expose the non-KV HSTU model through request-major plain tensors."""
+    """Expose the non-KV HSTU model through plain jagged tensors."""
 
-    def __init__(self, inner: torch.nn.Module, example_batch: HSTUBatch) -> None:
+    def __init__(
+        self,
+        inner: torch.nn.Module,
+        example_batch: HSTUBatch,
+        *,
+        request_major: bool = True,
+    ) -> None:
         super().__init__()
         self.inner = inner
+        self._request_major = request_major
         self._keys = tuple(example_batch.features.keys())
         self._contextual_feature_names = list(
             example_batch.contextual_feature_names
@@ -62,14 +69,21 @@ class HSTUPackedInputWrapper(torch.nn.Module):
 
     def forward(
         self,
-        values_rm: torch.Tensor,
-        lengths_rm: torch.Tensor,
+        values: torch.Tensor,
+        lengths: torch.Tensor,
         num_candidates: torch.Tensor,
     ) -> torch.Tensor:
-        values_fm, lengths_fm, offsets_fm = torch.ops.packed_jagged.reorder(
-            values_rm,
-            lengths_rm,
-        )
+        if self._request_major:
+            values_fm, lengths_fm, offsets_fm = torch.ops.packed_jagged.reorder(
+                values,
+                lengths,
+            )
+        else:
+            values_fm = values
+            lengths_fm = lengths.long()
+            offsets_fm = torch.ops.fbgemm.asynchronous_complete_cumsum(
+                lengths_fm
+            )
         features = KeyedJaggedTensor(
             keys=list(self._keys),
             values=values_fm,
