@@ -24,7 +24,6 @@ import pynve
 import torch
 import torch.distributed as dist
 from commons.datasets import get_data_loader
-from commons.datasets.hstu_batch import HSTUBatch
 from commons.datasets.hstu_sequence_dataset import get_dataset
 from commons.hstu_data_preprocessor import get_common_preprocessors
 from commons.utils.stringify import stringify_dict
@@ -40,6 +39,10 @@ from utils import NetworkArgs, TensorModelParallelArgs
 
 sys.path.append("./training/")
 from inference_aoti.nve_aoti_compat import load_aoti, prepare_output_directories
+from inference_aoti.packed_kjt_input import (
+    HSTUPackedInputWrapper,
+    kjt_to_request_major,
+)
 from pretrain_gr_ranking import create_ranking_config
 from trainer.utils import create_hstu_config, get_dataset_and_embedding_args
 
@@ -308,67 +311,18 @@ def export_inference_gr_ranking(
         )
         batch.labels = None
 
-        # ---- Plain-tuple input wrapper (Triton AOTI call_spec compatibility) ----
-        # Triton's PyTorch AOTI backend accepts builtin pytree containers plus
-        # tensors, but rejects custom HSTUBatch / KeyedJaggedTensor nodes in the
-        # exported input spec. Export a thin wrapper with only tensor inputs and
-        # rebuild the HSTUBatch internally.
-        class _PlainInputWrapper(torch.nn.Module):
-            def __init__(self, inner, example_batch):
-                super().__init__()
-                self.inner = inner
-                self._batch_size = int(example_batch.batch_size)
-                self._keys = list(example_batch.features.keys())
-                self._contextual_feature_names = list(
-                    example_batch.contextual_feature_names
-                )
-                self._item_feature_name = example_batch.item_feature_name
-                self._action_feature_name = example_batch.action_feature_name
-                self._feature_to_max_seqlen = dict(example_batch.feature_to_max_seqlen)
-                self._max_num_candidates = int(example_batch.max_num_candidates)
-                self._actual_batch_size = (
-                    int(example_batch.actual_batch_size)
-                    if example_batch.actual_batch_size is not None
-                    else None
-                )
-
-            def _rebuild_batch(self, values, lengths, num_candidates):
-                offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(lengths.long())
-                features = KeyedJaggedTensor(
-                    keys=self._keys,
-                    values=values,
-                    lengths=lengths,
-                    offsets=offsets,
-                )
-                return HSTUBatch(
-                    features=features,
-                    batch_size=self._batch_size,
-                    feature_to_max_seqlen=self._feature_to_max_seqlen,
-                    contextual_feature_names=self._contextual_feature_names,
-                    actual_batch_size=self._actual_batch_size,
-                    item_feature_name=self._item_feature_name,
-                    action_feature_name=self._action_feature_name,
-                    max_num_candidates=self._max_num_candidates,
-                    num_candidates=num_candidates,
-                )
-
-            def forward(
-                self,
-                values,
-                lengths,
-                num_candidates,
-            ):
-                rebuilt = self._rebuild_batch(values, lengths, num_candidates)
-                logits = self.inner(rebuilt)
-                return logits.float().cpu()
-
-        export_model = _PlainInputWrapper(model, batch)
-        example_values = batch.features.values()
-        example_lengths = batch.features.lengths()
+        # Export a plain request-major tensor boundary. The wrapper restores the
+        # feature-major KJT internally with packed_jagged::reorder.
+        feature_keys = tuple(batch.features.keys())
+        export_model = HSTUPackedInputWrapper(model, batch)
+        example_values_rm, example_lengths_rm = kjt_to_request_major(
+            batch.features,
+            feature_keys,
+        )
         example_num_candidates = batch.num_candidates
         example_inputs = (
-            example_values,
-            example_lengths,
+            example_values_rm,
+            example_lengths_rm,
             example_num_candidates,
         )
 
@@ -376,9 +330,8 @@ def export_inference_gr_ranking(
         sc = ShapesCollection()
         dim_batch = Dim("batch_size", min=1, max=8)
 
-        num_features = len(batch.features.keys())
-        sc[example_values] = {0: Dim("tokens", min=1, max=40000)}
-        sc[example_lengths] = {0: dim_batch * num_features}
+        sc[example_values_rm] = {0: Dim("tokens", min=1, max=40000)}
+        sc[example_lengths_rm] = {0: dim_batch}
         sc[example_num_candidates] = {0: dim_batch}
         dynamic_shapes = sc.dynamic_shapes(export_model, example_inputs)
         print(f"[INFO] Dynamic shapes: {dynamic_shapes}")
@@ -416,21 +369,24 @@ def export_inference_gr_ranking(
 
         print("[INFO][check]:")
         # torch.cuda.profiler.start()
-        inputs = []
+        prepared_inputs = []
         while True:
             try:
                 batch = next(dataloader_iter)
                 batch = prepare_on_gpu(batch)
-                inputs.append(batch)
+                values_rm, lengths_rm = kjt_to_request_major(
+                    batch.features,
+                    feature_keys,
+                )
+                compiled_inputs = [
+                    values_rm,
+                    lengths_rm,
+                    batch.num_candidates,
+                ]
+                prepared_inputs.append((batch, compiled_inputs))
 
                 with torch.inference_mode():
-                    logits = aoti_model_runtime.run(
-                        [
-                            batch.features.values(),
-                            batch.features.lengths(),
-                            batch.num_candidates,
-                        ]
-                    )[0]
+                    logits = aoti_model_runtime.run(compiled_inputs)[0]
                     ref_logits = model(batch)
                     ref_logits_cpu = ref_logits.detach().cpu()
 
@@ -442,11 +398,11 @@ def export_inference_gr_ranking(
                         feature_keys_dumped = True
 
                     _save_tensor_cpp_compatible(
-                        batch.features.values().detach().cpu(),
+                        values_rm.detach().cpu(),
                         os.path.join(dump_dir, f"batch_{dump_idx:06d}_values.pt"),
                     )
                     _save_tensor_cpp_compatible(
-                        batch.features.lengths().detach().cpu(),
+                        lengths_rm.detach().cpu(),
                         os.path.join(dump_dir, f"batch_{dump_idx:06d}_lengths.pt"),
                     )
                     _save_tensor_cpp_compatible(
@@ -471,7 +427,9 @@ def export_inference_gr_ranking(
                 break
         # torch.cuda.profiler.stop()
 
-        print(f"[INFO] Dumped {dump_idx} test batches to {dump_dir}.")
+        print(
+            f"[INFO] Dumped {dump_idx} request-major test batches to {dump_dir}."
+        )
 
         eval_metric_dict = eval_module.compute()
         print(
@@ -485,8 +443,10 @@ def export_inference_gr_ranking(
             "    Benchmark on GPU:",
             torch.cuda.get_device_name(torch.cuda.current_device()),
         )
-        num_benchmark_batches = len(inputs)
-        num_logical_requests = sum(int(b.batch_size) for b in inputs)
+        num_benchmark_batches = len(prepared_inputs)
+        num_logical_requests = sum(
+            int(b.batch_size) for b, _ in prepared_inputs
+        )
         if num_benchmark_batches == 0 or num_logical_requests == 0:
             raise RuntimeError("No inputs were collected for benchmarking")
         print(
@@ -502,14 +462,8 @@ def export_inference_gr_ranking(
             results = []
             start = time.perf_counter()
             with torch.inference_mode():
-                for b in inputs:
-                    logits = aoti_model_runtime.run(
-                        [
-                            b.features.values(),
-                            b.features.lengths(),
-                            b.num_candidates,
-                        ]
-                    )[0]
+                for _, compiled_inputs in prepared_inputs:
+                    logits = aoti_model_runtime.run(compiled_inputs)[0]
                     results.append(logits)
             torch.cuda.synchronize()
             end = time.perf_counter()
@@ -534,7 +488,7 @@ def export_inference_gr_ranking(
             results = []
             start = time.perf_counter()
             with torch.inference_mode():
-                for b in inputs:
+                for b, _ in prepared_inputs:
                     ref_logits = model(b)
                     results.append(ref_logits)
             torch.cuda.synchronize()
