@@ -228,16 +228,8 @@ def export_inference_gr_ranking(
         trained_emb_table_sizes,
     ) = get_inference_dataset_and_embedding_configs()
 
-    dataproc = get_common_preprocessors("")[dataset_args.dataset_name]
-    num_contextual_features = len(dataproc._contextual_feature_names)
-
+    export_max_batch_size = 8
     max_batch_size = max_bs
-    total_max_seqlen = (
-        dataset_args.max_num_candidates
-        + dataset_args.max_history_seqlen * 2
-        + num_contextual_features
-    )
-    print(f"[INFO] Total max sequence length: {total_max_seqlen}")
 
     def strip_padding_batch(batch, unpadded_batch_size):
         batch.batch_size = unpadded_batch_size
@@ -328,9 +320,11 @@ def export_inference_gr_ranking(
 
         # get dynamic shapes (now keyed on the plain tensor inputs)
         sc = ShapesCollection()
-        dim_batch = Dim("batch_size", min=1, max=8)
+        dim_batch = Dim("batch_size", min=1, max=export_max_batch_size)
+        max_tokens_per_request = sum(batch.feature_to_max_seqlen.values())
+        max_tokens = export_max_batch_size * max_tokens_per_request
 
-        sc[example_values_rm] = {0: Dim("tokens", min=1, max=40000)}
+        sc[example_values_rm] = {0: Dim("tokens", min=1, max=max_tokens)}
         sc[example_lengths_rm] = {0: dim_batch}
         sc[example_num_candidates] = {0: dim_batch}
         dynamic_shapes = sc.dynamic_shapes(export_model, example_inputs)
