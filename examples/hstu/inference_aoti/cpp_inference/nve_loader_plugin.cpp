@@ -55,10 +55,10 @@ NveLoaderPlugin::NveLoaderPlugin(std::string package_dir)
   }
   selected_version_ = version;
   if (selected_version_ == "26.05") {
-    uses_api_v2_ = false;
+    loader_version_ = LoaderVersion::kNve2605;
   } else if (selected_version_ == "26.06" ||
              selected_version_ == "26.07") {
-    uses_api_v2_ = true;
+    loader_version_ = LoaderVersion::kNve2606;
   } else {
     throw std::runtime_error(
         "Unsupported NVE_VERSION=" + selected_version_ +
@@ -93,7 +93,7 @@ const std::string& NveLoaderPlugin::selected_version() const noexcept {
 }
 
 bool NveLoaderPlugin::requires_aoti_loader() const noexcept {
-  return uses_api_v2_;
+  return loader_version_ == LoaderVersion::kNve2606;
 }
 
 void NveLoaderPlugin::create_state(

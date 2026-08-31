@@ -167,7 +167,7 @@ if(NOT NVE_CACHE_LINE_SIZE)
 endif()
 
 function(add_versioned_nve_loader_plugin
-    target loader_api nve_root nve_lib_dir replay_dir torch_ops_lib common_lib)
+    target nve_version nve_root nve_lib_dir replay_dir torch_ops_lib common_lib)
   add_library(${target} MODULE nve_loader_plugin_impl.cu)
   set(version_script "${CMAKE_CURRENT_BINARY_DIR}/${target}.map")
   file(GENERATE OUTPUT "${version_script}" CONTENT
@@ -180,7 +180,7 @@ function(add_versioned_nve_loader_plugin
     ${TORCH_INCLUDE_DIRS}
   )
   target_compile_definitions(${target} PRIVATE
-    RECSYS_NVE_LOADER_API=${loader_api}
+    NVE_VERSION=${nve_version}
     NVE_FEATURE_HT_PART_FNV1A=1
     NVE_FEATURE_HT_PART_MURMUR=1
     NVE_FEATURE_HT_PART_RRXMRRXMSX0=1
@@ -221,21 +221,21 @@ function(add_versioned_nve_loader_plugin
 endfunction()
 
 add_versioned_nve_loader_plugin(
-  recsys_nve_loader_2605 1
+  recsys_nve_loader_2605 2605
   "${NVE_2605_ROOT}" "${NVE_2605_LIB_DIR}" "${NVE_2605_REPLAY_DIR}"
   "${NVE_2605_TORCH_OPS_LIB}" "${NVE_2605_COMMON_LIB}"
 )
 set(RECSYS_NVE_LOADER_TARGETS recsys_nve_loader_2605)
 if(NVE_2606_AVAILABLE)
   add_versioned_nve_loader_plugin(
-    recsys_nve_loader_2606 2
+    recsys_nve_loader_2606 2606
     "${NVE_2606_ROOT}" "${NVE_2606_LIB_DIR}" "${NVE_2606_REPLAY_DIR}"
     "${NVE_2606_TORCH_OPS_LIB}" "${NVE_2606_COMMON_LIB}"
   )
   list(APPEND RECSYS_NVE_LOADER_TARGETS recsys_nve_loader_2606)
 endif()
 add_versioned_nve_loader_plugin(
-  recsys_nve_loader_2607 2
+  recsys_nve_loader_2607 2607
   "${NVE_2607_ROOT}" "${NVE_2607_LIB_DIR}" "${NVE_2607_REPLAY_DIR}"
   "${NVE_2607_TORCH_OPS_LIB}" "${NVE_2607_COMMON_LIB}"
 )

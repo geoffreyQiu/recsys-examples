@@ -9,10 +9,10 @@
 #include <exception>
 #include <memory>
 
-#if !defined(RECSYS_NVE_LOADER_API)
-#error "RECSYS_NVE_LOADER_API must be 1 or 2"
-#elif RECSYS_NVE_LOADER_API != 1 && RECSYS_NVE_LOADER_API != 2
-#error "Unsupported RECSYS_NVE_LOADER_API"
+#if !defined(NVE_VERSION)
+#error "NVE_VERSION must be defined"
+#elif NVE_VERSION < 2605
+#error "NVE_VERSION must be 2605 or later"
 #endif
 
 #include "python/pynve/torch_bindings/nve_loader.hpp"
@@ -27,7 +27,7 @@ void set_error(
 }
 
 struct PluginState {
-#if RECSYS_NVE_LOADER_API == 2
+#if NVE_VERSION >= 2606
   std::shared_ptr<nve::ResourceDirectory> resources;
 #endif
   std::unique_ptr<nve::LayerDirectory> layers;
@@ -45,7 +45,7 @@ extern "C" RECSYS_NVE_EXPORT void* recsys_nve_loader_create_state(
     error[0] = '\0';
   }
   try {
-#if RECSYS_NVE_LOADER_API == 1
+#if NVE_VERSION == 2605
     if (aoti_loader_or_null != nullptr) {
       set_error(error, error_size, "NVE 26.05 state must be created before AOTI");
       return nullptr;
@@ -57,7 +57,7 @@ extern "C" RECSYS_NVE_EXPORT void* recsys_nve_loader_create_state(
     }
 #endif
     auto state = std::make_unique<PluginState>();
-#if RECSYS_NVE_LOADER_API == 1
+#if NVE_VERSION == 2605
     state->layers =
         std::make_unique<nve::LayerDirectory>(package_dir, device_index);
 #else
