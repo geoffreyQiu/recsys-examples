@@ -350,6 +350,31 @@ def export_inference_gr_ranking(
         )
         print(f"[INFO] Loaded {len(nve_layers)} NVE layer(s) for AOTI")
 
+        print("[INFO][boundary check]:")
+        for boundary_size in (1, batch.batch_size):
+            boundary_batch = (
+                batch if boundary_size == batch.batch_size else batch.slice(0, 1)
+            )
+            boundary_values_rm, boundary_lengths_rm = kjt_to_request_major(
+                boundary_batch.features,
+                feature_keys,
+            )
+            with torch.inference_mode():
+                boundary_logits = aoti_model_runtime.run(
+                    [
+                        boundary_values_rm,
+                        boundary_lengths_rm,
+                        boundary_batch.num_candidates,
+                    ]
+                )[0]
+                boundary_ref = model(boundary_batch).detach().cpu()
+            boundary_equal = (
+                torch.max(torch.abs(boundary_logits - boundary_ref)).item() <= 0.0625
+            )
+            print(f"    [B={boundary_size}] Check equal: {boundary_equal}")
+            if not boundary_equal:
+                raise RuntimeError(f"AOTI boundary parity failed at B={boundary_size}")
+
         feature_keys_dumped = False
         dump_idx = 0
 
