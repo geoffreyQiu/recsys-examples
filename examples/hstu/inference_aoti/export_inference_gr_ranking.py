@@ -196,6 +196,7 @@ def export_inference_gr_ranking(
     checkpoint_dir: str,
     max_bs: int = 1,
     debug_flattened_inputs: bool = False,
+    benchmark_python_packed_input: bool = False,
     export_dir_: str | os.PathLike[str] = DEFAULT_EXPORT_DIR,
     dump_dir_: str | os.PathLike[str] = DEFAULT_DUMP_DIR,
 ):
@@ -491,21 +492,32 @@ def export_inference_gr_ranking(
 
         import time
 
+        python_benchmark_name = (
+            "Python packed-input wrapper"
+            if benchmark_python_packed_input
+            else "Python model"
+        )
         python_time = []
         for _ in range(3):
             torch.cuda.synchronize()
             results = []
             start = time.perf_counter()
             with torch.inference_mode():
-                for b, _ in prepared_inputs:
-                    ref_logits = model(b)
-                    results.append(ref_logits)
+                if benchmark_python_packed_input:
+                    for _, compiled_inputs in prepared_inputs:
+                        logits = export_model(*compiled_inputs)
+                        results.append(logits)
+                else:
+                    for b, _ in prepared_inputs:
+                        logits = model(b)
+                        results.append(logits)
             torch.cuda.synchronize()
             end = time.perf_counter()
             python_time.append(end - start)
         python_time_avg = sum(python_time) / len(python_time)
         print(
-            f"    Python model elapsed time: {python_time_avg:.6f} seconds; "
+            f"    {python_benchmark_name} elapsed time: "
+            f"{python_time_avg:.6f} seconds; "
             f"{python_time_avg * 1000.0 / num_benchmark_batches:.3f} "
             "ms/batch; "
             f"{python_time_avg * 1000.0 / num_logical_requests:.3f} "
@@ -523,6 +535,14 @@ if __name__ == "__main__":
     parser.add_argument("--disable_auc", action="store_true")
     parser.add_argument("--max_bs", type=int, default=2)
     parser.add_argument("--debug_flattened_inputs", action="store_true")
+    parser.add_argument(
+        "--benchmark_python_packed_input",
+        action="store_true",
+        help=(
+            "Benchmark the eager packed-input wrapper with the same "
+            "request-major inputs as AOTI instead of the original HSTUBatch model."
+        ),
+    )
     parser.add_argument(
         "--export_dir",
         type=str,
@@ -552,5 +572,6 @@ if __name__ == "__main__":
         dump_dir_=args.dump_dir,
         max_bs=args.max_bs,
         debug_flattened_inputs=args.debug_flattened_inputs,
+        benchmark_python_packed_input=args.benchmark_python_packed_input,
     )
     print("[INFO] Finished.")
