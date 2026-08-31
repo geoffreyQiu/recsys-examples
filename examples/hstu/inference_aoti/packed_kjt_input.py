@@ -78,7 +78,8 @@ class HSTUPackedInputWrapper(torch.nn.Module):
         )
         batch = HSTUBatch(
             features=features,
-            batch_size=lengths_rm.shape[0],
+            # Required positive metadata; runtime B comes from tensor shapes.
+            batch_size=1,
             feature_to_max_seqlen=self._feature_to_max_seqlen,
             contextual_feature_names=self._contextual_feature_names,
             actual_batch_size=None,
