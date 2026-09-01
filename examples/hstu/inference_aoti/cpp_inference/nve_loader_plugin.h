@@ -37,22 +37,21 @@ class NveLoaderPlugin {
   NveLoaderPlugin(const NveLoaderPlugin&) = delete;
   NveLoaderPlugin& operator=(const NveLoaderPlugin&) = delete;
 
-  const std::string& selected_version() const noexcept;
+  const char* selected_version() const noexcept;
   bool requires_aoti_loader() const noexcept;
   void create_state(void* aoti_loader_or_null, int device_index);
 
  private:
-  enum class LoaderVersion {
+  enum class NveVersion {
     kNve2605,
-    kNve2606,
+    kDefault,  // Submodule-backed NVE 26.06 and later.
   };
 
   using CreateStateFn = decltype(&recsys_nve_loader_create_state);
   using DestroyStateFn = decltype(&recsys_nve_loader_destroy_state);
 
   std::string package_dir_;
-  std::string selected_version_;
-  LoaderVersion loader_version_ = LoaderVersion::kNve2605;
+  NveVersion version_ = NveVersion::kDefault;
   CreateStateFn create_state_fn_ = nullptr;
   DestroyStateFn destroy_state_fn_ = nullptr;
   void* state_ = nullptr;

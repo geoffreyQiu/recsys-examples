@@ -4,7 +4,7 @@ This guide expands the quick workflow in [README.md](./README.md). It follows th
 
 This end-to-end Triton workflow selects NVE 26.05 because the current model-init
 hook supports only its legacy artifact contract. Standalone Python export and
-native replay also support NVE 26.06 and 26.07 as described in the
+native replay also support the submodule-backed default NVE as described in the
 [README NVE section](./README.md#nve-support).
 
 ## Build
@@ -96,7 +96,7 @@ Expected outputs:
 2. `examples/hstu/inference_aoti/cpp_inference/build/libhstu_cuda_ops_runtime.so`
 3. `examples/hstu/inference_aoti/cpp_inference/build/libpaged_kvcache_ops_runtime.so`
 4. `/opt/nve/26.05/replay/librecsys_nve_loader.so`
-5. `/opt/nve/26.07/replay/librecsys_nve_loader.so`
+5. `/opt/nve/default/replay/librecsys_nve_loader.so`
 
 
 ### Step 4: Verify with the C++ AOTI Replay

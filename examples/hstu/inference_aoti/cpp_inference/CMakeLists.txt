@@ -5,16 +5,13 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_PREFIX_PATH "${CMAKE_PREFIX_PATH};$ENV{Torch_DIR}")
 
-set(NVE_INSTALL_ROOT "/opt/nve" CACHE PATH "Versioned NVE install root")
+set(NVE_INSTALL_ROOT "/opt/nve" CACHE PATH "NVE install root")
 set(NVE_2605_ROOT "/workspace/deps/nve-26.05" CACHE PATH "NVE 26.05 source tree")
-set(NVE_2606_ROOT "/workspace/deps/nve-26.06" CACHE PATH "Optional NVE 26.06 source tree")
-set(NVE_2607_ROOT "/workspace/deps/nve-26.07" CACHE PATH "NVE 26.07 source tree")
+set(NVE_DEFAULT_ROOT "/workspace/deps/nve" CACHE PATH "Default NVE source tree")
 set(NVE_2605_LIB_DIR "${NVE_INSTALL_ROOT}/26.05/python/pynve" CACHE PATH "NVE 26.05 native-library directory")
-set(NVE_2606_LIB_DIR "${NVE_INSTALL_ROOT}/26.06/python/pynve" CACHE PATH "Optional NVE 26.06 native-library directory")
-set(NVE_2607_LIB_DIR "${NVE_INSTALL_ROOT}/26.07/python/pynve" CACHE PATH "NVE 26.07 native-library directory")
+set(NVE_DEFAULT_LIB_DIR "${NVE_INSTALL_ROOT}/default/python/pynve" CACHE PATH "Default NVE native-library directory")
 set(NVE_2605_REPLAY_DIR "${NVE_INSTALL_ROOT}/26.05/replay")
-set(NVE_2606_REPLAY_DIR "${NVE_INSTALL_ROOT}/26.06/replay")
-set(NVE_2607_REPLAY_DIR "${NVE_INSTALL_ROOT}/26.07/replay")
+set(NVE_DEFAULT_REPLAY_DIR "${NVE_INSTALL_ROOT}/default/replay")
 set(NVTX_INCLUDE_DIR "/workspace/deps/NVTX/c/include")
 
 find_package(Torch REQUIRED)
@@ -37,20 +34,10 @@ find_library(NVE_2605_TORCH_OPS_LIB nve-torch-ops
   PATHS "${NVE_2605_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
 find_library(NVE_2605_COMMON_LIB nve-common
   PATHS "${NVE_2605_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
-if(IS_DIRECTORY "${NVE_2606_ROOT}" AND IS_DIRECTORY "${NVE_2606_LIB_DIR}")
-  find_library(NVE_2606_TORCH_OPS_LIB nve-torch-ops
-    PATHS "${NVE_2606_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
-  find_library(NVE_2606_COMMON_LIB nve-common
-    PATHS "${NVE_2606_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
-  set(NVE_2606_AVAILABLE ON)
-else()
-  message(STATUS
-    "NVE 26.06 source or native libraries not found; skipping its replay plugin")
-endif()
-find_library(NVE_2607_TORCH_OPS_LIB nve-torch-ops
-  PATHS "${NVE_2607_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
-find_library(NVE_2607_COMMON_LIB nve-common
-  PATHS "${NVE_2607_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
+find_library(NVE_DEFAULT_TORCH_OPS_LIB nve-torch-ops
+  PATHS "${NVE_DEFAULT_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
+find_library(NVE_DEFAULT_COMMON_LIB nve-common
+  PATHS "${NVE_DEFAULT_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
 
 # Build a dedicated HSTU CUDA ops runtime library for C++ demos.
 # This avoids loading CPython extension modules from a pure C++ process.
@@ -166,8 +153,8 @@ if(NOT NVE_CACHE_LINE_SIZE)
   endif()
 endif()
 
-function(add_versioned_nve_loader_plugin
-    target nve_version nve_root nve_lib_dir replay_dir torch_ops_lib common_lib)
+function(add_nve_loader_plugin
+    target nve_root nve_lib_dir replay_dir torch_ops_lib common_lib)
   add_library(${target} MODULE nve_loader_plugin_impl.cu)
   set(version_script "${CMAKE_CURRENT_BINARY_DIR}/${target}.map")
   file(GENERATE OUTPUT "${version_script}" CONTENT
@@ -180,7 +167,6 @@ function(add_versioned_nve_loader_plugin
     ${TORCH_INCLUDE_DIRS}
   )
   target_compile_definitions(${target} PRIVATE
-    NVE_VERSION=${nve_version}
     NVE_FEATURE_HT_PART_FNV1A=1
     NVE_FEATURE_HT_PART_MURMUR=1
     NVE_FEATURE_HT_PART_RRXMRRXMSX0=1
@@ -220,26 +206,19 @@ function(add_versioned_nve_loader_plugin
   install(TARGETS ${target} LIBRARY DESTINATION "${replay_dir}")
 endfunction()
 
-add_versioned_nve_loader_plugin(
-  recsys_nve_loader_2605 2605
+add_nve_loader_plugin(
+  recsys_nve_loader_2605
   "${NVE_2605_ROOT}" "${NVE_2605_LIB_DIR}" "${NVE_2605_REPLAY_DIR}"
   "${NVE_2605_TORCH_OPS_LIB}" "${NVE_2605_COMMON_LIB}"
 )
-set(RECSYS_NVE_LOADER_TARGETS recsys_nve_loader_2605)
-if(NVE_2606_AVAILABLE)
-  add_versioned_nve_loader_plugin(
-    recsys_nve_loader_2606 2606
-    "${NVE_2606_ROOT}" "${NVE_2606_LIB_DIR}" "${NVE_2606_REPLAY_DIR}"
-    "${NVE_2606_TORCH_OPS_LIB}" "${NVE_2606_COMMON_LIB}"
-  )
-  list(APPEND RECSYS_NVE_LOADER_TARGETS recsys_nve_loader_2606)
-endif()
-add_versioned_nve_loader_plugin(
-  recsys_nve_loader_2607 2607
-  "${NVE_2607_ROOT}" "${NVE_2607_LIB_DIR}" "${NVE_2607_REPLAY_DIR}"
-  "${NVE_2607_TORCH_OPS_LIB}" "${NVE_2607_COMMON_LIB}"
+target_compile_definitions(recsys_nve_loader_2605 PRIVATE NVE_VERSION=2605)
+add_nve_loader_plugin(
+  recsys_nve_loader_default
+  "${NVE_DEFAULT_ROOT}" "${NVE_DEFAULT_LIB_DIR}" "${NVE_DEFAULT_REPLAY_DIR}"
+  "${NVE_DEFAULT_TORCH_OPS_LIB}" "${NVE_DEFAULT_COMMON_LIB}"
 )
-list(APPEND RECSYS_NVE_LOADER_TARGETS recsys_nve_loader_2607)
+set(RECSYS_NVE_LOADER_TARGETS
+  recsys_nve_loader_2605 recsys_nve_loader_default)
 
 add_dependencies(inference_hstu_gr_ranking_exported_model ${RECSYS_NVE_LOADER_TARGETS})
 add_dependencies(inference_hstu_gr_ranking_kvcache_exported_model ${RECSYS_NVE_LOADER_TARGETS})

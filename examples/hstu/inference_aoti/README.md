@@ -82,8 +82,9 @@ path/to/model_archive
         └── weights/*.nve                          # NVEmbedding weight data
 ```
 
-NVE 26.05 writes the legacy metadata contract, while NVE 26.06 and 26.07 use
-schema v2. An export must be loaded by a runtime from the same contract family.
+NVE 26.05 writes the legacy metadata contract, while the submodule-backed
+default NVE uses the newer contract. An export must be loaded by the same
+contract family.
 
 ---
 
@@ -93,8 +94,8 @@ schema v2. An export must be loaded by a runtime from the same contract family.
    `docker/Dockerfile`. It extends NVIDIA PyTorch 26.05
    (`nvcr.io/nvidia/pytorch:26.05-py3`) with the repository's FBGEMM, FlexKV,
    HSTU, DynamicEmb, commons, KV-cache manager, and isolated NVE 26.05 and
-   26.07 installations. The image selects 26.07 by default. See the HSTU
-   example [README](../README.md) for broader training and inference context.
+   submodule-backed default versions. The image selects the default. See
+   the HSTU example [README](../README.md) for broader context.
 
 2. Triton Server testing uses `docker/Dockerfile.tritonserver`, based on NVIDIA
    Triton Server 26.06 (`nvcr.io/nvidia/tritonserver:26.06-py3`). It copies the
@@ -107,11 +108,12 @@ schema v2. An export must be loaded by a runtime from the same contract family.
 
 ### NVE support
 
-Python export/reload and native C++ replay support NVE 26.05 through 26.07.
-The development image provides 26.05 and 26.07; a 26.06 installation must be
-supplied separately. The current Triton model-init hook supports only 26.05.
+Python export/reload and native C++ replay support NVE 26.05 and the
+submodule-backed default (26.06 or later). Upgrading the submodule updates the
+default without changing these workflows. The Triton model-init hook supports
+only 26.05.
 
-Select one installation before starting Python:
+The default needs no `NVE_VERSION`. To select 26.05 before starting Python:
 
 ```bash
 export NVE_INSTALL_ROOT=/opt/nve
@@ -119,8 +121,8 @@ export NVE_VERSION=26.05
 export PYTHONPATH="${NVE_INSTALL_ROOT}/${NVE_VERSION}/python:/workspace/recsys-examples/examples:/workspace/recsys-examples/examples/hstu"
 ```
 
-A custom install root must be absolute, use the
-`<root>/<version>/python/pynve` layout, and remain outside Python's automatic
+A custom install root must be absolute, contain
+`<root>/{26.05,default}/python/pynve`, and remain outside Python's automatic
 `site-packages` directories. Do not expose a second NVE installation through
 `PYTHONPATH`, `.pth`, `LD_LIBRARY_PATH`, or `LD_PRELOAD`.
 

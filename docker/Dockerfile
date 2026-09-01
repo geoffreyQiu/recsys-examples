@@ -261,9 +261,9 @@ RUN cd FlexKV && mkdir -p build && cd build && \
     cd .. && mkdir -p flexkv/lib && cp -P build/lib/*.so* flexkv/lib/ && \
     MAX_JOBS=8 FLEXKV_DEBUG=0 TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" python3 setup.py install
 
-# -- Layer 5: NVE 26.05/26.07 source trees and shared NVTX headers. The parent
-# repository pins 26.07 through its NVE submodule; 26.05 uses its release tag.
-COPY third_party/nv-embedding-cache /workspace/deps/nve-26.07
+# -- Layer 5: NVE 26.05/default source trees and shared NVTX headers. The
+# default build follows the repository submodule; 26.05 uses its release tag.
+COPY third_party/nv-embedding-cache /workspace/deps/nve
 RUN git clone --recursive -b v26.05 \
       https://github.com/NVIDIA/nv-embedding-cache.git nve-26.05 && \
     git clone -b v3.5.0 https://github.com/NVIDIA/NVTX.git NVTX
@@ -274,7 +274,9 @@ RUN set -eux; \
     if [ "${TARGETPLATFORM}" != "linux/arm64" ]; then \
       export PYNVE_DISABLE_AVX512=1; \
     fi; \
-    for version in 26.05 26.07; do \
+    for version in 26.05 default; do \
+      source_dir="/workspace/deps/nve"; \
+      if [ "${version}" = 26.05 ]; then source_dir="${source_dir}-26.05"; fi; \
       mkdir -p "/opt/nve/${version}/python"; \
       PYNVE_BUILD_DIR="/workspace/build/pynve-${version}" \
       PYNVE_WITH_TORCH_BINDINGS=1 \
@@ -282,14 +284,14 @@ RUN set -eux; \
       CPLUS_INCLUDE_PATH="/workspace/deps/NVTX/c/include${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}" \
       python3 -m pip install --no-build-isolation --no-deps \
         --target "/opt/nve/${version}/python" \
-        "/workspace/deps/nve-${version}"; \
+        "${source_dir}"; \
     done; \
     rm -rf /workspace/build
 
-# The development image selects 26.07 by default. Commands selecting 26.05
-# replace this value rather than appending to it. Keep "." ahead of the HSTU
-# path so sibling examples resolve their own local modules.
-ENV PYTHONPATH=/opt/nve/26.07/python:.:/workspace/recsys-examples/examples:/workspace/recsys-examples/examples/hstu
+# The development image selects the submodule-backed NVE by default. Commands
+# selecting 26.05 replace this value rather than appending to it. Keep "." ahead
+# of the HSTU path so sibling examples resolve their own local modules.
+ENV PYTHONPATH=/opt/nve/default/python:.:/workspace/recsys-examples/examples:/workspace/recsys-examples/examples/hstu
 
 # Install fbgemm_gpu_hstu (package: fbgemm_gpu_hstu, import: hstu) from submodule.
 COPY third_party/FBGEMM /workspace/deps/fbgemm_hstu
@@ -338,7 +340,7 @@ RUN cd /workspace/recsys-examples/corelib/dynamicemb && \
     cmake .. && make -j
 
 # ============================================================================
-# AOTI additions: version-independent C++ replay, two versioned NVE loader
+# AOTI additions: version-independent C++ replay, two NVE loader
 # plugins, the 26.05 Triton init hook, and existing runtime-library staging.
 # ============================================================================
 RUN cd /workspace/recsys-examples/corelib/recsys_kvcache_manager && \
@@ -349,9 +351,9 @@ RUN export CMAKE_PREFIX_PATH="$(python3 -c 'import os, torch; print(os.path.join
     cmake -S "./examples/hstu/inference_aoti/cpp_inference" \
       -B "./examples/hstu/inference_aoti/cpp_inference/build" \
       -DNVE_2605_ROOT=/workspace/deps/nve-26.05 \
-      -DNVE_2607_ROOT=/workspace/deps/nve-26.07 \
+      -DNVE_DEFAULT_ROOT=/workspace/deps/nve \
       -DNVE_2605_LIB_DIR=/opt/nve/26.05/python/pynve \
-      -DNVE_2607_LIB_DIR=/opt/nve/26.07/python/pynve \
+      -DNVE_DEFAULT_LIB_DIR=/opt/nve/default/python/pynve \
       -DNVTX_INCLUDE_DIR=/workspace/deps/NVTX/c/include && \
     cmake --build "./examples/hstu/inference_aoti/cpp_inference/build" -j 8 && \
     cmake --install "./examples/hstu/inference_aoti/cpp_inference/build"

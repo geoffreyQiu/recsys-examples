@@ -8,10 +8,11 @@ import site
 from pathlib import Path
 
 _DEFAULT_NVE_INSTALL_ROOT = Path("/opt/nve")
-_SUPPORTED_GENERATIONS = ("26.05", "26.06", "26.07")
+_NVE_2605 = (26, 5)
+_DEFAULT_NVE_MINIMUM = (26, 6)
 
 
-def _expected_pynve_dir(generation: str) -> Path:
+def _expected_pynve_dir(version: str) -> Path:
     configured = os.environ.get(
         "NVE_INSTALL_ROOT", os.fspath(_DEFAULT_NVE_INSTALL_ROOT)
     )
@@ -43,58 +44,59 @@ def _expected_pynve_dir(generation: str) -> Path:
             f"searched site-packages root {containing_site_root}. Use an isolated "
             "root such as /opt/nve"
         )
-    return (install_root / generation / "python" / "pynve").resolve()
+    return (install_root / version / "python" / "pynve").resolve()
+
+
+def _parse_generation(value: str, name: str) -> tuple[int, int]:
+    parts = value.split(".")
+    try:
+        generation = (int(parts[0]), int(parts[1]))
+    except (IndexError, ValueError) as error:
+        raise RuntimeError(f"Invalid {name}={value!r}") from error
+    if generation != _NVE_2605 and generation < _DEFAULT_NVE_MINIMUM:
+        raise RuntimeError(
+            f"Unsupported {name}={value!r}; expected 26.05 or 26.06 and later"
+        )
+    return generation
 
 
 def imported_nve_generation() -> str:
     """Return the generation of the already selected ``pynve`` package.
 
     The development image deliberately has no unversioned pynve installation.
-    A selected package must come from
-    ``NVE_INSTALL_ROOT/<generation>/python``.
+    A selected package must come from the ``26.05`` or ``default`` version.
     """
     import pynve
 
     version = str(getattr(pynve, "__version__", "unknown"))
-    generation = next(
-        (
-            candidate
-            for candidate in _SUPPORTED_GENERATIONS
-            if version == candidate or version.startswith(f"{candidate}.")
-        ),
-        None,
-    )
-    if generation is None:
-        raise RuntimeError(
-            f"Unsupported pynve version {version!r}; expected 26.05.x, "
-            "26.06.x, or 26.07.x"
-        )
+    generation = _parse_generation(version, "pynve version")
 
-    declared_generation = os.environ.get("NVE_VERSION")
-    if declared_generation:
-        if declared_generation not in _SUPPORTED_GENERATIONS:
-            raise RuntimeError(
-                f"Unsupported NVE_VERSION={declared_generation!r}; expected "
-                "exactly 26.05, 26.06, or 26.07"
-            )
-        if declared_generation != generation:
-            raise RuntimeError(
-                f"NVE_VERSION={declared_generation} but imported pynve "
-                f"{version} from {getattr(pynve, '__file__', None)}"
-            )
+    declared_version = os.environ.get("NVE_VERSION")
+    declared_generation = (
+        _parse_generation(declared_version, "NVE_VERSION")
+        if declared_version
+        else _DEFAULT_NVE_MINIMUM
+    )
+    selected_version = "26.05" if declared_generation == _NVE_2605 else "default"
+    if (generation == _NVE_2605) != (selected_version == "26.05"):
+        raise RuntimeError(
+            f"NVE_VERSION={declared_version!r} selects {selected_version}, "
+            "but imported "
+            f"pynve {version} from {getattr(pynve, '__file__', None)}"
+        )
 
     package_file = getattr(pynve, "__file__", None)
     if package_file is None:
         raise RuntimeError("The imported pynve package has no __file__")
     actual_dir = Path(package_file).resolve().parent
-    expected_dir = _expected_pynve_dir(generation)
+    expected_dir = _expected_pynve_dir(selected_version)
     if actual_dir != expected_dir:
         raise RuntimeError(
             f"pynve {version} was imported from {actual_dir}; expected "
-            f"{expected_dir}. Select exactly one versioned NVE Python prefix "
+            f"{expected_dir}. Select exactly one NVE Python prefix "
             "through PYTHONPATH"
         )
-    return generation
+    return f"{generation[0]:02d}.{generation[1]:02d}"
 
 
 def gpu_only_constructor_kwargs() -> dict[str, object]:

@@ -8,6 +8,7 @@
 #include <dlfcn.h>
 
 #include <array>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <stdexcept>
@@ -15,7 +16,7 @@
 #include <utility>
 
 #if !defined(RECSYS_NVE_INSTALL_ROOT)
-#error "CMake must provide the versioned NVE install root"
+#error "CMake must provide the NVE install root"
 #endif
 
 namespace recsys::nve_loader {
@@ -40,6 +41,14 @@ void* required_symbol(void* handle, const char* name) {
   return symbol;
 }
 
+bool is_supported_default_version(const char* version) {
+  int major = 0;
+  int minor = 0;
+  char trailing = '\0';
+  return std::sscanf(version, "%d.%d%c", &major, &minor, &trailing) == 2 &&
+      (major > 26 || (major == 26 && minor >= 6));
+}
+
 }  // namespace
 
 NveLoaderPlugin::NveLoaderPlugin(std::string package_dir)
@@ -48,30 +57,25 @@ NveLoaderPlugin::NveLoaderPlugin(std::string package_dir)
     throw std::runtime_error("NVE package directory must not be empty");
   }
 
-  const char* version = std::getenv("NVE_VERSION");
-  if (version == nullptr || version[0] == '\0') {
-    throw std::runtime_error(
-        "NVE_VERSION must be set to exactly 26.05, 26.06, or 26.07");
-  }
-  selected_version_ = version;
-  if (selected_version_ == "26.05") {
-    loader_version_ = LoaderVersion::kNve2605;
-  } else if (selected_version_ == "26.06" ||
-             selected_version_ == "26.07") {
-    loader_version_ = LoaderVersion::kNve2606;
-  } else {
-    throw std::runtime_error(
-        "Unsupported NVE_VERSION=" + selected_version_ +
-        "; expected exactly 26.05, 26.06, or 26.07");
+  const char* requested_version = std::getenv("NVE_VERSION");
+  if (requested_version != nullptr && requested_version[0] != '\0') {
+    if (std::string(requested_version) == "26.05") {
+      version_ = NveVersion::kNve2605;
+    } else if (!is_supported_default_version(requested_version)) {
+      throw std::runtime_error(
+          "Unsupported NVE_VERSION=" + std::string(requested_version) +
+          "; expected 26.05 or 26.06 and later");
+    }
   }
 
+  // NVE 26.05 uses the compatibility plugin; newer NVE uses the default one.
   const auto plugin_path = std::filesystem::path(kNveInstallRoot) /
-      selected_version_ / "replay/librecsys_nve_loader.so";
+      selected_version() / "replay/librecsys_nve_loader.so";
   dlerror();
   void* handle = dlopen(plugin_path.c_str(), RTLD_NOW | RTLD_LOCAL);
   if (handle == nullptr) {
     throw std::runtime_error(
-        "Failed to load NVE " + selected_version_ + " plugin " +
+        "Failed to load NVE " + std::string(selected_version()) + " plugin " +
         plugin_path.string() + ": " + dl_error_or_unknown());
   }
   // Do not dlclose: PyTorch retains operators registered by the plugin.
@@ -88,12 +92,12 @@ NveLoaderPlugin::~NveLoaderPlugin() {
   }
 }
 
-const std::string& NveLoaderPlugin::selected_version() const noexcept {
-  return selected_version_;
+const char* NveLoaderPlugin::selected_version() const noexcept {
+  return version_ == NveVersion::kNve2605 ? "26.05" : "default";
 }
 
 bool NveLoaderPlugin::requires_aoti_loader() const noexcept {
-  return loader_version_ == LoaderVersion::kNve2606;
+  return version_ == NveVersion::kDefault;
 }
 
 void NveLoaderPlugin::create_state(
