@@ -337,7 +337,12 @@ RUN cd /workspace/recsys-examples/corelib/dynamicemb && \
     ln -s /usr/local/cuda-13/compat/lib.real/libcuda.so.1 /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
     cd /workspace/recsys-examples/corelib/dynamicemb && \
     mkdir -p torch_binding_build && cd torch_binding_build && \
-    cmake .. && make -j
+    cmake .. \
+      -DDYNAMICEMB_BUILD_NVE_UPDATE=ON \
+      -DNVE_ROOT=/workspace/deps/nve \
+      -DNVE_LIB_DIR=/opt/nve/default/python/pynve \
+      -DNVTX_INCLUDE_DIR=/workspace/deps/NVTX/c/include && \
+    make -j
 
 # ============================================================================
 # AOTI additions: version-independent C++ replay, two NVE loader
