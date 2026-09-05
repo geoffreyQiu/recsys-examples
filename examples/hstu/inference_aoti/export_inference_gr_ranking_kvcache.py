@@ -27,7 +27,6 @@ import pynve
 import torch
 import torch.distributed as dist
 from commons.datasets import get_data_loader
-from commons.datasets.hstu_batch import HSTUBatch
 from commons.datasets.hstu_sequence_dataset import get_dataset
 from commons.hstu_data_preprocessor import get_common_preprocessors
 from commons.utils.stringify import stringify_dict
@@ -63,6 +62,10 @@ from utils import NetworkArgs, TensorModelParallelArgs
 
 sys.path.append("./training/")
 from inference_aoti.nve_aoti_compat import load_aoti, prepare_output_directories
+from inference_aoti.packed_kjt_input import (
+    HSTUPackedInputWrapper,
+    kjt_to_request_major,
+)
 from pretrain_gr_ranking import create_ranking_config
 from trainer.utils import create_hstu_config, get_dataset_and_embedding_args
 
@@ -564,99 +567,46 @@ def export_inference_gr_ranking(
             )
             batch.labels = None
 
-            # ---- Plain-tuple input wrapper (Triton AOTI call_spec compatibility) ----
-            # Triton's PyTorch AOTI backend accepts builtin pytree containers plus
-            # tensors, but rejects custom HSTUBatch / KeyedJaggedTensor nodes in the
-            # exported input spec. Export a thin wrapper with only tensor inputs and
-            # rebuild the HSTUBatch internally. Its batch_size is constant metadata
-            # required by HSTUBatch; graph execution derives the logical batch size
-            # from the input tensor shapes instead.
-            class _PlainInputWrapper(torch.nn.Module):
-                def __init__(self, inner, example_batch):
-                    super().__init__()
-                    self.inner = inner
-                    self._batch_size = config_max_batch_size
-                    self._keys = list(example_batch.features.keys())
-                    self._contextual_feature_names = list(
-                        example_batch.contextual_feature_names
-                    )
-                    self._item_feature_name = example_batch.item_feature_name
-                    self._action_feature_name = example_batch.action_feature_name
-                    self._feature_to_max_seqlen = dict(
-                        example_batch.feature_to_max_seqlen
-                    )
-                    self._max_num_candidates = int(example_batch.max_num_candidates)
-                    self._actual_batch_size = config_max_batch_size
+            feature_keys = tuple(batch.features.keys())
+            export_model = HSTUPackedInputWrapper(
+                model,
+                batch,
+                with_kv_cache=True,
+            )
 
-                def _rebuild_batch(self, values, lengths, num_candidates):
-                    offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
-                        lengths.long()
-                    )
-                    features = KeyedJaggedTensor(
-                        keys=self._keys,
-                        values=values,
-                        lengths=lengths,
-                        offsets=offsets,
-                    )
-                    return HSTUBatch(
-                        features=features,
-                        batch_size=self._batch_size,
-                        feature_to_max_seqlen=self._feature_to_max_seqlen,
-                        contextual_feature_names=self._contextual_feature_names,
-                        actual_batch_size=self._actual_batch_size,
-                        item_feature_name=self._item_feature_name,
-                        action_feature_name=self._action_feature_name,
-                        max_num_candidates=self._max_num_candidates,
-                        num_candidates=num_candidates,
-                    )
+            def make_plain_inputs(input_batch, input_user_ids, input_history_lengths):
+                values_rm, lengths_rm = kjt_to_request_major(
+                    input_batch.features,
+                    feature_keys,
+                )
+                return [
+                    values_rm,
+                    lengths_rm,
+                    input_batch.num_candidates,
+                    input_user_ids,
+                    input_history_lengths,
+                ]
 
-                def forward(
-                    self,
-                    values,
-                    lengths,
-                    num_candidates,
-                    user_ids,
-                    total_history_lengths,
-                ):
-                    rebuilt = self._rebuild_batch(values, lengths, num_candidates)
-                    logits, auxiliary_output = _split_model_outputs(
-                        self.inner(rebuilt, user_ids.cpu(), total_history_lengths.cpu())
-                    )
-                    if auxiliary_output is not None:
-                        raise RuntimeError(
-                            "Expected the no-offload model to return logits only"
-                        )
-                    return logits.float().cpu()
-
-            export_model = _PlainInputWrapper(model, batch)
-            example_values = batch.features.values()
-            example_lengths = batch.features.lengths()
-            example_num_candidates = batch.num_candidates
             user_ids_cuda, total_history_lengths_cuda = (
                 user_ids.cuda(),
                 total_history_lengths.cuda(),
             )
-            example_inputs = (
-                example_values,
-                example_lengths,
-                example_num_candidates,
-                user_ids_cuda,
-                total_history_lengths_cuda,
-            )
-
-            with torch.inference_mode():
-                rebuilt_batch = export_model._rebuild_batch(
-                    example_values, example_lengths, example_num_candidates
+            example_inputs = tuple(
+                make_plain_inputs(
+                    batch,
+                    user_ids_cuda,
+                    total_history_lengths_cuda,
                 )
+            )
+            example_values, example_lengths, example_num_candidates = example_inputs[:3]
 
             # get dynamic shapes (now keyed on the plain tensor inputs)
             sc = ShapesCollection()
             dim_batch = Dim("batch_size", min=1, max=8)
 
-            num_features = len(batch.features.keys())
             max_tokens = config_max_batch_size * total_max_seqlen
             sc[example_values] = {0: Dim("tokens", min=1, max=max_tokens)}
-            sc[example_lengths] = {0: dim_batch * num_features}
+            sc[example_lengths] = {0: dim_batch}
             sc[example_num_candidates] = {0: dim_batch}
             sc[user_ids_cuda] = {0: dim_batch}
             sc[total_history_lengths_cuda] = {0: dim_batch}
@@ -703,20 +653,23 @@ def export_inference_gr_ranking(
             compiled_results = []
             with torch.inference_mode():
                 for batch, user_ids, total_history_lengths in inputs:
-                    compiled_outputs = aoti_model_runtime.run(
-                        [
-                            batch.features.values(),
-                            batch.features.lengths(),
-                            batch.num_candidates,
-                            user_ids,
-                            total_history_lengths,
-                        ]
+                    compiled_inputs = make_plain_inputs(
+                        batch,
+                        user_ids,
+                        total_history_lengths,
                     )
-                    compiled_results.append(_split_model_outputs(compiled_outputs))
+                    compiled_outputs = aoti_model_runtime.run(
+                        compiled_inputs
+                    )
+                    compiled_results.append(
+                        (compiled_inputs, _split_model_outputs(compiled_outputs))
+                    )
 
             with torch.inference_mode():
                 for batch, user_ids, total_history_lengths in inputs:
-                    logits, auxiliary_output = compiled_results[dump_idx]
+                    compiled_inputs, (logits, auxiliary_output) = compiled_results[
+                        dump_idx
+                    ]
                     if auxiliary_output is not None:
                         raise RuntimeError(
                             "Expected the compiled no-offload AOTI model to "
@@ -731,25 +684,25 @@ def export_inference_gr_ranking(
                         feature_keys_dumped = True
 
                     _save_tensor_cpp_compatible(
-                        batch.features.values().detach().cpu(),
+                        compiled_inputs[0].detach().cpu(),
                         os.path.join(dump_dir, f"batch_{dump_idx:06d}_values.pt"),
                     )
                     _save_tensor_cpp_compatible(
-                        batch.features.lengths().detach().cpu(),
+                        compiled_inputs[1].detach().cpu(),
                         os.path.join(dump_dir, f"batch_{dump_idx:06d}_lengths.pt"),
                     )
                     _save_tensor_cpp_compatible(
-                        batch.num_candidates.detach().cpu(),
+                        compiled_inputs[2].detach().cpu(),
                         os.path.join(
                             dump_dir, f"batch_{dump_idx:06d}_num_candidates.pt"
                         ),
                     )
                     _save_tensor_cpp_compatible(
-                        user_ids.detach().cpu(),
+                        compiled_inputs[3].detach().cpu(),
                         os.path.join(dump_dir, f"batch_{dump_idx:06d}_user_ids.pt"),
                     )
                     _save_tensor_cpp_compatible(
-                        total_history_lengths.detach().cpu(),
+                        compiled_inputs[4].detach().cpu(),
                         os.path.join(
                             dump_dir, f"batch_{dump_idx:06d}_total_history_lengths.pt"
                         ),
@@ -762,7 +715,10 @@ def export_inference_gr_ranking(
                     )
                     print(f"    [Batch {dump_idx + 1}] Dumped C++ replay tensors")
                     dump_idx += 1
-                    eval_module(logits.cuda(), batch.labels.values())
+                    eval_module(
+                        logits.reshape(-1, logits.shape[-1]).cuda(),
+                        batch.labels.values(),
+                    )
 
             print(f"[INFO] Dumped {dump_idx} test batches to {dump_dir}.")
 

@@ -46,7 +46,7 @@ def kjt_to_request_major(
 
 
 class HSTUPackedInputWrapper(torch.nn.Module):
-    """Expose the non-KV HSTU model through plain jagged tensors."""
+    """Expose an HSTU model through request-major jagged tensors."""
 
     def __init__(
         self,
@@ -54,10 +54,12 @@ class HSTUPackedInputWrapper(torch.nn.Module):
         example_batch: HSTUBatch,
         *,
         request_major: bool = True,
+        with_kv_cache: bool = False,
     ) -> None:
         super().__init__()
         self.inner = inner
         self._request_major = request_major
+        self._with_kv_cache = with_kv_cache
         self._keys = tuple(example_batch.features.keys())
         self._contextual_feature_names = list(
             example_batch.contextual_feature_names
@@ -72,6 +74,8 @@ class HSTUPackedInputWrapper(torch.nn.Module):
         values: torch.Tensor,
         lengths: torch.Tensor,
         num_candidates: torch.Tensor,
+        user_ids: torch.Tensor | None = None,
+        total_history_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self._request_major:
             values_fm, lengths_fm, offsets_fm = torch.ops.packed_jagged.reorder(
@@ -102,4 +106,15 @@ class HSTUPackedInputWrapper(torch.nn.Module):
             max_num_candidates=self._max_num_candidates,
             num_candidates=num_candidates,
         )
+        if self._with_kv_cache:
+            logits = self.inner(
+                batch,
+                user_ids.cpu(),
+                total_history_lengths.cpu(),
+            )
+            return logits.reshape(
+                num_candidates.shape[0],
+                self._max_num_candidates,
+                -1,
+            ).float().cpu()
         return self.inner(batch).float().cpu()

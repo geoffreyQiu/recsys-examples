@@ -4,36 +4,37 @@
 
 name: "hstu_gr_ranking_kvcache"
 platform: "torch_aoti"
-# Triton's scheduler-level batching is disabled. The five tensors below encode
-# one logical HSTU batch inside a single Triton call. The AOTI dynamic-shape
-# contract and KV-cache runtime accept logical batch sizes from 1 through 8.
-max_batch_size: 0
+max_batch_size: 8
 
 input [
   {
     name: "INPUT__0"
     data_type: TYPE_INT64
     dims: [ -1 ]
+    allow_ragged_batch: true
   },
   {
     name: "INPUT__1"
     data_type: TYPE_INT64
-    dims: [ -1 ]
+    dims: [ 8 ]
   },
   {
     name: "INPUT__2"
     data_type: TYPE_INT64
-    dims: [ -1 ]
+    dims: [ 1 ]
+    reshape: { shape: [ ] }
   },
   {
     name: "INPUT__3"
     data_type: TYPE_INT64
-    dims: [ -1 ]
+    dims: [ 1 ]
+    reshape: { shape: [ ] }
   },
   {
     name: "INPUT__4"
     data_type: TYPE_INT64
-    dims: [ -1 ]
+    dims: [ 1 ]
+    reshape: { shape: [ ] }
   }
 ]
 
@@ -41,9 +42,13 @@ output [
   {
     name: "OUTPUT__0"
     data_type: TYPE_FP32
-    dims: [ -1, 8 ]
+    dims: [ 100, 8 ]
   }
 ]
+
+dynamic_batching {
+  max_queue_delay_microseconds: 5000
+}
 
 instance_group [
   {

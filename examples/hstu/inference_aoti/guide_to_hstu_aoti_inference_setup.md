@@ -329,12 +329,11 @@ Run the request replay client against the dumped tensors:
 
 ```bash
 cd ${HSTU_DIR}
-python3 inference_aoti/test_tritonserver_aoti_hstu_model.py \
-  --workflow kv-cache \
+python3 inference_aoti/test_tritonserver_aoti_hstu_kvcache_autobatching.py \
   --dump_dir inference_aoti/export_test_dump \
   --url localhost:8000 \
   --model_name hstu_gr_ranking_kvcache \
-  --batch_size 2
+  --batch_size 8
 ```
 
 This request path validates that:
@@ -343,4 +342,5 @@ This request path validates that:
 2. the NVE model-init hook is working
 3. the custom operator libraries are visible
 4. the KV-cache runtime service is reachable
-5. the model input/output contract matches the dumped replay data
+5. both cache-miss and cache-hit bursts are dynamically batched and match the
+   dump

@@ -37,7 +37,7 @@ Triton Server AOTI deployment:
 
 - `nve_init_hook/`
 - `triton_aoti/hstu_gr_ranking_kvcache/`
-- `test_tritonserver_aoti_hstu_model.py`
+- `test_tritonserver_aoti_hstu_kvcache_autobatching.py`
 
 FlexKV server launcher:
 
@@ -251,7 +251,7 @@ docker run \
     python3 ./inference_aoti/export_inference_gr_ranking_kvcache.py \
       --gin_config_file ./inference/configs/kuairand_1k_inference_ranking.gin \
       --checkpoint_dir ./ckpt/kuairand_1k_ckpt \
-      --max_bs 2 --kvcache_config_file \${KVCACHE_MANAGER_CONFIG_FILE}
+      --max_bs 8 --kvcache_config_file \${KVCACHE_MANAGER_CONFIG_FILE}
 
     python3 ./inference_aoti/start_flexkv_server_for_kvcache_cpp.py \
       --config_file \${KVCACHE_MANAGER_CONFIG_FILE} > flexkv_cache_server.log 2>&1 &
@@ -282,6 +282,10 @@ DOCKER_BUILDKIT=1 docker build --progress=plain \
 
 ### 5. Replay the exported model through Triton Server
 
+The client sends concurrent `B=1` cache-miss and cache-hit requests. Triton
+`batch_stats` is the batching proof; `PACKED_JAGGED_BATCH_LOG=1` additionally
+logs the `B/M/T` seen by the packed-input adapter.
+
 ```bash
 docker run \
   --rm --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 --gpus 1 \
@@ -307,16 +311,16 @@ docker run \
     sleep 10
     kill -0 \${kvserver_pid}
 
+    PACKED_JAGGED_BATCH_LOG=1 \
     tritonserver --model-repository=/triton_model_repo/ &
     triton_pid=\$!
     sleep 30
 
-    python3 test_tritonserver_aoti_hstu_model.py \
-      --workflow kv-cache \
+    python3 test_tritonserver_aoti_hstu_kvcache_autobatching.py \
       --dump_dir export_test_dump \
       --url localhost:8000 \
       --model_name hstu_gr_ranking_kvcache \
-      --batch_size 2 > test_benchmark.log
+      --batch_size 8 > test_benchmark.log
     cat test_benchmark.log
     kill \$triton_pid || true
     kill -9 \$triton_pid || true
