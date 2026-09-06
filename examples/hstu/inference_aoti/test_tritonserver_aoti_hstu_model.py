@@ -4,6 +4,7 @@
 import argparse
 import json
 import time
+from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -26,19 +27,17 @@ WORKFLOW_INPUT_TENSORS = {
         ("INPUT__4", "total_history_lengths"),
     ],
 }
-InputCase = tuple[int, list[np.ndarray]]
 SUPPORTED_BATCH_SIZES = (2, 4, 8)
 WARMUP_COUNT = 2
 CACHE_MEASUREMENT_SET_COUNT = 3
+OUTPUT_ATOL = 0.0625
 
 
 @dataclass(frozen=True)
-class InputSample:
-    feature_values: tuple[np.ndarray, ...]
-    feature_lengths: np.ndarray
-    num_candidates: np.ndarray
-    user_ids: np.ndarray
-    total_history_lengths: np.ndarray
+class InputCase:
+    batch_index: int
+    inputs: list[np.ndarray]
+    compiled_logits: np.ndarray | None = None
 
 
 def _load_dumped_tensor(path: Path) -> np.ndarray:
@@ -49,10 +48,10 @@ def _load_dumped_tensor(path: Path) -> np.ndarray:
     return tensor.numpy()
 
 
-def _make_input(httpclient, name: str, array: np.ndarray):
+def _make_input(client_module, name: str, array: np.ndarray):
     if array.dtype != np.int64:
         array = array.astype(np.int64, copy=False)
-    infer_input = httpclient.InferInput(name, array.shape, "INT64")
+    infer_input = client_module.InferInput(name, array.shape, "INT64")
     infer_input.set_data_from_numpy(array)
     return infer_input
 
@@ -71,12 +70,17 @@ def _load_input_cases(dump_dir: Path, workflow: str) -> list[InputCase]:
     for batch_index in _find_batch_indices(dump_dir):
         prefix = dump_dir / f"batch_{batch_index:06d}"
         input_cases.append(
-            (
-                batch_index,
-                [
+            InputCase(
+                batch_index=batch_index,
+                inputs=[
                     _load_dumped_tensor(Path(f"{prefix}_{suffix}.pt"))
                     for _, suffix in input_tensors
                 ],
+                compiled_logits=(
+                    _load_dumped_tensor(Path(f"{prefix}_compiled_logits.pt"))
+                    if workflow == "kv-cache"
+                    else None
+                ),
             )
         )
     if not input_cases:
@@ -85,13 +89,20 @@ def _load_input_cases(dump_dir: Path, workflow: str) -> list[InputCase]:
 
 
 def _make_inputs(
-    httpclient,
+    client_module,
     input_case: list[np.ndarray],
     workflow: str,
+    *,
+    scheduler_batch: bool = False,
 ):
+    arrays = (
+        [array.reshape(1, -1) for array in input_case]
+        if scheduler_batch
+        else input_case
+    )
     return [
-        _make_input(httpclient, input_name, array)
-        for (input_name, _), array in zip(WORKFLOW_INPUT_TENSORS[workflow], input_case)
+        _make_input(client_module, input_name, array)
+        for (input_name, _), array in zip(WORKFLOW_INPUT_TENSORS[workflow], arrays)
     ]
 
 
@@ -99,11 +110,7 @@ def _logical_batch_size(
     input_case: Sequence[np.ndarray], workflow: str = "kv-cache"
 ) -> int:
     values, lengths, num_candidates = input_case[:3]
-    named_arrays = [
-        ("values", values),
-        ("lengths", lengths),
-        ("num_candidates", num_candidates),
-    ]
+    named_arrays = [("values", values), ("num_candidates", num_candidates)]
     if workflow == "kv-cache":
         user_ids, total_history_lengths = input_case[3:5]
         named_arrays.extend(
@@ -119,6 +126,10 @@ def _logical_batch_size(
     for name, array in named_arrays:
         if array.ndim != 1:
             raise ValueError(f"{name} must be one-dimensional, got {array.shape}")
+    if lengths.ndim not in (1, 2):
+        raise ValueError(
+            f"lengths must be one- or two-dimensional, got {lengths.shape}"
+        )
 
     if batch_size < 1 or batch_size > max(SUPPORTED_BATCH_SIZES):
         raise ValueError(f"Unsupported logical batch size: {batch_size}")
@@ -137,6 +148,11 @@ def _logical_batch_size(
             f"{lengths.size} feature lengths are not divisible by batch size "
             f"{batch_size}"
         )
+    if lengths.ndim == 2 and lengths.shape[0] != batch_size:
+        raise ValueError(
+            f"lengths first dimension must be batch size {batch_size}, got "
+            f"{lengths.shape}"
+        )
     if np.any(lengths < 0):
         raise ValueError("Feature lengths must be non-negative")
     if int(lengths.sum()) != values.size:
@@ -147,11 +163,13 @@ def _logical_batch_size(
     return batch_size
 
 
-def _iter_input_samples(input_cases: Sequence[InputCase]) -> Iterator[InputSample]:
+def _iter_input_samples(input_cases: Sequence[InputCase]) -> Iterator[InputCase]:
     expected_num_features = None
-    for _, input_case in input_cases:
-        batch_size = _logical_batch_size(input_case)
-        values, lengths, num_candidates, user_ids, total_history_lengths = input_case
+    for input_case in input_cases:
+        batch_size = _logical_batch_size(input_case.inputs)
+        values, lengths, num_candidates, user_ids, total_history_lengths = (
+            input_case.inputs
+        )
         num_features = lengths.size // batch_size
         if expected_num_features is None:
             expected_num_features = num_features
@@ -161,61 +179,60 @@ def _iter_input_samples(input_cases: Sequence[InputCase]) -> Iterator[InputSampl
                 f"{num_features} versus {expected_num_features}"
             )
 
-        lengths_by_feature = lengths.reshape(num_features, batch_size)
-        offsets = np.empty(lengths.size + 1, dtype=np.int64)
-        offsets[0] = 0
-        np.cumsum(lengths, dtype=np.int64, out=offsets[1:])
-        for sample_index in range(batch_size):
-            feature_values = tuple(
-                values[
-                    offsets[feature_index * batch_size + sample_index] : offsets[
-                        feature_index * batch_size + sample_index + 1
-                    ]
-                ]
-                for feature_index in range(num_features)
+        lengths_rm = lengths.reshape(batch_size, num_features)
+        tokens_per_request = lengths_rm.sum(axis=1, dtype=np.int64)
+        request_offsets = np.empty(batch_size + 1, dtype=np.int64)
+        request_offsets[0] = 0
+        np.cumsum(tokens_per_request, out=request_offsets[1:])
+        if (
+            input_case.compiled_logits is None
+            or input_case.compiled_logits.shape[0] != batch_size
+        ):
+            raise ValueError(
+                f"batch_{input_case.batch_index:06d} needs one compiled "
+                "reference per request"
             )
-            yield InputSample(
-                feature_values=feature_values,
-                feature_lengths=lengths_by_feature[:, sample_index],
-                num_candidates=num_candidates[sample_index : sample_index + 1],
-                user_ids=user_ids[sample_index : sample_index + 1],
-                total_history_lengths=total_history_lengths[
+        for sample_index in range(batch_size):
+            yield InputCase(
+                batch_index=input_case.batch_index,
+                inputs=[
+                    values[
+                        request_offsets[sample_index] : request_offsets[
+                            sample_index + 1
+                        ]
+                    ],
+                    lengths_rm[sample_index],
+                    num_candidates[sample_index : sample_index + 1],
+                    user_ids[sample_index : sample_index + 1],
+                    total_history_lengths[sample_index : sample_index + 1],
+                ],
+                compiled_logits=input_case.compiled_logits[
                     sample_index : sample_index + 1
                 ],
             )
 
 
-def _merge_samples(samples: Sequence[InputSample]) -> list[np.ndarray]:
+def _merge_samples(samples: Sequence[InputCase], batch_index: int) -> InputCase:
     if not samples:
         raise ValueError("Cannot build an input batch from zero samples")
 
-    num_features = len(samples[0].feature_values)
-    if any(len(sample.feature_values) != num_features for sample in samples):
+    num_features = samples[0].inputs[1].size
+    if any(sample.inputs[1].size != num_features for sample in samples):
         raise ValueError("Input samples disagree on feature count")
 
-    values = np.concatenate(
-        [
-            sample.feature_values[feature_index]
-            for feature_index in range(num_features)
-            for sample in samples
-        ]
+    return InputCase(
+        batch_index=batch_index,
+        inputs=[
+            np.concatenate([sample.inputs[0] for sample in samples]),
+            np.stack([sample.inputs[1] for sample in samples]),
+            np.concatenate([sample.inputs[2] for sample in samples]),
+            np.concatenate([sample.inputs[3] for sample in samples]),
+            np.concatenate([sample.inputs[4] for sample in samples]),
+        ],
+        compiled_logits=np.concatenate(
+            [sample.compiled_logits for sample in samples], axis=0
+        ),
     )
-    lengths = np.concatenate(
-        [
-            np.asarray(
-                [sample.feature_lengths[feature_index] for sample in samples],
-                dtype=samples[0].feature_lengths.dtype,
-            )
-            for feature_index in range(num_features)
-        ]
-    )
-    return [
-        values,
-        lengths,
-        np.concatenate([sample.num_candidates for sample in samples]),
-        np.concatenate([sample.user_ids for sample in samples]),
-        np.concatenate([sample.total_history_lengths for sample in samples]),
-    ]
 
 
 def _rebatch_input_cases(
@@ -230,10 +247,7 @@ def _rebatch_input_cases(
         )
 
     return [
-        (
-            batch_index,
-            _merge_samples(samples[start : start + batch_size]),
-        )
+        _merge_samples(samples[start : start + batch_size], batch_index)
         for batch_index, start in enumerate(range(0, len(samples), batch_size))
     ]
 
@@ -245,7 +259,7 @@ def _prepare_request_plan(
         raise RuntimeError("Need at least two source batches to warm up and measure")
 
     source_batch_sizes = [
-        _logical_batch_size(input_case) for _, input_case in input_cases
+        _logical_batch_size(input_case.inputs) for input_case in input_cases
     ]
     measured_source_batch_sizes = source_batch_sizes[:-1]
     if len(set(measured_source_batch_sizes)) != 1:
@@ -270,9 +284,9 @@ def _prepare_request_plan(
 def _validate_cache_phase_user_ids(
     warmup_case: InputCase, measured_input_cases: Sequence[InputCase]
 ) -> tuple[int, int]:
-    warmup_user_ids = warmup_case[1][3]
+    warmup_user_ids = warmup_case.inputs[3]
     measured_user_ids = np.concatenate(
-        [input_case[3] for _, input_case in measured_input_cases]
+        [input_case.inputs[3] for input_case in measured_input_cases]
     )
     unique_measured_ids, measured_id_counts = np.unique(
         measured_user_ids, return_counts=True
@@ -302,8 +316,8 @@ def _offset_input_case_user_ids(
         return list(input_cases)
 
     adjusted_input_cases = []
-    for batch_index, input_case in input_cases:
-        user_ids = input_case[3]
+    for input_case in input_cases:
+        user_ids = input_case.inputs[3]
         if not np.issubdtype(user_ids.dtype, np.signedinteger):
             raise ValueError(
                 f"user_ids must use a signed integer dtype: {user_ids.dtype}"
@@ -315,9 +329,15 @@ def _offset_input_case_user_ids(
             raise OverflowError(
                 f"user_id offset {user_id_offset} exceeds {user_ids.dtype} range"
             )
-        adjusted_input_case = list(input_case)
-        adjusted_input_case[3] = user_ids + user_id_offset
-        adjusted_input_cases.append((batch_index, adjusted_input_case))
+        adjusted_inputs = list(input_case.inputs)
+        adjusted_inputs[3] = user_ids + user_id_offset
+        adjusted_input_cases.append(
+            InputCase(
+                batch_index=input_case.batch_index,
+                inputs=adjusted_inputs,
+                compiled_logits=input_case.compiled_logits,
+            )
+        )
     return adjusted_input_cases
 
 
@@ -326,8 +346,8 @@ def _build_cache_measurement_sets(
 ) -> list[tuple[int, int, list[InputCase]]]:
     all_original_user_ids = np.concatenate(
         [
-            warmup_case[1][3],
-            *[input_case[3] for _, input_case in measured_input_cases],
+            warmup_case.inputs[3],
+            *[input_case.inputs[3] for input_case in measured_input_cases],
         ]
     )
     user_id_stride = (
@@ -347,7 +367,7 @@ def _build_cache_measurement_sets(
 
 def _run_input_cases(
     client,
-    httpclient,
+    client_module,
     model_name: str,
     input_cases: list[InputCase],
     outputs,
@@ -359,46 +379,132 @@ def _run_input_cases(
     request_sequence: int,
     profile_records: list[dict[str, Any]],
     workflow: str = "kv-cache",
+    request_mode: str = "prebatched",
 ):
     result = None
-    total_latency_ns = 0
-    for batch_index, input_case in input_cases:
-        batch_size = _logical_batch_size(input_case, workflow)
-        request_id = (
-            f"hstu-aoti-{phase}-s{cache_set_index}-r{run_index}-"
-            f"bs{batch_size}-b{batch_index:06d}-q{request_sequence:06d}"
+    max_abs_diff = None
+    for input_case in input_cases:
+        batch_index = input_case.batch_index
+        batch_size = _logical_batch_size(input_case.inputs, workflow)
+        samples = (
+            list(_iter_input_samples([input_case]))
+            if request_mode == "autobatch"
+            else [input_case]
         )
-        input_bytes = sum(array.nbytes for array in input_case)
+        requests = []
         start_ns = time.perf_counter_ns()
-        try:
-            result = client.infer(
-                model_name,
-                inputs=_make_inputs(httpclient, input_case, workflow),
-                outputs=outputs,
-                request_id=request_id,
+        for sample_index, sample in enumerate(samples):
+            triton_batch_size = 1 if request_mode == "autobatch" else batch_size
+            request_id = (
+                f"hstu-aoti-{phase}-s{cache_set_index}-r{run_index}-"
+                f"bs{triton_batch_size}-b{batch_index:06d}"
+                + (
+                    f"-i{sample_index:02d}"
+                    if request_mode == "autobatch"
+                    else ""
+                )
+                + f"-q{request_sequence:06d}"
             )
-        except Exception:
-            print(f"Request failed for batch_{batch_index:06d}")
-            raise
+            try:
+                if request_mode == "autobatch":
+                    response = Future()
+
+                    def callback(result, error, response=response):
+                        if error is not None:
+                            response.set_exception(error)
+                        else:
+                            response.set_result(result)
+
+                    client.async_infer(
+                        model_name,
+                        inputs=_make_inputs(
+                            client_module,
+                            sample.inputs,
+                            workflow,
+                            scheduler_batch=True,
+                        ),
+                        outputs=outputs,
+                        request_id=request_id,
+                        callback=callback,
+                    )
+                else:
+                    response = client.infer(
+                        model_name,
+                        inputs=_make_inputs(
+                            client_module, sample.inputs, workflow
+                        ),
+                        outputs=outputs,
+                        request_id=request_id,
+                    )
+            except Exception:
+                print(f"Request failed: {request_id}")
+                raise
+            requests.append(
+                (
+                    request_sequence,
+                    request_id,
+                    sample,
+                    response,
+                )
+            )
+            request_sequence += 1
+
+        for _, request_id, sample, response in requests:
+            try:
+                result = (
+                    response.result()
+                    if request_mode == "autobatch"
+                    else response
+                )
+            except Exception:
+                print(f"Request failed: {request_id}")
+                raise
+            if request_mode == "autobatch":
+                logits = result.as_numpy("OUTPUT__0")
+                abs_diff = float(np.max(np.abs(logits - sample.compiled_logits)))
+                max_abs_diff = max(max_abs_diff or 0.0, abs_diff)
+                if abs_diff > OUTPUT_ATOL:
+                    raise RuntimeError(
+                        f"Output parity failed for {request_id}: {abs_diff:.6f}"
+                    )
+
         latency_ns = time.perf_counter_ns() - start_ns
-        total_latency_ns += latency_ns
-        profile_records.append(
-            {
-                "request_sequence": request_sequence,
+        for sample_sequence, request_id, sample, _ in requests:
+            record = {
+                "request_sequence": sample_sequence,
                 "request_id": request_id,
                 "phase": phase,
                 "run_index": run_index,
                 "cache_set_index": cache_set_index,
                 "user_id_offset": user_id_offset,
                 "batch_index": batch_index,
-                "batch_size": batch_size,
+                "batch_size": 1 if request_mode == "autobatch" else batch_size,
                 "client_latency_ns": latency_ns,
                 "client_latency_per_request_ns": latency_ns / batch_size,
-                "input_bytes": input_bytes,
+                "input_bytes": sum(array.nbytes for array in sample.inputs),
             }
-        )
-        request_sequence += 1
-    return result, request_sequence, total_latency_ns
+            if request_mode == "autobatch":
+                record["burst_size"] = batch_size
+            profile_records.append(record)
+    return result, request_sequence, max_abs_diff
+
+
+def _batch_counts(client, model_name: str) -> dict[int, int]:
+    stats = client.get_inference_statistics(
+        model_name=model_name, as_json=True
+    )["model_stats"][0]
+    return {
+        int(item["batch_size"]): int(item["compute_infer"]["count"])
+        for item in stats.get("batch_stats", [])
+    }
+
+
+def _batch_delta(before: dict[int, int], after: dict[int, int]) -> dict[int, int]:
+    return {
+        batch_size: after.get(batch_size, 0) - before.get(batch_size, 0)
+        for batch_size in sorted(before.keys() | after.keys())
+        if after.get(batch_size, 0) > before.get(batch_size, 0)
+    }
 
 
 def _write_profile_records(path: Path, records: list[dict[str, Any]]) -> None:
@@ -425,7 +531,12 @@ def parse_args() -> argparse.Namespace:
         default=SCRIPT_DIR / "export_test_dump",
         help="Directory containing batch_000000_*.pt dump files.",
     )
-    parser.add_argument("--url", type=str, default="localhost:8000")
+    parser.add_argument(
+        "--url",
+        type=str,
+        default=None,
+        help="Triton endpoint (default: HTTP :8000 for non-KV, gRPC :8001 for KV).",
+    )
     parser.add_argument("--model_name", type=str, default=None)
     parser.add_argument(
         "--batch_size",
@@ -433,6 +544,15 @@ def parse_args() -> argparse.Namespace:
         choices=SUPPORTED_BATCH_SIZES,
         default=2,
         help="Logical HSTU batch size for measured Triton requests.",
+    )
+    parser.add_argument(
+        "--request_mode",
+        choices=("prebatched", "autobatch"),
+        default="prebatched",
+        help=(
+            "Submit one encoded logical batch per Triton call (prebatched), or "
+            "submit its samples as concurrent B=1 calls (autobatch)."
+        ),
     )
     parser.add_argument("--post_warmup_sleep_seconds", type=float, default=1.0)
     parser.add_argument(
@@ -461,10 +581,12 @@ def main() -> int:
     input_cases = _load_input_cases(args.dump_dir, args.workflow)
 
     if args.workflow == "non-kv":
+        if args.request_mode != "prebatched":
+            raise ValueError("--request_mode autobatch is KV-cache only")
         measured_input_cases = [
             input_case
             for input_case in input_cases
-            if _logical_batch_size(input_case[1], "non-kv") == args.batch_size
+            if _logical_batch_size(input_case.inputs, "non-kv") == args.batch_size
         ]
         if not measured_input_cases:
             raise ValueError(
@@ -477,7 +599,9 @@ def main() -> int:
         import tritonclient.http as httpclient
 
         outputs = [httpclient.InferRequestedOutput("OUTPUT__0")]
-        client = httpclient.InferenceServerClient(url=args.url)
+        client = httpclient.InferenceServerClient(
+            url=args.url or "localhost:8000"
+        )
         profile_records: list[dict[str, Any]] = []
         result, _, _ = _run_input_cases(
             client,
@@ -512,22 +636,32 @@ def main() -> int:
     cache_measurement_sets = _build_cache_measurement_sets(
         warmup_case, measured_input_cases
     )
-    triton_request_count = WARMUP_COUNT + (
-        2 * CACHE_MEASUREMENT_SET_COUNT * len(measured_input_cases)
-    )
+    if args.request_mode == "autobatch":
+        triton_request_count = WARMUP_COUNT * _logical_batch_size(
+            warmup_case.inputs
+        ) + 2 * CACHE_MEASUREMENT_SET_COUNT * sum(
+            _logical_batch_size(input_case.inputs)
+            for input_case in measured_input_cases
+        )
+    else:
+        triton_request_count = WARMUP_COUNT + (
+            2 * CACHE_MEASUREMENT_SET_COUNT * len(measured_input_cases)
+        )
     if args.print_triton_request_count_only:
         print(triton_request_count)
         return 0
 
-    import tritonclient.http as httpclient
+    import tritonclient.grpc as grpcclient
 
-    outputs = [httpclient.InferRequestedOutput("OUTPUT__0")]
+    outputs = [grpcclient.InferRequestedOutput("OUTPUT__0")]
 
-    client = httpclient.InferenceServerClient(url=args.url)
+    client = grpcclient.InferenceServerClient(
+        url=args.url or "localhost:8001",
+    )
     profile_records = []
     request_sequence = 0
 
-    warmup_batch_size = _logical_batch_size(warmup_case[1])
+    warmup_batch_size = _logical_batch_size(warmup_case.inputs)
     print(
         f"Loaded {len(input_cases)} source batches from {args.dump_dir}; "
         f"generated {len(measured_input_cases)} full batch_size={args.batch_size} "
@@ -538,9 +672,9 @@ def main() -> int:
         f"are disjoint from {warmup_user_count} warmup user IDs"
     )
     for warmup_index in range(1, WARMUP_COUNT + 1):
-        _, request_sequence, _ = _run_input_cases(
+        _, request_sequence, warmup_max_abs_diff = _run_input_cases(
             client,
-            httpclient,
+            grpcclient,
             model_name,
             [warmup_case],
             outputs,
@@ -550,11 +684,17 @@ def main() -> int:
             user_id_offset=0,
             request_sequence=request_sequence,
             profile_records=profile_records,
+            request_mode=args.request_mode,
         )
         print(
             f"Warmup {warmup_index}/{WARMUP_COUNT}: sent final source batch "
             f"with logical batch_size={warmup_batch_size}; excluded from "
             "measured runs"
+            + (
+                f"; max_abs_diff={warmup_max_abs_diff:.6f}"
+                if warmup_max_abs_diff is not None
+                else ""
+            )
         )
     if args.post_warmup_sleep_seconds > 0:
         time.sleep(args.post_warmup_sleep_seconds)
@@ -577,10 +717,15 @@ def main() -> int:
             ),
             start=1,
         ):
+            batch_counts_before = (
+                _batch_counts(client, model_name)
+                if args.request_mode == "autobatch"
+                else None
+            )
             phase_start_ns = time.perf_counter_ns()
-            result, request_sequence, _ = _run_input_cases(
+            result, request_sequence, max_abs_diff = _run_input_cases(
                 client,
-                httpclient,
+                grpcclient,
                 model_name,
                 cache_set_input_cases,
                 outputs,
@@ -590,25 +735,57 @@ def main() -> int:
                 user_id_offset=user_id_offset,
                 request_sequence=request_sequence,
                 profile_records=profile_records,
+                request_mode=args.request_mode,
             )
             phase_e2e_ns = time.perf_counter_ns() - phase_start_ns
+            batch_histogram = (
+                _batch_delta(
+                    batch_counts_before,
+                    _batch_counts(client, model_name),
+                )
+                if batch_counts_before is not None
+                else None
+            )
+            if batch_histogram is not None and not any(
+                batch_size > 1 for batch_size in batch_histogram
+            ):
+                raise RuntimeError(
+                    f"Triton did not dynamically batch the {label} phase"
+                )
             batch_count = len(cache_set_input_cases)
             logical_request_count = batch_count * args.batch_size
             e2e_seconds = phase_e2e_ns / 1_000_000_000
-            latency_ms_per_triton_call = phase_e2e_ns / batch_count / 1_000_000
             latency_ms_per_logical_request = (
                 phase_e2e_ns / logical_request_count / 1_000_000
             )
-            print(
-                f"Set {cache_set_index} Run {run_index} "
-                f"({label}, batch_size={args.batch_size}): "
-                f"{e2e_seconds:.6f} seconds E2E; "
-                f"{latency_ms_per_triton_call:.3f} ms/Triton call "
-                f"over {batch_count} calls; "
-                f"{latency_ms_per_logical_request:.3f} ms/logical request "
-                f"over {batch_count} batches x {args.batch_size} "
-                f"= {logical_request_count} logical requests"
-            )
+            if args.request_mode == "autobatch":
+                latency_ms_per_burst = phase_e2e_ns / batch_count / 1_000_000
+                throughput = logical_request_count / e2e_seconds
+                print(
+                    f"Set {cache_set_index} Run {run_index} "
+                    f"({label}, autobatch target={args.batch_size}): "
+                    f"{e2e_seconds:.6f} seconds E2E; "
+                    f"{latency_ms_per_burst:.3f} ms/burst over "
+                    f"{batch_count} bursts; "
+                    f"{latency_ms_per_logical_request:.3f} ms/logical request; "
+                    f"{throughput:.3f} logical requests/s; "
+                    f"actual_batch_histogram={batch_histogram}; "
+                    f"max_abs_diff={max_abs_diff:.6f}"
+                )
+            else:
+                latency_ms_per_triton_call = (
+                    phase_e2e_ns / batch_count / 1_000_000
+                )
+                print(
+                    f"Set {cache_set_index} Run {run_index} "
+                    f"({label}, batch_size={args.batch_size}): "
+                    f"{e2e_seconds:.6f} seconds E2E; "
+                    f"{latency_ms_per_triton_call:.3f} ms/Triton call "
+                    f"over {batch_count} calls; "
+                    f"{latency_ms_per_logical_request:.3f} ms/logical request "
+                    f"over {batch_count} batches x {args.batch_size} "
+                    f"= {logical_request_count} logical requests"
+                )
 
     if result is None:
         raise RuntimeError("No Triton requests were sent")

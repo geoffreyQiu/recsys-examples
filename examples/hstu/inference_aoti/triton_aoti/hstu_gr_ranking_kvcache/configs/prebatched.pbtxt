@@ -1,0 +1,55 @@
+# Triton PyTorch AOTI backend config for one request containing an encoded
+# logical HSTU batch. Scheduler-level batching is intentionally disabled.
+
+name: "hstu_gr_ranking_kvcache"
+platform: "torch_aoti"
+max_batch_size: 0
+
+input [
+  {
+    name: "INPUT__0"
+    data_type: TYPE_INT64
+    dims: [ -1 ]
+  },
+  {
+    name: "INPUT__1"
+    data_type: TYPE_INT64
+    dims: [ -1, 8 ]
+  },
+  {
+    name: "INPUT__2"
+    data_type: TYPE_INT64
+    dims: [ -1 ]
+  },
+  {
+    name: "INPUT__3"
+    data_type: TYPE_INT64
+    dims: [ -1 ]
+  },
+  {
+    name: "INPUT__4"
+    data_type: TYPE_INT64
+    dims: [ -1 ]
+  }
+]
+
+output [
+  {
+    name: "OUTPUT__0"
+    data_type: TYPE_FP32
+    dims: [ -1, 100, 8 ]
+  }
+]
+
+instance_group [
+  {
+    count: 1
+    kind: KIND_GPU
+    gpus: [ 0 ]
+  }
+]
+
+parameters {
+  key: "MODEL_INIT_LIBRARY"
+  value: { string_value: "/workspace/recsys-examples/examples/hstu/inference_aoti/nve_init_hook/build/libnve_init_hook.so" }
+}
