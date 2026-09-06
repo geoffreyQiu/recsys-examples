@@ -45,6 +45,8 @@ add_library(hstu_cuda_ops_runtime SHARED
   ../../../commons/ops/cuda_ops/csrc/kjt_aux_op.cpp
   ../../../commons/ops/cuda_ops/csrc/jagged_tensor_op_cuda.cpp
   ../../../commons/ops/cuda_ops/csrc/jagged_tensor_op_kernel.cu
+  ../../../commons/ops/cuda_ops/csrc/packed_jagged_ops.cpp
+  ../../../commons/ops/cuda_ops/csrc/packed_jagged_cuda.cu
 )
 target_link_libraries(hstu_cuda_ops_runtime PRIVATE ${TORCH_LIBRARIES})
 target_include_directories(hstu_cuda_ops_runtime PRIVATE

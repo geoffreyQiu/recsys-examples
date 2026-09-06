@@ -31,6 +31,8 @@ _ALL_EXT_MODULES = [
             "ops/cuda_ops/csrc/jagged_tensor_op_cuda.cpp",
             "ops/cuda_ops/csrc/jagged_tensor_op_kernel.cu",
             "ops/cuda_ops/csrc/kjt_aux_op.cpp",
+            "ops/cuda_ops/csrc/packed_jagged_ops.cpp",
+            "ops/cuda_ops/csrc/packed_jagged_cuda.cu",
         ],
         extra_compile_args={
             "cxx": ["-O3", "-std=c++17", "-DWITH_PYBIND11=1"],
