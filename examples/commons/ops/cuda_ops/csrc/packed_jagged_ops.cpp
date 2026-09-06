@@ -4,6 +4,11 @@
 #include <ATen/ATen.h>
 #include <torch/library.h>
 
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <tuple>
 
 #ifdef PACKED_JAGGED_STANDALONE
@@ -13,6 +18,44 @@
 namespace packed_jagged {
 
 using AdapterOutput = std::tuple<at::Tensor, at::Tensor, at::Tensor>;
+
+namespace {
+
+constexpr std::uint64_t kBatchLogLimit = 64;
+
+bool batch_log_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("PACKED_JAGGED_BATCH_LOG");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+
+void maybe_log_batch(
+    const at::Tensor& values_rm,
+    const at::Tensor& lengths_rm) {
+  if (!batch_log_enabled()) {
+    return;
+  }
+
+  static std::atomic<std::uint64_t> call_count{0};
+  const std::uint64_t call =
+      call_count.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (call > kBatchLogLimit) {
+    return;
+  }
+
+  std::fprintf(
+      stderr,
+      "[packed-jagged-batch] call=%llu B=%lld M=%lld T=%lld\n",
+      static_cast<unsigned long long>(call),
+      static_cast<long long>(lengths_rm.size(0)),
+      static_cast<long long>(lengths_rm.size(1)),
+      static_cast<long long>(values_rm.numel()));
+  std::fflush(stderr);
+}
+
+} // namespace
 
 AdapterOutput reorder_cuda_impl(
     const at::Tensor& values_rm,
@@ -50,6 +93,7 @@ AdapterOutput reorder_cuda(
     const at::Tensor& values_rm,
     const at::Tensor& lengths_rm) {
   check_common(values_rm, lengths_rm);
+  maybe_log_batch(values_rm, lengths_rm);
   return reorder_cuda_impl(values_rm, lengths_rm);
 }
 
