@@ -329,11 +329,13 @@ Run the request replay client against the dumped tensors:
 
 ```bash
 cd ${HSTU_DIR}
-python3 inference_aoti/test_tritonserver_aoti_hstu_kvcache_autobatching.py \
+python3 inference_aoti/test_tritonserver_aoti_hstu_model.py \
+  --workflow kv-cache \
   --dump_dir inference_aoti/export_test_dump \
-  --url localhost:8000 \
+  --url localhost:8001 \
   --model_name hstu_gr_ranking_kvcache \
-  --batch_size 8
+  --batch_size 8 \
+  --request_mode autobatch
 ```
 
 This request path validates that:
