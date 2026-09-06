@@ -4,6 +4,7 @@
 import argparse
 import json
 import time
+from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -47,10 +48,10 @@ def _load_dumped_tensor(path: Path) -> np.ndarray:
     return tensor.numpy()
 
 
-def _make_input(httpclient, name: str, array: np.ndarray):
+def _make_input(client_module, name: str, array: np.ndarray):
     if array.dtype != np.int64:
         array = array.astype(np.int64, copy=False)
-    infer_input = httpclient.InferInput(name, array.shape, "INT64")
+    infer_input = client_module.InferInput(name, array.shape, "INT64")
     infer_input.set_data_from_numpy(array)
     return infer_input
 
@@ -88,7 +89,7 @@ def _load_input_cases(dump_dir: Path, workflow: str) -> list[InputCase]:
 
 
 def _make_inputs(
-    httpclient,
+    client_module,
     input_case: list[np.ndarray],
     workflow: str,
     *,
@@ -100,7 +101,7 @@ def _make_inputs(
         else input_case
     )
     return [
-        _make_input(httpclient, input_name, array)
+        _make_input(client_module, input_name, array)
         for (input_name, _), array in zip(WORKFLOW_INPUT_TENSORS[workflow], arrays)
     ]
 
@@ -366,7 +367,7 @@ def _build_cache_measurement_sets(
 
 def _run_input_cases(
     client,
-    httpclient,
+    client_module,
     model_name: str,
     input_cases: list[InputCase],
     outputs,
@@ -405,26 +406,36 @@ def _run_input_cases(
                 + f"-q{request_sequence:06d}"
             )
             try:
-                response = (
+                if request_mode == "autobatch":
+                    response = Future()
+
+                    def callback(result, error, response=response):
+                        if error is not None:
+                            response.set_exception(error)
+                        else:
+                            response.set_result(result)
+
                     client.async_infer(
                         model_name,
                         inputs=_make_inputs(
-                            httpclient,
+                            client_module,
                             sample.inputs,
                             workflow,
                             scheduler_batch=True,
                         ),
                         outputs=outputs,
                         request_id=request_id,
+                        callback=callback,
                     )
-                    if request_mode == "autobatch"
-                    else client.infer(
+                else:
+                    response = client.infer(
                         model_name,
-                        inputs=_make_inputs(httpclient, sample.inputs, workflow),
+                        inputs=_make_inputs(
+                            client_module, sample.inputs, workflow
+                        ),
                         outputs=outputs,
                         request_id=request_id,
                     )
-                )
             except Exception:
                 print(f"Request failed: {request_id}")
                 raise
@@ -441,7 +452,7 @@ def _run_input_cases(
         for _, request_id, sample, response in requests:
             try:
                 result = (
-                    response.get_result()
+                    response.result()
                     if request_mode == "autobatch"
                     else response
                 )
@@ -479,7 +490,9 @@ def _run_input_cases(
 
 
 def _batch_counts(client, model_name: str) -> dict[int, int]:
-    stats = client.get_inference_statistics(model_name=model_name)["model_stats"][0]
+    stats = client.get_inference_statistics(
+        model_name=model_name, as_json=True
+    )["model_stats"][0]
     return {
         int(item["batch_size"]): int(item["compute_infer"]["count"])
         for item in stats.get("batch_stats", [])
@@ -518,7 +531,12 @@ def parse_args() -> argparse.Namespace:
         default=SCRIPT_DIR / "export_test_dump",
         help="Directory containing batch_000000_*.pt dump files.",
     )
-    parser.add_argument("--url", type=str, default="localhost:8000")
+    parser.add_argument(
+        "--url",
+        type=str,
+        default=None,
+        help="Triton endpoint (default: HTTP :8000 for non-KV, gRPC :8001 for KV).",
+    )
     parser.add_argument("--model_name", type=str, default=None)
     parser.add_argument(
         "--batch_size",
@@ -581,7 +599,9 @@ def main() -> int:
         import tritonclient.http as httpclient
 
         outputs = [httpclient.InferRequestedOutput("OUTPUT__0")]
-        client = httpclient.InferenceServerClient(url=args.url)
+        client = httpclient.InferenceServerClient(
+            url=args.url or "localhost:8000"
+        )
         profile_records: list[dict[str, Any]] = []
         result, _, _ = _run_input_cases(
             client,
@@ -631,13 +651,12 @@ def main() -> int:
         print(triton_request_count)
         return 0
 
-    import tritonclient.http as httpclient
+    import tritonclient.grpc as grpcclient
 
-    outputs = [httpclient.InferRequestedOutput("OUTPUT__0")]
+    outputs = [grpcclient.InferRequestedOutput("OUTPUT__0")]
 
-    client = httpclient.InferenceServerClient(
-        url=args.url,
-        concurrency=args.batch_size if args.request_mode == "autobatch" else 1,
+    client = grpcclient.InferenceServerClient(
+        url=args.url or "localhost:8001",
     )
     profile_records = []
     request_sequence = 0
@@ -655,7 +674,7 @@ def main() -> int:
     for warmup_index in range(1, WARMUP_COUNT + 1):
         _, request_sequence, warmup_max_abs_diff = _run_input_cases(
             client,
-            httpclient,
+            grpcclient,
             model_name,
             [warmup_case],
             outputs,
@@ -706,7 +725,7 @@ def main() -> int:
             phase_start_ns = time.perf_counter_ns()
             result, request_sequence, max_abs_diff = _run_input_cases(
                 client,
-                httpclient,
+                grpcclient,
                 model_name,
                 cache_set_input_cases,
                 outputs,

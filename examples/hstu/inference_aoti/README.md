@@ -282,7 +282,7 @@ DOCKER_BUILDKIT=1 docker build --progress=plain \
 
 ### 5. Replay the exported model through Triton Server
 
-The client sends concurrent `B=1` cache-miss and cache-hit requests. Triton
+The client uses gRPC to send concurrent `B=1` cache-miss and cache-hit requests. Triton
 `batch_stats` is the batching proof; `PACKED_JAGGED_BATCH_LOG=1` additionally
 logs the `B/M/T` seen by the packed-input adapter.
 
@@ -324,7 +324,7 @@ docker run \
     python3 test_tritonserver_aoti_hstu_model.py \
       --workflow kv-cache \
       --dump_dir export_test_dump \
-      --url localhost:8000 \
+      --url localhost:8001 \
       --model_name hstu_gr_ranking_kvcache \
       --batch_size 8 \
       --request_mode autobatch > test_benchmark.log
