@@ -196,6 +196,8 @@ def export_inference_gr_ranking(
     checkpoint_dir: str,
     max_bs: int = 1,
     debug_flattened_inputs: bool = False,
+    benchmark_python_packed_input: bool = False,
+    feature_major_baseline: bool = False,
     export_dir_: str | os.PathLike[str] = DEFAULT_EXPORT_DIR,
     dump_dir_: str | os.PathLike[str] = DEFAULT_DUMP_DIR,
 ):
@@ -303,20 +305,34 @@ def export_inference_gr_ranking(
         )
         batch.labels = None
 
-        # Export a plain request-major tensor boundary. The wrapper restores the
-        # feature-major KJT internally with packed_jagged::reorder.
+        # Export a plain tensor boundary. The deployment path accepts
+        # request-major tensors; the feature-major mode is a performance
+        # baseline that bypasses packed_jagged::reorder.
         feature_keys = tuple(batch.features.keys())
-        export_model = HSTUPackedInputWrapper(model, batch)
-        example_values_rm, example_lengths_rm = kjt_to_request_major(
-            batch.features,
-            feature_keys,
+        input_layout = (
+            "feature-major" if feature_major_baseline else "request-major"
         )
-        example_num_candidates = batch.num_candidates
-        example_inputs = (
-            example_values_rm,
-            example_lengths_rm,
-            example_num_candidates,
+        export_model = HSTUPackedInputWrapper(
+            model,
+            batch,
+            request_major=not feature_major_baseline,
         )
+
+        def make_plain_inputs(input_batch):
+            if feature_major_baseline:
+                return [
+                    input_batch.features.values(),
+                    input_batch.features.lengths(),
+                    input_batch.num_candidates,
+                ]
+            values_rm, lengths_rm = kjt_to_request_major(
+                input_batch.features,
+                feature_keys,
+            )
+            return [values_rm, lengths_rm, input_batch.num_candidates]
+
+        example_inputs = tuple(make_plain_inputs(batch))
+        example_values, example_lengths, example_num_candidates = example_inputs
 
         # get dynamic shapes (now keyed on the plain tensor inputs)
         sc = ShapesCollection()
@@ -324,8 +340,10 @@ def export_inference_gr_ranking(
         max_tokens_per_request = sum(batch.feature_to_max_seqlen.values())
         max_tokens = export_max_batch_size * max_tokens_per_request
 
-        sc[example_values_rm] = {0: Dim("tokens", min=1, max=max_tokens)}
-        sc[example_lengths_rm] = {0: dim_batch}
+        sc[example_values] = {0: Dim("tokens", min=1, max=max_tokens)}
+        sc[example_lengths] = {
+            0: dim_batch * len(feature_keys) if feature_major_baseline else dim_batch
+        }
         sc[example_num_candidates] = {0: dim_batch}
         dynamic_shapes = sc.dynamic_shapes(export_model, example_inputs)
         print(f"[INFO] Dynamic shapes: {dynamic_shapes}")
@@ -355,17 +373,9 @@ def export_inference_gr_ranking(
             boundary_batch = (
                 batch if boundary_size == batch.batch_size else batch.slice(0, 1)
             )
-            boundary_values_rm, boundary_lengths_rm = kjt_to_request_major(
-                boundary_batch.features,
-                feature_keys,
-            )
             with torch.inference_mode():
                 boundary_logits = aoti_model_runtime.run(
-                    [
-                        boundary_values_rm,
-                        boundary_lengths_rm,
-                        boundary_batch.num_candidates,
-                    ]
+                    make_plain_inputs(boundary_batch)
                 )[0]
                 boundary_ref = model(boundary_batch).detach().cpu()
             boundary_equal = (
@@ -385,15 +395,7 @@ def export_inference_gr_ranking(
             try:
                 batch = next(dataloader_iter)
                 batch = prepare_on_gpu(batch)
-                values_rm, lengths_rm = kjt_to_request_major(
-                    batch.features,
-                    feature_keys,
-                )
-                compiled_inputs = [
-                    values_rm,
-                    lengths_rm,
-                    batch.num_candidates,
-                ]
+                compiled_inputs = make_plain_inputs(batch)
                 prepared_inputs.append((batch, compiled_inputs))
 
                 with torch.inference_mode():
@@ -409,11 +411,11 @@ def export_inference_gr_ranking(
                         feature_keys_dumped = True
 
                     _save_tensor_cpp_compatible(
-                        values_rm.detach().cpu(),
+                        compiled_inputs[0].detach().cpu(),
                         os.path.join(dump_dir, f"batch_{dump_idx:06d}_values.pt"),
                     )
                     _save_tensor_cpp_compatible(
-                        lengths_rm.detach().cpu(),
+                        compiled_inputs[1].detach().cpu(),
                         os.path.join(dump_dir, f"batch_{dump_idx:06d}_lengths.pt"),
                     )
                     _save_tensor_cpp_compatible(
@@ -438,7 +440,7 @@ def export_inference_gr_ranking(
                 break
         # torch.cuda.profiler.stop()
 
-        print(f"[INFO] Dumped {dump_idx} request-major test batches.")
+        print(f"[INFO] Dumped {dump_idx} {input_layout} test batches.")
 
         eval_metric_dict = eval_module.compute()
         print(
@@ -491,21 +493,32 @@ def export_inference_gr_ranking(
 
         import time
 
+        python_benchmark_name = (
+            f"Python {input_layout} wrapper"
+            if benchmark_python_packed_input
+            else "Python model"
+        )
         python_time = []
         for _ in range(3):
             torch.cuda.synchronize()
             results = []
             start = time.perf_counter()
             with torch.inference_mode():
-                for b, _ in prepared_inputs:
-                    ref_logits = model(b)
-                    results.append(ref_logits)
+                if benchmark_python_packed_input:
+                    for _, compiled_inputs in prepared_inputs:
+                        logits = export_model(*compiled_inputs)
+                        results.append(logits)
+                else:
+                    for b, _ in prepared_inputs:
+                        logits = model(b)
+                        results.append(logits)
             torch.cuda.synchronize()
             end = time.perf_counter()
             python_time.append(end - start)
         python_time_avg = sum(python_time) / len(python_time)
         print(
-            f"    Python model elapsed time: {python_time_avg:.6f} seconds; "
+            f"    {python_benchmark_name} elapsed time: "
+            f"{python_time_avg:.6f} seconds; "
             f"{python_time_avg * 1000.0 / num_benchmark_batches:.3f} "
             "ms/batch; "
             f"{python_time_avg * 1000.0 / num_logical_requests:.3f} "
@@ -523,6 +536,22 @@ if __name__ == "__main__":
     parser.add_argument("--disable_auc", action="store_true")
     parser.add_argument("--max_bs", type=int, default=2)
     parser.add_argument("--debug_flattened_inputs", action="store_true")
+    parser.add_argument(
+        "--benchmark_python_packed_input",
+        action="store_true",
+        help=(
+            "Benchmark the eager packed-input wrapper with the same "
+            "request-major inputs as AOTI instead of the original HSTUBatch model."
+        ),
+    )
+    parser.add_argument(
+        "--feature_major_baseline",
+        action="store_true",
+        help=(
+            "Export and benchmark a feature-major plain-tensor baseline that "
+            "bypasses the request-major conversion."
+        ),
+    )
     parser.add_argument(
         "--export_dir",
         type=str,
@@ -552,5 +581,7 @@ if __name__ == "__main__":
         dump_dir_=args.dump_dir,
         max_bs=args.max_bs,
         debug_flattened_inputs=args.debug_flattened_inputs,
+        benchmark_python_packed_input=args.benchmark_python_packed_input,
+        feature_major_baseline=args.feature_major_baseline,
     )
     print("[INFO] Finished.")
