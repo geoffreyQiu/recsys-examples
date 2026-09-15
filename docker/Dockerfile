@@ -315,10 +315,28 @@ RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
 # kvcache_manager) and runtime libcuda link.
 # ============================================================================
 FROM ${DEVEL_IMAGE} AS build
+ARG TARGETPLATFORM
 
 RUN rm -rf /workspace/recsys-examples
 WORKDIR /workspace/recsys-examples
 COPY . .
+
+# Keep the default NVE build aligned with this checkout when DEVEL_IMAGE is an
+# external pre-built image. The 26.05 compatibility install remains untouched.
+RUN rm -rf /workspace/deps/nve /opt/nve/default/python /workspace/build/pynve-default && \
+    cp -a third_party/nv-embedding-cache /workspace/deps/nve && \
+    mkdir -p /opt/nve/default/python && \
+    if [ "${TARGETPLATFORM}" != "linux/arm64" ]; then \
+      export PYNVE_DISABLE_AVX512=1; \
+    fi && \
+    PYNVE_BUILD_DIR=/workspace/build/pynve-default \
+    PYNVE_WITH_TORCH_BINDINGS=1 \
+    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" \
+    CPLUS_INCLUDE_PATH="/workspace/deps/NVTX/c/include${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}" \
+    python3 -m pip install --no-build-isolation --no-deps \
+      --target /opt/nve/default/python \
+      /workspace/deps/nve && \
+    rm -rf /workspace/build/pynve-default
 
 RUN cd /workspace/recsys-examples/corelib/dynamicemb && \
     TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" python setup.py install && \
@@ -337,7 +355,11 @@ RUN cd /workspace/recsys-examples/corelib/dynamicemb && \
     ln -s /usr/local/cuda-13/compat/lib.real/libcuda.so.1 /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
     cd /workspace/recsys-examples/corelib/dynamicemb && \
     mkdir -p torch_binding_build && cd torch_binding_build && \
-    cmake .. && make -j
+    cmake .. \
+      -DNVE_ROOT=/workspace/deps/nve \
+      -DNVE_LIB_DIR=/opt/nve/default/python/pynve \
+      -DNVTX_INCLUDE_DIR=/workspace/deps/NVTX/c/include && \
+    make -j
 
 # ============================================================================
 # AOTI additions: version-independent C++ replay, two NVE loader
