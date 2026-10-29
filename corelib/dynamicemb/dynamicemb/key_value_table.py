@@ -13,18 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dynamicemb.checkpoint_io import (
-    load_from_json,
-    dtype_to_meta_name,
-    dtype_from_meta_name,
-    resolve_checkpoint_value_layout,
-    _tensor_from_bytes,
-    _iter_batches_from_files,
-    META_EMBEDDING_DTYPE,
-    META_EMBEDDING_DIM,
-    META_OPT_STATE_DTYPE,
-)
-
 import json
 import math
 import os
@@ -32,9 +20,19 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
-import numpy as np
 import torch  # usort:skip
 import torch.distributed as dist
+from dynamicemb.checkpoint_io import (  # noqa: F401 - preserve checkpoint helper exports
+    META_EMBEDDING_DIM,
+    META_EMBEDDING_DTYPE,
+    META_OPT_STATE_DTYPE,
+    _iter_batches_from_files,
+    _tensor_from_bytes,
+    dtype_from_meta_name,
+    dtype_to_meta_name,
+    load_from_json,
+    resolve_checkpoint_value_layout,
+)
 from dynamicemb.dynamicemb_config import (
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
@@ -51,7 +49,6 @@ from dynamicemb.extendable_tensor import (
     ExtendableBuffer,
     HostExtendableBuffer,
 )
-from dynamicemb.key_ownership import owned_key_mask
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.scored_hashtable import (
     ScoreArg,
@@ -68,7 +65,6 @@ from dynamicemb.types import (
     CopyMode,
     ReplayStats,
     Storage,
-    torch_dtype_to_np_dtype,
 )
 from dynamicemb_extensions import EvictStrategy, device_timestamp, flagged_compact
 from dynamicemb_extensions import load_from_flat_table_contiguous as _load_contiguous
