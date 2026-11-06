@@ -173,6 +173,7 @@ def get_extensions():
             "indexer_snapshot.cpp",
             "indexer_ops.cu",
             "indexer_cpu.cpp",
+            "inference_emb_schemas.cpp",
             "incremental_update.cpp",
             "nve_runtime.cu",
             "nve_tier_pybind.cu",

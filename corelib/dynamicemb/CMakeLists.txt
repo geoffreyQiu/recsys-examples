@@ -1,5 +1,13 @@
 cmake_minimum_required(VERSION 3.18)
-project(DynamicEmbInferenceOps LANGUAGES CXX CUDA)
+
+# CPU-only builds compile just the INFERENCE_EMB CPU kernels (HostLayer
+# indexers) against a CPU-only PyTorch, with no CUDA toolkit, cudart or Python.
+option(DYNAMICEMB_CPU_ONLY "Build only the CPU inference operators, without CUDA" OFF)
+if(DYNAMICEMB_CPU_ONLY)
+    project(DynamicEmbInferenceOps LANGUAGES CXX)
+else()
+    project(DynamicEmbInferenceOps LANGUAGES CXX CUDA)
+endif()
 
 include(GNUInstallDirs)
 
@@ -20,7 +28,11 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+if(DYNAMICEMB_CPU_ONLY)
+    find_package(Python3 COMPONENTS Interpreter)
+else()
+    find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+endif()
 
 if(NOT DEFINED CMAKE_PREFIX_PATH)
     execute_process(
@@ -36,6 +48,39 @@ if(NOT DEFINED CMAKE_PREFIX_PATH)
 endif()
 
 find_package(Torch REQUIRED)
+message(STATUS "Found Torch ${TORCH_VERSION}")
+separate_arguments(TORCH_CXX_FLAGS_LIST NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
+
+if(DYNAMICEMB_CPU_ONLY)
+    add_library(inference_emb_ops SHARED
+        src/exportable_embedding/indexer_snapshot.cpp
+        src/exportable_embedding/indexer_cpu.cpp
+        src/exportable_embedding/inference_emb_schemas.cpp
+    )
+    target_compile_options(inference_emb_ops PRIVATE
+        ${TORCH_CXX_FLAGS_LIST} -O3 -fvisibility=hidden -w)
+    target_include_directories(inference_emb_ops PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${TORCH_INCLUDE_DIRS}
+    )
+    # at::parallel_for is header-inlined; without OpenMP it runs serially.
+    find_package(OpenMP)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(inference_emb_ops PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+    target_link_libraries(inference_emb_ops PRIVATE ${TORCH_LIBRARIES})
+    target_link_options(inference_emb_ops PRIVATE "LINKER:--no-undefined")
+    set_target_properties(inference_emb_ops PROPERTIES
+        PREFIX ""
+        OUTPUT_NAME "inference_emb_ops"
+    )
+    install(TARGETS inference_emb_ops
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+    return()
+endif()
+
 find_package(CUDAToolkit REQUIRED)
 
 
@@ -47,7 +92,6 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     endif()
 endif()
 
-message(STATUS "Found Torch ${TORCH_VERSION}")
 message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
 set(INFERENCE_EMB_SOURCES
@@ -55,6 +99,7 @@ set(INFERENCE_EMB_SOURCES
     src/exportable_embedding/indexer_snapshot.cpp
     src/exportable_embedding/indexer_ops.cu
     src/exportable_embedding/indexer_cpu.cpp
+    src/exportable_embedding/inference_emb_schemas.cpp
     src/table_operation/lookup_torch_binding.cu
     src/table_operation/get_table_range_torch_binding.cu
     src/table_operation/expand_table_ids_torch_binding.cu
@@ -67,8 +112,8 @@ set(INFERENCE_EMB_SOURCES
 )
 
 add_library(inference_emb_ops SHARED ${INFERENCE_EMB_SOURCES})
+target_compile_definitions(inference_emb_ops PRIVATE DYNAMICEMB_WITH_CUDA)
 
-separate_arguments(TORCH_CXX_FLAGS_LIST NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
 if(TORCH_CXX_FLAGS_LIST)
     target_compile_options(inference_emb_ops PRIVATE ${TORCH_CXX_FLAGS_LIST})
 endif()

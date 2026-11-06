@@ -4,10 +4,6 @@
 
 #include "unique_op.h"
 
-TORCH_LIBRARY_FRAGMENT(INFERENCE_EMB, m) {
-    m.def("expand_table_ids(Tensor offsets, Tensor indices, Tensor? table_offsets_in_feature=None, int num_tables=0, int local_batch_size=1) -> Tensor");
-}
-
 namespace dyn_emb {
 
 // expand_table_ids_cuda (unique_op.cu) now only supports identity mapping
