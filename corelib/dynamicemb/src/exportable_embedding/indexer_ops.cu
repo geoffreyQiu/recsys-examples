@@ -50,11 +50,6 @@ at::Tensor embedding_collection_index_meta(const at::Tensor& marker,
 
 }  // namespace dynamicemb::exportable_embedding
 
-TORCH_LIBRARY_FRAGMENT(INFERENCE_EMB, m) {
-  m.def("embedding_collection_index(Tensor marker, int marker_value, "
-        "Tensor feature_ids, Tensor table_ids) -> Tensor");
-}
-
 TORCH_LIBRARY_IMPL(INFERENCE_EMB, CUDA, m) {
   m.impl("embedding_collection_index",
          &dynamicemb::exportable_embedding::embedding_collection_index_cuda);

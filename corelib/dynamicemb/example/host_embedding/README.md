@@ -92,6 +92,25 @@ required. The CUDA toolkit is needed for building native bindings, not for
 ordinary lookup/update with the installed wheel. AOT export additionally needs
 PyTorch's C++ compilation tools.
 
+### CPU-only operator library
+
+Servers that link a CPU-only PyTorch (for example, a C++ AOTI runtime with no
+CUDA libraries) can build just the operators an exported Host collection calls,
+with no CUDA toolkit:
+
+```bash
+cmake -S . -B build_cpu -DDYNAMICEMB_CPU_ONLY=ON \
+  -DCMAKE_PREFIX_PATH="$(python3 -c 'import torch; print(torch.utils.cmake_prefix_path)')"
+cmake --build build_cpu --target inference_emb_ops
+```
+
+`inference_emb_ops.so` then links only PyTorch's CPU libraries and registers the
+CPU kernels of `linear_hash_lookup`, `expand_table_ids` and
+`embedding_collection_index`. It serves packages with embedded index state and
+indexers registered through `register_embedding_collection_indexer`; the
+sidecar directory loader, staged snapshot updates and the Python bindings
+require the CUDA build. `test/test_cpu_only_build.sh` checks this build.
+
 ### Build directly from source
 
 From `corelib/dynamicemb`, with NVE on `PYTHONPATH`:
