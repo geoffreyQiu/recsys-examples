@@ -145,3 +145,5 @@ python3 docker/flexkv-minimal/collect_perf.py \
 ```
 
 `PERF_RESULTS.md` is the checked-in snapshot of the supplied target evidence. The target's `perf/` directory contains the automatically updated working record and is gitignored so future pulls do not conflict. Send back `perf/summary.csv` and relevant `result.json`/logs when updating the shared snapshot. Instrumentation and collection changes were checked using saved logs, AST/shell syntax, and simulated Docker success/failure; no code was built or run on a GPU here.
+
+The longer GPU-hit preparation currently has a reproduced `slot_mapping.size=0` failure even without Nsight. The mounted benchmark now emits `[CacheMetadataError]` before PUT when it observes an empty page mapping for a nonempty history. This is diagnostic evidence, not a correctness workaround. The collector retains that JSON under `cache_metadata_errors` in the run's `result.json`. Do not accept a failed run as a cache latency measurement.

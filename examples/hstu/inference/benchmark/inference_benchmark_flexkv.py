@@ -4,6 +4,7 @@
 #
 
 import argparse
+import json
 import math
 import os
 import random
@@ -148,6 +149,47 @@ def build_request(
     )
 
 
+def install_cache_metadata_check(cache):
+    """Fail with page-table evidence before an invalid mapping reaches FlexKV PUT."""
+    original = cache.onboard_launch
+    request_count = 0
+
+    def checked(index_meta, lookup_result, metadata):
+        nonlocal request_count
+        request_count += 1
+        handle = original(index_meta, lookup_result, metadata)
+        slots = getattr(index_meta, "slot_mappings", None)
+        if slots is None:
+            return handle
+        lengths = index_meta.seq_lengths.tolist()
+        empty = [i for i, length in enumerate(lengths) if length > 0 and slots[i].numel() == 0]
+        if empty:
+            evidence = {
+                "allocation_request": request_count,
+                "user_ids": index_meta.user_ids.tolist(),
+                "history_lengths": lengths,
+                "slot_mapping_lengths": [slot.numel() for slot in slots],
+                "page_indices_numel": metadata.kv_indices.numel(),
+                "page_indptr_before_sync": metadata.kv_indptr.detach().cpu().tolist(),
+                "gpu_cached_lengths": lookup_result.gpu_cached_lengths.tolist(),
+                "host_cached_lengths": lookup_result.host_cached_lengths.tolist(),
+            }
+            # Only the failing path synchronizes for additional diagnostics.
+            torch.cuda.synchronize()
+            evidence["page_indptr_after_sync"] = metadata.kv_indptr.detach().cpu().tolist()
+            evidence["rebuilt_slot_mapping_lengths"] = [
+                slot.numel() for slot in cache.host_kvstorage_manager._build_slot_mappings(metadata)
+            ]
+            print("[CacheMetadataError] " + json.dumps(evidence, sort_keys=True), flush=True)
+            raise RuntimeError(
+                "Empty GPU page mapping for a nonempty history before FlexKV PUT; "
+                "see [CacheMetadataError]. No retry or cache fallback was applied."
+            )
+        return handle
+
+    cache.onboard_launch = checked
+
+
 def build_model(cfg: BenchmarkConfig, history_len: int, enable_kvcache: bool = True):
     max_num_history = max(2048, history_len + cfg.append_history_len)
     max_num_candidates = cfg.num_candidates
@@ -254,6 +296,8 @@ def build_model(cfg: BenchmarkConfig, history_len: int, enable_kvcache: bool = T
     )
     model_predict.bfloat16()
     model_predict.eval()
+    if enable_kvcache:
+        install_cache_metadata_check(model_predict.dense_module.kvcache)
     return model_predict, page_size, max_seqlen
 
 

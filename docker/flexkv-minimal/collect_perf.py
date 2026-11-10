@@ -68,6 +68,14 @@ def collect(text, run_id, mode, exit_code, log_path, image, gpus, profile):
             f = fields(line)
             transfers.append({k: f[k] for k in ('direction', 'blocks', 'data_size', 'transfer_time', 'bandwidth', 'op_id', 'graph_id') if k in f})
     record['transfer_samples'] = transfers
+    metadata_errors = []
+    for line in text.splitlines():
+        if line.startswith('[CacheMetadataError] '):
+            try:
+                metadata_errors.append(json.loads(line.split(' ', 1)[1]))
+            except json.JSONDecodeError:
+                metadata_errors.append({'unparsed': line})
+    record['cache_metadata_errors'] = metadata_errors
     return record, samples
 
 

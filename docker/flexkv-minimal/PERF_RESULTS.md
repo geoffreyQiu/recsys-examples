@@ -14,6 +14,8 @@ Forward latency includes the model call and its completion on CUDA; request cons
 | reported-smoke-graphs-on-cpu_hit | cpu_hit | on | no | 0 | — | — | — | — | completed; warnings |
 | reported-long-graphs-on-no_cache | no_cache | on | no | 50 | 2.5143 | 2.5144 | 2.5267 | 2.4955–2.5339 | completed |
 | reported-long-graphs-on-gpu_hit | gpu_hit | on | yes | 0 | — | — | — | — | failed_or_incomplete; warnings |
+| no_cache-20261110T085850Z-RUtt2Q | no_cache | on | no | 50 | 2.5079 | 2.5070 | 2.5178 | 2.4862–2.5595 | completed |
+| gpu_hit-20261110T085900Z-bBzka0 | gpu_hit | on | no | 0 | — | — | — | — | failed_or_incomplete; warnings |
 
 ## Run details
 
@@ -87,6 +89,26 @@ Forward latency includes the model call and its completion on CUDA; request cons
 - Source log: `user-provided longer RTX measurement transcript`; exit code: `None` (null means imported transcript, exit status not captured).
 - Config: `{"append_history_len": "0", "batch_size": "1", "disable_cudagraph": "False", "history_len": "1024", "mode": "only_onboard", "num_candidates": "256", "prefetch_gap_ms": "0.0-20.0", "scenarios": "gpu_hit", "skip_prefetch": "False"}`.
 - Image: `hstu-flexkv-minimal:sm120`; GPU selection: `device=2`; profiled: `True`.
+- Transfer log samples: 25; see JSONL/run JSON for individual values. These may include warmup transfers.
+- Warning: AssertionError: slot_mapping.size=0, token_mask.sum()=2048
+- Warning: AttributeError: 'NoneType' object has no attribute 'suppress'
+- Warning: CUDA IPC cleanup warning
+- Warning: FlexKV destructor error after shutdown
+
+### no_cache-20261110T085850Z-RUtt2Q
+
+- Assessment: measured; inspect warnings.
+- Source log: `user-provided unprofiled round1 transcript`; exit code: `0` (null means imported transcript, exit status not captured).
+- Config: `{"append_history_len": "0", "batch_size": "1", "disable_cudagraph": "False", "history_len": "1024", "layer_granularity": "-1", "layerwise": "0", "mode": "only_onboard", "num_candidates": "256", "prefetch_gap_ms": "0.0-20.0", "scenarios": "no_cache", "skip_prefetch": "False", "timed_iters": "50", "warmup_iters": "50"}`.
+- Image: `hstu-flexkv-minimal:sm120`; GPU selection: `device=2`; profiled: `False`.
+- Transfer log samples: 0; see JSONL/run JSON for individual values. These may include warmup transfers.
+
+### gpu_hit-20261110T085900Z-bBzka0
+
+- Assessment: failed during preparation without profiling; no timed GPU-hit samples.
+- Source log: `user-provided unprofiled round1 transcript`; exit code: `1` (null means imported transcript, exit status not captured).
+- Config: `{"append_history_len": "0", "batch_size": "1", "disable_cudagraph": "False", "history_len": "1024", "layer_granularity": "-1", "layerwise": "0", "mode": "only_onboard", "num_candidates": "256", "prefetch_gap_ms": "0.0-20.0", "scenarios": "gpu_hit", "skip_prefetch": "False", "timed_iters": "50", "warmup_iters": "50"}`.
+- Image: `hstu-flexkv-minimal:sm120`; GPU selection: `device=2`; profiled: `False`.
 - Transfer log samples: 25; see JSONL/run JSON for individual values. These may include warmup transfers.
 - Warning: AssertionError: slot_mapping.size=0, token_mask.sum()=2048
 - Warning: AttributeError: 'NoneType' object has no attribute 'suppress'
