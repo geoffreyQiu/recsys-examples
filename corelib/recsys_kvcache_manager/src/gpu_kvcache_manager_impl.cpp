@@ -76,6 +76,8 @@ GPUKVCacheManagerImpl::GPUKVCacheManagerImpl(
         _empty_pages.push(page_id);
 
     cudaCheck(cudaStreamCreateWithFlags(&alloc_stream, cudaStreamNonBlocking));
+    cudaCheck(cudaEventCreateWithFlags(&alloc_ready_event,
+                                       cudaEventDisableTiming));
     cudaCheck(cudaEventCreateWithFlags(&alloc_complete_event,
                                        cudaEventDisableTiming));
     cudaCheck(cudaMallocHost((void**)&this->metadata_host_buffer, 
@@ -83,7 +85,12 @@ GPUKVCacheManagerImpl::GPUKVCacheManagerImpl(
 }    
 
 GPUKVCacheManagerImpl::~GPUKVCacheManagerImpl() {
+    const c10::cuda::OptionalCUDAGuard device_guard(this->device);
+    if (alloc_pending) {
+        cudaCheck(cudaEventSynchronize(alloc_complete_event));
+    }
     cudaCheck(cudaFreeHost(this->metadata_host_buffer));
+    cudaCheck(cudaEventDestroy(alloc_ready_event));
     cudaCheck(cudaEventDestroy(alloc_complete_event));
     cudaCheck(cudaStreamDestroy(alloc_stream));
 }
@@ -303,6 +310,22 @@ void GPUKVCacheManagerImpl::allocate(
 
     const c10::cuda::OptionalCUDAGuard device_guard(this->device);
 
+    // The pinned staging buffer is shared by sequential calls. A device-side
+    // wait does not stop the CPU from rewriting it before the previous H2D
+    // copy has finished. This manager is not safe for concurrent callers.
+    if (alloc_pending) {
+        cudaCheck(cudaEventSynchronize(alloc_complete_event));
+    }
+
+    // PyTorch allocated the output buffers on the caller's current stream.
+    // Even torch.empty may reuse storage with pending writes from an earlier
+    // tensor. Order those writes before our raw CUDA writes on alloc_stream.
+    // The reverse dependency at the end only protects subsequent consumers.
+    const auto current_stream =
+        c10::cuda::getCurrentCUDAStream(this->device.index());
+    cudaCheck(cudaEventRecord(alloc_ready_event, current_stream.stream()));
+    cudaCheck(cudaStreamWaitEvent(alloc_stream, alloc_ready_event, 0));
+
     int batch_size = user_ids.size(0);
     int64_t *user_ids_ptr = user_ids.data_ptr<int64_t>();
     int *host_cached_lengths_ptr = host_cached_lengths.data_ptr<int>();
@@ -454,15 +477,12 @@ void GPUKVCacheManagerImpl::allocate(
     {
         nvtx3::scoped_range range{
             "hstu.aoti.kvcache.allocate.stream_dependency"};
-        // Preserve cross-stream ordering without blocking the model-execution
-        // CPU thread. The exported Triton model deliberately has one instance,
-        // matching this manager's single pinned metadata staging buffer. A
-        // concurrent multi-instance configuration needs one staging buffer
-        // and completion event per in-flight allocation.
+        // Order subsequent model work after the metadata producer. Buffer
+        // reuse was ordered in the opposite direction at entry. Concurrent
+        // callers would require separate staging buffers and event pairs.
         cudaCheck(
             cudaEventRecord(this->alloc_complete_event, this->alloc_stream));
-        const auto current_stream =
-            c10::cuda::getCurrentCUDAStream(this->device.index());
+        alloc_pending = true;
         cudaCheck(cudaStreamWaitEvent(current_stream.stream(),
                                       this->alloc_complete_event, 0));
     }

@@ -50,6 +50,8 @@ def collect(text, run_id, mode, exit_code, log_path, image, gpus, profile):
         'mode': mode, 'status': 'completed' if completed and exit_code in (None, 0) else 'failed_or_incomplete',
         'exit_code': exit_code, 'config': cfg, 'image': image, 'gpus': gpus,
         'profile': profile, 'log': str(log_path), 'samples_ms': vals,
+        'sync_cache_alloc': cfg.get('sync_cache_alloc') == 'True',
+        'allocator_impl': cfg.get('allocator_impl', 'unmarked'),
         'metric': 'synchronized_forward_wall_ms' if vals else None,
         'sample_count': len(vals), 'warnings': sorted(set(warnings)),
         'log_sha256': hashlib.sha256(text.encode()).hexdigest(),
@@ -67,6 +69,9 @@ def collect(text, run_id, mode, exit_code, log_path, image, gpus, profile):
         if '[FlexKV-IO]' in line and 'operation=transfer' in line and 'status=success' in line:
             f = fields(line)
             transfers.append({k: f[k] for k in ('direction', 'blocks', 'data_size', 'transfer_time', 'bandwidth', 'op_id', 'graph_id') if k in f})
+    if cfg.get('sync_cache_alloc') == 'True':
+        record['assessment'] = 'diagnostic allocation synchronization; ' + record['assessment']
+        record['warnings'].append('Diagnostic CPU wait before cache allocation changes scheduling and latency')
     record['transfer_samples'] = transfers
     metadata_errors = []
     for line in text.splitlines():
@@ -91,6 +96,8 @@ def render(records):
         val = lambda key: f"{r[key]:.4f}" if key in r else '—'
         span = f"{r['min_ms']:.4f}–{r['max_ms']:.4f}" if 'min_ms' in r else '—'
         status = r['status'] + ('; warnings' if r.get('warnings') else '')
+        if cfg.get('sync_cache_alloc') == 'True':
+            status += '; alloc-sync diagnostic'
         lines.append(f"| {r['run_id']} | {r['mode']} | {graph} | {'yes' if r.get('profile') else 'no'} | {r['sample_count']} | {val('mean_ms')} | {val('median_ms')} | {val('p95_ms')} | {span} | {status} |")
     lines += ['', '## Run details', '']
     for r in records:
@@ -100,6 +107,7 @@ def render(records):
                   f"- Image: `{r.get('image', '')}`; GPU selection: `{r.get('gpus', '')}`; profiled: `{r.get('profile', False)}`.",
                   f"- Transfer log samples: {len(r.get('transfer_samples', []))}; see JSONL/run JSON for individual values. These may include warmup transfers."]
         lines += [f'- Warning: {w}' for w in r.get('warnings', [])]
+        lines += [f'- Cache metadata error: `{json.dumps(e, sort_keys=True)}`.' for e in r.get('cache_metadata_errors', [])]
         lines += ['']
     return '\n'.join(lines).rstrip() + '\n'
 
@@ -154,7 +162,7 @@ def main():
         temp = report.with_suffix('.md.tmp')
         temp.write_text(render(records))
         temp.replace(report)
-        columns = ['run_id','mode','status','sample_count','mean_ms','median_ms','p95_ms','p99_ms','min_ms','max_ms','stddev_ms','metric','exit_code','profile','log']
+        columns = ['run_id','mode','status','sample_count','mean_ms','median_ms','p95_ms','p99_ms','min_ms','max_ms','stddev_ms','metric','exit_code','profile','sync_cache_alloc','allocator_impl','log']
         with (args.record_dir / 'summary.csv').open('w', newline='') as out:
             writer = csv.DictWriter(out, fieldnames=columns, extrasaction='ignore')
             writer.writeheader()

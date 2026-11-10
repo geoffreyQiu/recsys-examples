@@ -1,0 +1,7 @@
+**
+!corelib/
+!corelib/recsys_kvcache_manager/
+!corelib/recsys_kvcache_manager/**
+**/__pycache__
+**/build
+**/*.egg-info

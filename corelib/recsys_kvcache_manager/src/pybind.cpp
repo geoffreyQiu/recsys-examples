@@ -22,6 +22,7 @@
 #include "gpu_kvcache_manager_impl.h"
 
 PYBIND11_MODULE(kvcache_cpp, m) {
+  m.attr("cache_allocator_stream_ordering") = "events_v1";
   py::class_<kvcache::HostKVStorageImpl>(m, "HostKVStorageImpl", py::module_local())
     .def(py::init<int, int, int, int, int64_t, int64_t, int64_t, int64_t, int>(), 
          py::arg("num_layers"),

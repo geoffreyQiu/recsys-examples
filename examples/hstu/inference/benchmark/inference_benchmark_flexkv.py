@@ -44,6 +44,7 @@ class BenchmarkConfig:
     seed: int = 20260624
     max_batch_size: int = 16
     disable_cudagraph: bool = False
+    sync_cache_alloc: bool = False
     flexkv_config_path: str = ""
     flexkv_num_cpu_blocks: int = 4096
     flexkv_num_local_blocks: int = 4096
@@ -147,6 +148,23 @@ def build_request(
         torch.tensor(user_ids, dtype=torch.int64),
         torch.full((batch_size,), history_len * 2, dtype=torch.int32),
     )
+
+
+def install_cache_allocation_sync(cache):
+    """Diagnostic for the native allocator's missing incoming stream dependency.
+
+    This CPU wait changes scheduling and is included in timed forwards. Keep
+    results separate from measurements using the native event-based fix.
+    """
+    original = cache.allocate_kvcache
+    device = cache.gpu_kvcache_mgr.device_idx
+
+    def synchronized(*args, **kwargs):
+        torch.cuda.current_stream(device).synchronize()
+        return original(*args, **kwargs)
+
+    cache.allocate_kvcache = synchronized
+    print("[CacheAllocator] sync_cache_alloc=True; diagnostic CPU wait enabled", flush=True)
 
 
 def install_cache_metadata_check(cache):
@@ -297,6 +315,8 @@ def build_model(cfg: BenchmarkConfig, history_len: int, enable_kvcache: bool = T
     model_predict.bfloat16()
     model_predict.eval()
     if enable_kvcache:
+        if cfg.sync_cache_alloc:
+            install_cache_allocation_sync(model_predict.dense_module.kvcache)
         install_cache_metadata_check(model_predict.dense_module.kvcache)
     return model_predict, page_size, max_seqlen
 
@@ -819,6 +839,11 @@ if __name__ == "__main__":
     )
     parser.add_argument("--disable-cudagraph", action="store_true")
     parser.add_argument(
+        "--sync-cache-alloc",
+        action="store_true",
+        help="Diagnostic: wait for the current CUDA stream before cache allocation; changes latency.",
+    )
+    parser.add_argument(
         "--no-prefetch",
         action="store_true",
         help="Timed SSD-hit GET reads SSD itself. Skip the DISK2H prefetch.",
@@ -868,6 +893,8 @@ if __name__ == "__main__":
         cfg = replace(cfg, ssd_pressure_batch_sleep_s=args.ssd_pressure_batch_sleep_s)
     if args.disable_cudagraph:
         cfg = replace(cfg, disable_cudagraph=True)
+    if args.sync_cache_alloc:
+        cfg = replace(cfg, sync_cache_alloc=True)
     if args.layerwise:
         cfg = replace(cfg, flexkv_enable_layerwise=1)
     if args.layer_granularity is not None:
@@ -901,10 +928,14 @@ if __name__ == "__main__":
         )
     enable_kvcache = scenarios != {"no_cache"}
     mode = "only_onboard" if cfg.only_onboard else "end_to_end"
+    allocator_impl = getattr(
+        sys.modules.get("kvcache_cpp"), "cache_allocator_stream_ordering", "unmarked"
+    )
     print(
         f"[Config] history_len={history_len}, append_history_len={cfg.append_history_len}, "
         f"num_candidates={cfg.num_candidates}, batch_size={cfg.batch_size}, "
-        f"disable_cudagraph={cfg.disable_cudagraph}, "
+        f"disable_cudagraph={cfg.disable_cudagraph}, sync_cache_alloc={cfg.sync_cache_alloc}, "
+        f"allocator_impl={allocator_impl}, "
         f"warmup_iters={cfg.warmup_iters}, timed_iters={cfg.timed_iters}, "
         f"layerwise={cfg.flexkv_enable_layerwise}, layer_granularity={cfg.flexkv_layer_granularity}, "
         f"mode={mode}, skip_prefetch={cfg.skip_prefetch}, "

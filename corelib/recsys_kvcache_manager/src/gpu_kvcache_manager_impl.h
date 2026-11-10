@@ -121,7 +121,9 @@ public:
 public:
     // allocation related
     cudaStream_t alloc_stream;
+    cudaEvent_t alloc_ready_event;
     cudaEvent_t alloc_complete_event;
+    bool alloc_pending = false;
     void* metadata_host_buffer;   // preallocated pinned host buffer
 
 public:

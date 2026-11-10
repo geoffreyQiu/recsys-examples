@@ -61,8 +61,8 @@ Then use the defaults (history 1024, no appended history, batch size 1, CUDA Gra
 
 ```bash
 bash docker/flexkv-minimal/run.sh no_cache
-PROFILE=1 bash docker/flexkv-minimal/run.sh gpu_hit
-PROFILE=1 bash docker/flexkv-minimal/run.sh cpu_hit
+PROFILE=0 bash docker/flexkv-minimal/run.sh gpu_hit
+PROFILE=0 bash docker/flexkv-minimal/run.sh cpu_hit
 ```
 
 `PROFILE=1` requires `nsys` inside the image. The NGC base normally includes it; check `docker run --rm hstu-flexkv-minimal:sm120 which nsys`. The original upstream GPU/CPU cases expose `scenario1_timed_run_*` and `scenario2_timed_run_*` NVTX ranges rather than printed latency summaries. Inspect those ranges and GPU activity in Nsight Systems; Python range duration alone is not a synchronized GPU latency measurement. The mounted benchmark now prints synchronized wall samples for all cases; Nsight remains useful for a component timeline. Do not report “completed” messages as numerical performance results.
@@ -77,8 +77,8 @@ Choose a dedicated empty directory on the actual local SSD, not a shared filesys
 
 ```bash
 export SSD_CACHE_DIR=/your/local/ssd/flexkv-benchmark-cache
-PROFILE=1 bash docker/flexkv-minimal/run.sh ssd_hit
-PROFILE=1 LAYER_GRANULARITY=1 bash docker/flexkv-minimal/run.sh ssd_layerwise
+PROFILE=0 bash docker/flexkv-minimal/run.sh ssd_hit
+PROFILE=0 LAYER_GRANULARITY=1 bash docker/flexkv-minimal/run.sh ssd_layerwise
 ```
 
 The wrapper mounts that directory at `/ssd-cache`, writes a config into `results-flexkv/ssd.yml` (CPU cache 0.2 GiB, SSD cache 8 GiB), and uses `--no-prefetch` for naive/layerwise comparability. The 8 GiB SSD setting accommodates the default targets plus pressure users more safely than upstream's tiny illustrative config. If increasing the workload, reassess capacity and the SSD residency prechecks; a recompute/fallback is not an SSD hit.
@@ -134,7 +134,7 @@ export RESULTS_DIR="$PWD/results-flexkv-measurements"
 tail -f "$(cat "$RESULTS_DIR/latest-run.txt")"/*.log
 ```
 
-The cumulative `perf/bench-results.md`, `perf/summary.csv`, and append-only `perf/runs.jsonl` update after each run, including failed runs. Initial history is seeded with the six smoke cases supplied in this chat; old GPU/CPU cases have **no inferred latency**, only completion and transfer evidence. Each run with latency samples records mean, median, P95, P99, minimum, maximum, and standard deviation. Raw transfer timings are retained separately and may include warmup activity. Cleanup warnings remain visible. Fewer than 30 samples are marked preliminary; even 50 samples need sensible warmup and repeatability before a firm comparison.
+The cumulative `perf/bench-results.md`, `perf/summary.csv`, and append-only `perf/runs.jsonl` update after each run, including failed runs. History is seeded with all target runs supplied in this chat; old GPU/CPU cases have **no inferred latency**, only completion and transfer evidence. Each run with latency samples records mean, median, P95, P99, minimum, maximum, and standard deviation. Raw transfer timings are retained separately and may include warmup activity. Cleanup warnings remain visible. Fewer than 30 samples are marked preliminary; even 50 samples need sensible warmup and repeatability before a firm comparison.
 
 To import a saved log later (the run ID must be unique, and retrying the same ID/content is idempotent):
 
@@ -147,3 +147,46 @@ python3 docker/flexkv-minimal/collect_perf.py \
 `PERF_RESULTS.md` is the checked-in snapshot of the supplied target evidence. The target's `perf/` directory contains the automatically updated working record and is gitignored so future pulls do not conflict. Send back `perf/summary.csv` and relevant `result.json`/logs when updating the shared snapshot. Instrumentation and collection changes were checked using saved logs, AST/shell syntax, and simulated Docker success/failure; no code was built or run on a GPU here.
 
 The longer GPU-hit preparation currently has a reproduced `slot_mapping.size=0` failure even without Nsight. The mounted benchmark now emits `[CacheMetadataError]` before PUT when it observes an empty page mapping for a nonempty history. This is diagnostic evidence, not a correctness workaround. The collector retains that JSON under `cache_metadata_errors` in the run's `result.json`. Do not accept a failed run as a cache latency measurement.
+
+## Cache allocator failure and targeted correction
+
+The graph-disabled, unprofiled run `gpu_hit-20261110T090542Z-unFSqH` failed on allocation 19 (user 28), during preparation. There were 64 page indices for a 2048-token history, but `kv_indptr` was `[1007943680, 0]` rather than `[0, 64]`. It stayed invalid after synchronization, and rebuilding the slot mapping still returned zero slots. Eighteen preparation transfers completed; there were zero timed inference samples. Neither profiling nor CUDA Graphs is required to trigger this failure.
+
+Static inspection found a missing CUDA stream dependency in `GPUKVCacheManagerImpl::allocate`: Python allocates output buffers on the current stream; native code writes them on a nonblocking `alloc_stream` without first waiting for prior work on the current stream. PyTorch can reuse storage while old writes remain queued on the original stream. The outgoing wait protects consumers but cannot prevent those earlier writes from clobbering new metadata. This is a concrete source defect and the leading explanation for the observed corruption; the causal diagnosis and fix still require target execution. See [PyTorch's stream and reused-memory contract](https://docs.pytorch.org/docs/2.15/notes/cuda.html#cuda-streams).
+
+The native correction adds the incoming stream dependency, preserves the outgoing dependency, and waits for the previous allocation before the CPU rewrites the shared pinned staging buffer. It remains a single-caller manager. The compiled module exposes `cache_allocator_stream_ordering=events_v1`; the benchmark logs this as `allocator_impl`. Pulling source does **not** update the native extension inside the image.
+
+First use the existing image for a targeted check without compilation:
+
+```bash
+git pull --ff-only
+export GPUS=device=2 PROFILE=0
+export IMAGE=hstu-flexkv-minimal:sm120
+export RESULTS_DIR="$PWD/results-flexkv-alloc-sync-check"
+export PERF_RECORD_DIR="$PWD/perf"
+bash docker/flexkv-minimal/run.sh gpu_hit \
+  --warmup-iters 50 --timed-iters 50 --disable-cudagraph --sync-cache-alloc
+cat "$PERF_RECORD_DIR/summary.csv"
+run_dir=$(cat "$RESULTS_DIR/latest-run.txt")
+cat "$run_dir/result.json"
+```
+
+`--sync-cache-alloc` waits for the current CUDA stream before each cache allocation. It uses the existing extension and retains the metadata check; it does not retry or fabricate a mapping. It changes scheduling and adds a CPU wait within timed forwards. Successful timings are **diagnostic**, not formal performance results. Config, CSV and Markdown identify the flag. A pass supports the diagnosis but does not validate the native correction.
+
+After that check supports the diagnosis, this target-only build creates a separate image by rebuilding **only** the KV-cache manager package on the successfully built local image. It keeps the original image and all other compiled dependencies:
+
+```bash
+set -o pipefail
+BUILD_JOBS=4 IMAGE=hstu-flexkv-minimal:sm120-allocfix \
+  bash docker/flexkv-minimal/build-cache-fix.sh 2>&1 | tee build-cache-fix.log
+```
+
+The target-only regression tests pending writes on default and non-default caller streams. Run it after building the corrected image, without any further compilation:
+
+```bash
+docker run --rm --gpus "$GPUS" hstu-flexkv-minimal:sm120-allocfix \
+  python -m pytest -q /workspace/recsys-examples/corelib/recsys_kvcache_manager/test/test_allocator_stream_ordering.py \
+  2>&1 | tee allocator-regression.log
+```
+
+Then select `IMAGE=hstu-flexkv-minimal:sm120-allocfix` and run without `--sync-cache-alloc`. Check for `allocator_impl=events_v1` and completion before accepting measurements. Start graph-disabled to match the failing diagnostic; graph-enabled formal runs follow a successful corrected-image check. No native build or GPU test was executed locally. Syntax checks, saved-log parsing, and CPU-only mocks are the local validation scope.
