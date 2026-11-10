@@ -1,0 +1,7 @@
+.git
+**/.git
+**/__pycache__
+**/build
+**/*.egg-info
+third_party/nv-embedding-cache
+third_party/cutlass

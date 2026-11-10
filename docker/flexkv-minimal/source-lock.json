@@ -1,0 +1,15 @@
+{
+  "source_revisions": {
+    ".": "d03198c35166e8dae907b6bc453f2fa1112700b0",
+    "third_party/FBGEMM": "17a613fc8bf7df7b19cd32bb1874c54642821793",
+    "third_party/FBGEMM/external/cutlass": "571edeb2d0ac872a8392fc49285b156b07884b4e",
+    "third_party/FlexKV": "80edd8461a975c4562ef31d17e48badbb8949b66",
+    "third_party/FlexKV/third_party/xxHash": "50f42268c6c96a3390e5832689906922f357a9b7",
+    "third_party/FlexKV/third_party/spdlog": "79524ddd08a4ec981b7fea76afd08ee05f83755d"
+  },
+  "torchrec": "0ea0ec09512930dbcbf6d24cb65132a77835bce8",
+  "base_image": "nvcr.io/nvidia/pytorch:26.07-py3",
+  "resolved_base_digest": "sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c",
+  "fbgemm_gpu": "1.8.0+cu130",
+  "nvcomp": "5.1.0.21_cuda12"
+}
