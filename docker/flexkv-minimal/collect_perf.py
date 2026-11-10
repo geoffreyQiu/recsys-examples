@@ -40,6 +40,8 @@ def collect(text, run_id, mode, exit_code, log_path, image, gpus, profile):
     if 'Producer process has been terminated before all shared CUDA tensors released' in text:
         warnings.append('CUDA IPC cleanup warning')
     for line in text.splitlines():
+        if re.match(r'^(?:[\w.]*Error|[\w.]*Exception|KeyboardInterrupt):', line):
+            warnings.append(line[:300])
         if re.search(r'fail.open|fallback|status=(?:fail|error)|Traceback', line, re.I):
             if 'Traceback' not in line:  # destructor trace recorded above
                 warnings.append(line[:300])
@@ -57,6 +59,8 @@ def collect(text, run_id, mode, exit_code, log_path, image, gpus, profile):
                       p95_ms=percentile(vals, 95), p99_ms=percentile(vals, 99),
                       min_ms=min(vals), max_ms=max(vals), stddev_ms=statistics.pstdev(vals))
     record['assessment'] = 'preliminary (<30 samples)' if 0 < len(vals) < 30 else ('measured; inspect warnings' if vals else 'completion only; latency unavailable')
+    if record['status'] == 'failed_or_incomplete':
+        record['assessment'] = 'failed/incomplete; any partial samples are not valid benchmark results'
     # Transfer samples are components, not inference latency; retain direction.
     transfers = []
     for line in text.splitlines():
@@ -122,10 +126,15 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX)
         history = args.record_dir / 'runs.jsonl'
         records = [json.loads(line) for line in history.read_text().splitlines() if line.strip()] if history.exists() else []
-        if not history.exists():
-            seed = Path(__file__).with_name('perf-seed.jsonl')
-            records = [json.loads(line) for line in seed.read_text().splitlines() if line.strip()] if seed.exists() else []
-            history.write_text(''.join(json.dumps(r, sort_keys=True) + '\n' for r in records))
+        seed = Path(__file__).with_name('perf-seed.jsonl')
+        seeded = [json.loads(line) for line in seed.read_text().splitlines() if line.strip()] if seed.exists() else []
+        known_ids = {r['run_id'] for r in records}
+        missing = [r for r in seeded if r['run_id'] not in known_ids]
+        if missing:
+            with history.open('a') as out:
+                for entry in missing:
+                    out.write(json.dumps(entry, sort_keys=True) + '\n')
+            records.extend(missing)
         old = next((r for r in records if r['run_id'] == record['run_id']), None)
         if old and old['log_sha256'] != record['log_sha256']:
             raise SystemExit('Run ID already exists with different log content; choose a new ID.')
