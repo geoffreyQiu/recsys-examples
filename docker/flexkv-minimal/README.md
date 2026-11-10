@@ -23,7 +23,7 @@ Included:
 - Dynamic embedding Python/CUDA extension, used by the item embedding in the unmodified benchmark.
 - FlexKV native extension, xxHash, and SSD io_uring support. GDS, P2P, and Prometheus are disabled.
 - HSTU attention built for BF16 forward inference and head dimension 256. This is deliberately specific to this benchmark.
-- `hstu_cuda_ops`, `paged_kvcache_ops`, and the KV-cache manager extension/runtime library its package builds.
+- `hstu_cuda_ops`, `paged_kvcache_ops`, and the KV-cache manager extension/runtime library its package builds. The C++ client also requires `cppzmq-dev` for `zmq.hpp`.
 - nvCOMP 5.1.0.21: paged KV-cache ops link it even when the benchmark doesn't enable compression.
 
 Skipped: Triton inference server/backends/client build, NVE (both versions), Megatron, TorchX, AOTI executables/plugins, standalone dynamic embedding Torch binding, training attention variants, and unrelated extension `kk_cpu_ops`. `HSTU_INFERENCE_ONLY=1` is set. The Triton **kernel compiler** bundled with PyTorch remains required and is distinct from Triton inference server.

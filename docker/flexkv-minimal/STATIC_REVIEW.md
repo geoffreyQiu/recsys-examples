@@ -14,7 +14,7 @@ Source: NVIDIA/recsys-examples `d03198c35166e8dae907b6bc453f2fa1112700b0`. Submo
 | Keep two commons CUDA extensions | Paged layer `:16` imports `paged_kvcache_ops`; `commons/ops/cuda_ops/JaggedTensorOpFunction.py:3` imports `hstu_cuda_ops`; ranking model requires `strip_cached_tokens` | Use `BUILD_EXT_ONLY=hstu_cuda_ops,paged_kvcache_ops`; omit CPU partitioner |
 | Keep nvCOMP | `examples/commons/setup.py:49–70` unconditionally links `nvcomp_static` into the paged cache extension | The unmodified extension still needs nvCOMP even though this benchmark does not request compression |
 | Keep KV-cache manager package | Dense module imports its manager and metadata classes; native GPU manager imports `kvcache_cpp` | Use its stock installer. This also builds `kvcache_manager_ops.so`; avoid another standalone CMake build |
-| Keep FlexKV + io_uring + ZMQ | Flex adapter imports FlexKV client/config classes; FlexKV setup links `uring` and `xxhash`; KV-cache manager links ZMQ | Retain local SSD support, native logging headers, and xxHash. Disable optional GDS/P2P/metrics |
+| Keep FlexKV + io_uring + ZMQ | Flex adapter imports FlexKV client/config classes; FlexKV setup links `uring` and `xxhash`; KV-cache manager links ZMQ | Retain local SSD support, native logging headers, xxHash, and `cppzmq-dev` for the C++ `zmq.hpp` header (in addition to `libzmq3-dev`). Disable optional GDS/P2P/metrics |
 | Skip NVE | `modules/inference_embedding.py:193–194` imports NVE only for the NVEMB backend; `:246–255` defaults to DynamicEmb/TorchRec | No NVE source build needed for the unchanged benchmark |
 | Skip Megatron | `modules/inference_dense_module.py:40–46` guards training imports with `HSTU_INFERENCE_ONLY`; `hstu_processor.py:34–43` and `mlp.py:20–36` provide inference fallbacks | Set `HSTU_INFERENCE_ONLY=1` |
 | Skip Triton Server, AOTI apps/plugins, TorchX, standalone embedding Torch binding | They are serving/export/training tooling outside the selected benchmark's execution path | Retain only the Triton kernel compiler already supplied with PyTorch |
@@ -73,3 +73,9 @@ The recipe intentionally retains FlexKV release/Cython compilation (`FLEXKV_DEBU
 - [Pinned upstream build](https://github.com/NVIDIA/recsys-examples/blob/d03198c35166e8dae907b6bc453f2fa1112700b0/docker/Dockerfile)
 - [Pinned benchmark](https://github.com/NVIDIA/recsys-examples/blob/d03198c35166e8dae907b6bc453f2fa1112700b0/examples/hstu/inference/benchmark/inference_benchmark_flexkv.py)
 - [Pinned attention setup](https://github.com/jiayus-nvidia/FBGEMM/blob/17a613fc8bf7df7b19cd32bb1874c54642821793/fbgemm_gpu/experimental/hstu/setup.py)
+
+## Target build follow-up: missing zmq.hpp
+
+The target build reached `recsys_kvcache_manager` and failed at `flexkv_cpp_client.cpp:12` because `zmq.hpp` was absent. Ubuntu Noble packages the C++ headers in `cppzmq-dev`; `libzmq3-dev` only recommends it, so `--no-install-recommends` did not install it. The Dockerfile now explicitly installs `cppzmq-dev` and checks `/usr/include/zmq.hpp` immediately before the KV-cache manager build. Earlier compilation layers are unchanged to preserve the target's Docker cache. This fix was reviewed statically; no compilation was performed here.
+
+Package evidence: [Ubuntu cppzmq-dev](https://packages.ubuntu.com/en/noble/cppzmq-dev), [Ubuntu libzmq3-dev](https://packages.ubuntu.com/noble/libzmq3-dev).

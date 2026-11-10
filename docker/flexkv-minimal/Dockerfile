@@ -51,6 +51,11 @@ RUN cd corelib/dynamicemb && python -m pip install --no-build-isolation --no-dep
 COPY examples/commons /workspace/recsys-examples/examples/commons
 RUN cd examples/commons && BUILD_EXT_ONLY=hstu_cuda_ops,paged_kvcache_ops \
     python -m pip install --no-build-isolation --no-deps .
+# The KV runtime client includes zmq.hpp (cppzmq), not just zmq.h.
+# Keep this late so existing expensive extension layers remain cached.
+RUN apt-get update && apt-get install -y --no-install-recommends cppzmq-dev \
+    && test -f /usr/include/zmq.hpp \
+    && rm -rf /var/lib/apt/lists/*
 COPY corelib/recsys_kvcache_manager /workspace/recsys-examples/corelib/recsys_kvcache_manager
 RUN cd corelib/recsys_kvcache_manager && python -m pip install --no-build-isolation --no-deps .
 COPY examples/hstu /workspace/recsys-examples/examples/hstu
