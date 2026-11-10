@@ -44,3 +44,7 @@ results/
 .docs/
 .SKILLS/
 .cursor/
+
+# Generated cumulative benchmark records and per-run artifacts
+/perf/
+/results-flexkv*/

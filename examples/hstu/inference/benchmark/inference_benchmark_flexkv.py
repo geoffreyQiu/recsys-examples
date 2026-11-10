@@ -405,6 +405,8 @@ def run_scenario_gpu_hit(
     # timed run
     print("timed run")
     for iter_idx, (batch, user_ids, total_history_lengths) in enumerate(req_timed):
+        torch.cuda.synchronize()
+        forward_t0 = time.perf_counter()
         torch.cuda.nvtx.range_push(f"scenario1_timed_run_{iter_idx}")
         model_predict.forward_with_kvcache(
             batch,
@@ -412,6 +414,13 @@ def run_scenario_gpu_hit(
             total_history_lengths,
         )
         torch.cuda.nvtx.range_pop()
+        torch.cuda.synchronize()
+        elapsed_ms = (time.perf_counter() - forward_t0) * 1000.0
+        print(
+            f"[latency_sample] scenario=gpu_hit batch_size={batch_size} "
+            f"iter={iter_idx} ms={elapsed_ms:.6f}",
+            flush=True,
+        )
 
     print(f"[Scenario1] timed run completed, iters={timed_iters}")
 
@@ -463,6 +472,8 @@ def run_scenario_gpu_miss_host_hit(
         kvcache_mgr.evict(user_ids, for_gpu=True)
 
         # timed run
+        torch.cuda.synchronize()
+        forward_t0 = time.perf_counter()
         torch.cuda.nvtx.range_push(f"scenario2_timed_run_{iter_idx}")
         model_predict.forward_with_kvcache(
             batch,
@@ -470,6 +481,13 @@ def run_scenario_gpu_miss_host_hit(
             total_history_lengths,
         )
         torch.cuda.nvtx.range_pop()
+        torch.cuda.synchronize()
+        elapsed_ms = (time.perf_counter() - forward_t0) * 1000.0
+        print(
+            f"[latency_sample] scenario=cpu_hit batch_size={batch_size} "
+            f"iter={iter_idx} ms={elapsed_ms:.6f}",
+            flush=True,
+        )
     print(f"[Scenario2] timed run completed, iters={timed_iters}")
 
 
@@ -686,6 +704,12 @@ def run_scenario_gpu_cpu_miss_ssd_hit(
         scored = forward_samples
     else:
         scored = forward_samples[1:] if len(forward_samples) > 1 else forward_samples
+    for sample_idx, (wall_ms, cuda_ms) in enumerate(scored):
+        print(
+            f"[latency_sample] scenario=ssd_hit batch_size={batch_size} "
+            f"iter={sample_idx} ms={wall_ms:.6f} cuda_ms={cuda_ms:.6f}",
+            flush=True,
+        )
     if scored:
         wall_mean = sum(sample[0] for sample in scored) / len(scored)
         cuda_mean = sum(sample[1] for sample in scored) / len(scored)
@@ -837,6 +861,8 @@ if __name__ == "__main__":
         f"[Config] history_len={history_len}, append_history_len={cfg.append_history_len}, "
         f"num_candidates={cfg.num_candidates}, batch_size={cfg.batch_size}, "
         f"disable_cudagraph={cfg.disable_cudagraph}, "
+        f"warmup_iters={cfg.warmup_iters}, timed_iters={cfg.timed_iters}, "
+        f"layerwise={cfg.flexkv_enable_layerwise}, layer_granularity={cfg.flexkv_layer_granularity}, "
         f"mode={mode}, skip_prefetch={cfg.skip_prefetch}, "
         f"prefetch_gap_ms={PREFETCH_GAP_MS_RANGE[0]}-{PREFETCH_GAP_MS_RANGE[1]}, "
         f"scenarios={','.join(sorted(scenarios))}"

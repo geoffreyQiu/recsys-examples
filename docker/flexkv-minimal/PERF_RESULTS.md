@@ -1,0 +1,72 @@
+# Running benchmark results — RTX PRO 5500
+
+Updated automatically from saved logs. UTC timestamps identify collection, not necessarily execution.
+
+Forward latency includes the model call and its completion on CUDA; request construction and cache eviction are outside the timer. Each iteration is synchronized, so this is sequential latency, not pipelined throughput. Transfer timings are separate components. Profiling can add overhead. Fewer than 30 samples are preliminary; more samples alone do not establish steady state or correctness.
+
+| Run | Case | Graphs | Profiled | N | Mean ms | P50 ms | P95 ms | Min–max ms | Status |
+|---|---|---|---|---:|---:|---:|---:|---|---|
+| reported-smoke-graphs-off-no_cache | no_cache | off | no | 2 | 3.6346 | 3.6346 | 4.3664 | 2.8215–4.4477 | completed |
+| reported-smoke-graphs-off-gpu_hit | gpu_hit | off | no | 0 | — | — | — | — | completed; warnings |
+| reported-smoke-graphs-off-cpu_hit | cpu_hit | off | no | 0 | — | — | — | — | completed; warnings |
+| reported-smoke-graphs-on-no_cache | no_cache | on | no | 2 | 3.3598 | 3.3598 | 3.9270 | 2.7297–3.9900 | completed |
+| reported-smoke-graphs-on-gpu_hit | gpu_hit | on | no | 0 | — | — | — | — | completed; warnings |
+| reported-smoke-graphs-on-cpu_hit | cpu_hit | on | no | 0 | — | — | — | — | completed; warnings |
+
+## Run details
+
+### reported-smoke-graphs-off-no_cache
+
+- Assessment: preliminary (<30 samples).
+- Source log: `user-provided RTX PRO 5500 smoke transcript (graphs-off)`; exit code: `None` (null means imported transcript, exit status not captured).
+- Config: `{"append_history_len": "0", "batch_size": "1", "disable_cudagraph": "True", "history_len": "1024", "mode": "only_onboard", "num_candidates": "256", "prefetch_gap_ms": "0.0-20.0", "scenarios": "no_cache", "skip_prefetch": "False"}`.
+- Image: `hstu-flexkv-minimal:sm120`; GPU selection: `device=2`; profiled: `False`.
+- Transfer log samples: 0; see JSONL/run JSON for individual values. These may include warmup transfers.
+
+### reported-smoke-graphs-off-gpu_hit
+
+- Assessment: completion only; latency unavailable.
+- Source log: `user-provided RTX PRO 5500 smoke transcript (graphs-off)`; exit code: `None` (null means imported transcript, exit status not captured).
+- Config: `{"append_history_len": "0", "batch_size": "1", "disable_cudagraph": "True", "history_len": "1024", "mode": "only_onboard", "num_candidates": "256", "prefetch_gap_ms": "0.0-20.0", "scenarios": "gpu_hit", "skip_prefetch": "False"}`.
+- Image: `hstu-flexkv-minimal:sm120`; GPU selection: `device=2`; profiled: `False`.
+- Transfer log samples: 2; see JSONL/run JSON for individual values. These may include warmup transfers.
+- Warning: CUDA IPC cleanup warning
+- Warning: FlexKV destructor error after shutdown
+
+### reported-smoke-graphs-off-cpu_hit
+
+- Assessment: completion only; latency unavailable.
+- Source log: `user-provided RTX PRO 5500 smoke transcript (graphs-off)`; exit code: `None` (null means imported transcript, exit status not captured).
+- Config: `{"append_history_len": "0", "batch_size": "1", "disable_cudagraph": "True", "history_len": "1024", "mode": "only_onboard", "num_candidates": "256", "prefetch_gap_ms": "0.0-20.0", "scenarios": "cpu_hit", "skip_prefetch": "False"}`.
+- Image: `hstu-flexkv-minimal:sm120`; GPU selection: `device=2`; profiled: `False`.
+- Transfer log samples: 4; see JSONL/run JSON for individual values. These may include warmup transfers.
+- Warning: CUDA IPC cleanup warning
+- Warning: FlexKV destructor error after shutdown
+
+### reported-smoke-graphs-on-no_cache
+
+- Assessment: preliminary (<30 samples).
+- Source log: `user-provided RTX PRO 5500 smoke transcript (graphs-on)`; exit code: `None` (null means imported transcript, exit status not captured).
+- Config: `{"append_history_len": "0", "batch_size": "1", "disable_cudagraph": "False", "history_len": "1024", "mode": "only_onboard", "num_candidates": "256", "prefetch_gap_ms": "0.0-20.0", "scenarios": "no_cache", "skip_prefetch": "False"}`.
+- Image: `hstu-flexkv-minimal:sm120`; GPU selection: `device=2`; profiled: `False`.
+- Transfer log samples: 0; see JSONL/run JSON for individual values. These may include warmup transfers.
+
+### reported-smoke-graphs-on-gpu_hit
+
+- Assessment: completion only; latency unavailable.
+- Source log: `user-provided RTX PRO 5500 smoke transcript (graphs-on)`; exit code: `None` (null means imported transcript, exit status not captured).
+- Config: `{"append_history_len": "0", "batch_size": "1", "disable_cudagraph": "False", "history_len": "1024", "mode": "only_onboard", "num_candidates": "256", "prefetch_gap_ms": "0.0-20.0", "scenarios": "gpu_hit", "skip_prefetch": "False"}`.
+- Image: `hstu-flexkv-minimal:sm120`; GPU selection: `device=2`; profiled: `False`.
+- Transfer log samples: 2; see JSONL/run JSON for individual values. These may include warmup transfers.
+- Warning: CUDA IPC cleanup warning
+- Warning: FlexKV destructor error after shutdown
+
+### reported-smoke-graphs-on-cpu_hit
+
+- Assessment: completion only; latency unavailable.
+- Source log: `user-provided RTX PRO 5500 smoke transcript (graphs-on)`; exit code: `None` (null means imported transcript, exit status not captured).
+- Config: `{"append_history_len": "0", "batch_size": "1", "disable_cudagraph": "False", "history_len": "1024", "mode": "only_onboard", "num_candidates": "256", "prefetch_gap_ms": "0.0-20.0", "scenarios": "cpu_hit", "skip_prefetch": "False"}`.
+- Image: `hstu-flexkv-minimal:sm120`; GPU selection: `device=2`; profiled: `False`.
+- Transfer log samples: 4; see JSONL/run JSON for individual values. These may include warmup transfers.
+- Warning: CUDA IPC cleanup warning
+- Warning: FlexKV destructor error after shutdown

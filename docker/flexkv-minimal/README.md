@@ -1,10 +1,10 @@
 # Minimal HSTU FlexKV benchmark build
 
-This recipe runs `examples/hstu/inference/benchmark/inference_benchmark_flexkv.py` from upstream revision `d03198c35166e8dae907b6bc453f2fa1112700b0`. It preserves the benchmark and model source. Default deployment target: NVIDIA RTX PRO 5500 Blackwell, compute capability 12.0, on Linux x86_64. Build on the deployment server; transfer source through GitHub rather than copying H100-only binaries.
+This recipe runs `examples/hstu/inference/benchmark/inference_benchmark_flexkv.py` from upstream revision `d03198c35166e8dae907b6bc453f2fa1112700b0`. It preserves model source and adds explicit benchmark timing; see the collection workflow below. Default deployment target: NVIDIA RTX PRO 5500 Blackwell, compute capability 12.0, on Linux x86_64. Build on the deployment server; transfer source through GitHub rather than copying H100-only binaries.
 
 ## Chosen stack and scope
 
-Base: `nvcr.io/nvidia/pytorch:26.07-py3` (Python 3.12, PyTorch 2.13 development build, CUDA 13.3.1), matching the upstream Dockerfile. The successful pull of 26.03 establishes registry access; it does not validate this stack or the GPU driver. Your supplied target snapshot shows driver 620.70.06 / CUDA driver API 13.5, sufficiently recent for this stack. Its RTX PRO 5500s are physical GPUs 2 and 3; both were occupied (~80 GiB each by PID 691274). Arrange for one to be available before running the benchmark. GPU 0 is an RTX 6000D, so the default GPU 0 would benchmark the wrong model.
+Base: `nvcr.io/nvidia/pytorch:26.07-py3` (Python 3.12, PyTorch 2.13 development build, CUDA 13.3.1), matching the upstream Dockerfile. The successful pull of 26.03 establishes registry access; it does not validate this stack or the GPU driver. Your supplied target snapshot shows driver 620.70.06 / CUDA driver API 13.5, sufficiently recent for this stack. Its RTX PRO 5500s are physical GPUs 2 and 3; both were occupied in the initial snapshot, and the user subsequently confirmed both are available. Check availability before each run. GPU 0 is an RTX 6000D, so selecting GPU 0 would benchmark the wrong model.
 
 Before building, run:
 
@@ -65,7 +65,7 @@ PROFILE=1 bash docker/flexkv-minimal/run.sh gpu_hit
 PROFILE=1 bash docker/flexkv-minimal/run.sh cpu_hit
 ```
 
-`PROFILE=1` requires `nsys` inside the image. The NGC base normally includes it; check `docker run --rm hstu-flexkv-minimal:sm120 which nsys`. GPU/CPU cases in this upstream revision expose `scenario1_timed_run_*` and `scenario2_timed_run_*` NVTX ranges rather than printed latency summaries. Inspect those ranges and GPU activity in Nsight Systems; Python range duration alone is not a synchronized GPU latency measurement. `no_cache` prints synchronized wall latency samples. Do not report “completed” messages as numerical performance results.
+`PROFILE=1` requires `nsys` inside the image. The NGC base normally includes it; check `docker run --rm hstu-flexkv-minimal:sm120 which nsys`. The original upstream GPU/CPU cases expose `scenario1_timed_run_*` and `scenario2_timed_run_*` NVTX ranges rather than printed latency summaries. Inspect those ranges and GPU activity in Nsight Systems; Python range duration alone is not a synchronized GPU latency measurement. The mounted benchmark now prints synchronized wall samples for all cases; Nsight remains useful for a component timeline. Do not report “completed” messages as numerical performance results.
 
 The upstream GPU/CPU preparation loops use the timed-user count rather than `--warmup-iters`. The script passes the upstream flags unchanged. Do not assume 100 extra steady-state warmups happened in those cases.
 
@@ -87,11 +87,11 @@ Each run saves a log under `results-flexkv/` by default, plus an `.nsys-rep` whe
 
 ## Verification status
 
-**Static review only; target build and execution are unverified.** The earlier H100 and SM120 build attempts were canceled during FlexKV compilation at the user's request. No complete minimal image or benchmark run was produced. H100 behavior is not used as evidence for RTX PRO 5500 behavior.
+**Local verification is static only. User-supplied target logs now confirm a successful image build, GPU preflight, and no-cache/GPU-hit/CPU-hit smoke cases with CUDA Graphs off and on; see `PERF_RESULTS.md`. SSD execution and the newly added cache latency instrumentation remain unverified on the target.** The earlier H100 and SM120 build attempts were canceled during FlexKV compilation at the user's request. No complete image or benchmark run was produced locally. H100 behavior is not used as evidence for RTX PRO 5500 behavior.
 
 The static review traces imports and native linkage, checks the target architecture flags against the pinned build scripts, and inspects the supplied target driver/GPU snapshot. A binary audit of the matched FBGEMM wheel found an SM120a cubin in its cumulative-sum library. This establishes that code target is present, not that all wheel operations or the model execute correctly on the RTX.
 
-See `STATIC_REVIEW.md` for evidence and remaining target-side checks. The commands in this guide are instructions for the target operator; they have not been run on that server.
+See `STATIC_REVIEW.md` for evidence and remaining target-side checks. Target execution evidence comes only from user-supplied logs. New collection commands still need target-side verification.
 
 ## References
 
@@ -99,3 +99,49 @@ See `STATIC_REVIEW.md` for evidence and remaining target-side checks. The comman
 - [Pinned benchmark](https://github.com/NVIDIA/recsys-examples/blob/d03198c35166e8dae907b6bc453f2fa1112700b0/examples/hstu/inference/benchmark/inference_benchmark_flexkv.py)
 - [NVIDIA PyTorch 26.07 release notes](https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-07.html)
 - [NVIDIA GPU compute capabilities](https://developer.nvidia.com/cuda/gpus)
+
+## Run and collect results together (no image rebuild)
+
+From this revision, `run.sh` mounts the host benchmark into the existing image. GPU/CPU cache forward loops now print synchronized wall latency samples, and SSD samples are exported too. The model and cache residency logic are unchanged. Each GPU/CPU sample synchronizes before and after the forward call; request construction and explicit GPU eviction stay outside that timer. Background offload completion is not part of the forward latency. This is sequential request latency, not pipelined throughput.
+
+The host needs Python 3 (standard library only). Set the GPU explicitly to avoid accidentally selecting the server's RTX 6000D at index 0.
+
+```bash
+git pull --ff-only
+export GPUS=device=2
+export RESULTS_DIR="$PWD/results-flexkv-measurements"
+export PERF_RECORD_DIR="$PWD/perf"
+
+# A short check of the new timing/collection path; no image rebuild required.
+bash docker/flexkv-minimal/run.sh gpu_hit --warmup-iters 1 --timed-iters 2
+
+# All commands run AND gather data. Each run appends its results automatically.
+for scenario in no_cache gpu_hit cpu_hit; do
+  bash docker/flexkv-minimal/run.sh "$scenario" --timed-iters 50 || break
+done
+
+# View the cumulative record and spreadsheet-friendly summary.
+cat "$PERF_RECORD_DIR/bench-results.md"
+cat "$PERF_RECORD_DIR/summary.csv"
+```
+
+Every run gets a unique directory below `$RESULTS_DIR/runs/`. It contains the raw log, exact command, GPU/driver snapshot, image ID, source revision, benchmark hash, `samples.csv`, and `result.json`. Optional `PROFILE=1` also saves the Nsight report in that directory. Use profiling as a separate diagnostic run; mark its overhead when comparing measurements.
+
+While a run is active, another terminal can follow samples as they arrive:
+
+```bash
+export RESULTS_DIR="$PWD/results-flexkv-measurements"
+tail -f "$(cat "$RESULTS_DIR/latest-run.txt")"/*.log
+```
+
+The cumulative `perf/bench-results.md`, `perf/summary.csv`, and append-only `perf/runs.jsonl` update after each run, including failed runs. Initial history is seeded with the six smoke cases supplied in this chat; old GPU/CPU cases have **no inferred latency**, only completion and transfer evidence. Each run with latency samples records mean, median, P95, P99, minimum, maximum, and standard deviation. Raw transfer timings are retained separately and may include warmup activity. Cleanup warnings remain visible. Fewer than 30 samples are marked preliminary; even 50 samples need sensible warmup and repeatability before a firm comparison.
+
+To import a saved log later (the run ID must be unique, and retrying the same ID/content is idempotent):
+
+```bash
+python3 docker/flexkv-minimal/collect_perf.py \
+  --log /path/to/saved/cpu_hit.log --mode cpu_hit \
+  --run-id imported-cpu-hit-001 --record-dir "$PWD/perf"
+```
+
+`PERF_RESULTS.md` is the checked-in snapshot of the supplied target evidence. The target's `perf/` directory contains the automatically updated working record and is gitignored so future pulls do not conflict. Send back `perf/summary.csv` and relevant `result.json`/logs when updating the shared snapshot. Instrumentation and collection changes were checked using saved logs, AST/shell syntax, and simulated Docker success/failure; no code was built or run on a GPU here.
