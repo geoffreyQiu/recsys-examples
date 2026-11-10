@@ -81,6 +81,14 @@ def collect(text, run_id, mode, exit_code, log_path, image, gpus, profile):
             except json.JSONDecodeError:
                 metadata_errors.append({'unparsed': line})
     record['cache_metadata_errors'] = metadata_errors
+    hit_warmups = [fields(line) for line in text.splitlines() if line.startswith('[CacheHitWarmup] ')]
+    record['cache_hit_warmups'] = [w for w in hit_warmups if w.get('scenario') == mode]
+    requested_warmups = int(cfg.get('cache_hit_warmup_iters', '0'))
+    if requested_warmups > 0 and mode in ('gpu_hit', 'cpu_hit'):
+        if not any(int(w.get('completed', '0')) == requested_warmups for w in record['cache_hit_warmups']):
+            record['status'] = 'failed_or_incomplete'
+            record['assessment'] = 'requested cache-hit warmup was not confirmed; do not accept latency as a warmed result'
+            record['warnings'].append('Requested cache-hit warmup completion missing from log')
     return record, samples
 
 
@@ -106,6 +114,7 @@ def render(records):
                   f"- Config: `{json.dumps(r.get('config', {}), sort_keys=True)}`.",
                   f"- Image: `{r.get('image', '')}`; GPU selection: `{r.get('gpus', '')}`; profiled: `{r.get('profile', False)}`.",
                   f"- Transfer log samples: {len(r.get('transfer_samples', []))}; see JSONL/run JSON for individual values. These may include warmup transfers."]
+        lines += [f'- Cache-hit warmup: `{json.dumps(w, sort_keys=True)}`.' for w in r.get('cache_hit_warmups', [])]
         lines += [f'- Warning: {w}' for w in r.get('warnings', [])]
         lines += [f'- Cache metadata error: `{json.dumps(e, sort_keys=True)}`.' for e in r.get('cache_metadata_errors', [])]
         lines += ['']

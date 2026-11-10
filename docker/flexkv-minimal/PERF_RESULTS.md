@@ -19,6 +19,8 @@ Forward latency includes the model call and its completion on CUDA; request cons
 | gpu_hit-20261110T090542Z-unFSqH | gpu_hit | off | no | 0 | — | — | — | — | failed_or_incomplete; warnings |
 | gpu_hit-20261110T093804Z-eX4F8j | gpu_hit | off | no | 50 | 3.0681 | 2.9676 | 3.0196 | 2.9551–7.7346 | completed; warnings; alloc-sync diagnostic |
 | allocator-validation-1SfHJj | allocator_validation | ? | no | 0 | — | — | — | — | build_completed_validation_blocked; warnings |
+| allocator-validation-vgyIP8 | allocator_validation | ? | no | 0 | — | — | — | — | completed |
+| gpu_hit-20261110T100249Z-wi4RWY | gpu_hit | off | no | 50 | 3.1117 | 3.0138 | 3.0555 | 2.9954–7.7609 | completed; warnings |
 
 ## Run details
 
@@ -147,3 +149,20 @@ Forward latency includes the model call and its completion on CUDA; request cons
 - Image: `hstu-flexkv-minimal:sm120-allocfix`; GPU selection: `device=2`; profiled: `False`.
 - Transfer log samples: 0; see JSONL/run JSON for individual values. These may include warmup transfers.
 - Warning: Regression launcher: /usr/bin/python: No module named pytest
+
+### allocator-validation-vgyIP8
+
+- Assessment: both native stream-ordering regressions passed on the target (default and nondefault current stream); no inference timing measured by these tests.
+- Source log: `/root/recsys/junyiq/recsys-flexkv-minimal/results-flexkv-allocfix/validation-vgyIP8/regression.log (user-provided transcript section)`; exit code: `0` (null means imported transcript, exit status not captured).
+- Config: `{"phase": "native_regression", "test_runner": "unittest", "tests_passed": "2"}`.
+- Image: `hstu-flexkv-minimal:sm120-allocfix`; GPU selection: `device=2`; profiled: `False`.
+- Transfer log samples: 0; see JSONL/run JSON for individual values. These may include warmup transfers.
+
+### gpu_hit-20261110T100249Z-wi4RWY
+
+- Assessment: measured; inspect warnings.
+- Source log: `/root/recsys/junyiq/recsys-flexkv-minimal/results-flexkv-allocfix/runs/gpu_hit-20261110T100249Z-wi4RWY/gpu_hit.log`; exit code: `0` (null means imported transcript, exit status not captured).
+- Config: `{"allocator_impl": "events_v1", "append_history_len": "0", "batch_size": "1", "disable_cudagraph": "True", "history_len": "1024", "layer_granularity": "-1", "layerwise": "0", "mode": "only_onboard", "num_candidates": "256", "prefetch_gap_ms": "0.0-20.0", "scenarios": "gpu_hit", "skip_prefetch": "False", "sync_cache_alloc": "False", "timed_iters": "50", "warmup_iters": "50"}`.
+- Image: `hstu-flexkv-minimal:sm120-allocfix`; GPU selection: `device=2`; profiled: `False`.
+- Transfer log samples: 50; see JSONL/run JSON for individual values. These may include warmup transfers.
+- Warning: CUDA IPC cleanup warning

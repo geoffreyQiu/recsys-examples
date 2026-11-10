@@ -260,3 +260,35 @@ The regression now uses Python's built-in `unittest` runner. Mount the updated t
 ```
 
 Expected regression output: both named tests `ok`, `Ran 2 tests`, and `OK`. CUDA absence or an old native-extension marker is an error, not a skip. The benchmark must show `allocator_impl=events_v1`, `sync_cache_alloc=False`, all 50 prefix lengths equal to 2048, and 50 completed timed samples. The original pytest launch failure is retained as an `allocator_validation` event in the running record, with no benchmark latency attributed to it.
+
+
+## First matched performance round after native validation
+
+The corrected native allocator has now passed both stream tests and the graph-disabled 50-request GPU-hit benchmark without `--sync-cache-alloc`. The latter's mean is 3.1117 ms, P50 3.0138 ms and P95 3.0555 ms; its first timed sample was 7.7609 ms. This validation run is preserved unchanged.
+
+The optional `--cache-hit-warmup-iters 50` warms the cache-hit forward path in the GPU/CPU cases. It is separate from preparing prefixes and from the original `--warmup-iters`, which those upstream cache cases do not use for extra hit forwards. It requires `--only-onboard` (already selected by `run.sh`). Warmups use fresh requests for existing users, so they do not consume/mutate the reserved timed requests or introduce additional cached users. Each CPU warmup evicts its GPU copy first. The collector saves `[CacheHitWarmup]` completion evidence; those forwards do not become latency samples. Transfer logs include warmup traffic and must not be treated as timed inference samples.
+
+Run the following on the RTX server. All three scenarios use the corrected image, matching shapes, CUDA Graphs enabled, and `PROFILE=0`. No image rebuild is needed. The no-cache case gets 50 ordinary warmup forwards; the two cache cases each get 50 explicit cache-hit warmup forwards followed by 50 timed forwards. This first round provides matched measurements; repeatability still needs later repeated runs.
+
+```bash
+(
+  set -euo pipefail
+  git pull --ff-only
+  export GPUS=device=2 PROFILE=0
+  export IMAGE=hstu-flexkv-minimal:sm120-allocfix
+  export RESULTS_DIR="$PWD/results-flexkv-round1-allocfix"
+  export PERF_RECORD_DIR="$PWD/perf"
+
+  for scenario in no_cache gpu_hit cpu_hit; do
+    args=(--warmup-iters 50 --timed-iters 50)
+    if [[ $scenario != no_cache ]]; then
+      args+=(--cache-hit-warmup-iters 50)
+    fi
+    bash docker/flexkv-minimal/run.sh "$scenario" "${args[@]}"
+  done
+
+  cat "$PERF_RECORD_DIR/summary.csv"
+)
+```
+
+Every run saves its log, `samples.csv`, `result.json`, configuration, image ID, and source revision, then updates the cumulative Markdown/CSV/JSONL record. Failure stops the loop after the failed run's artifacts have been collected. Expected config is `disable_cudagraph=False`, `sync_cache_alloc=False`, `allocator_impl=events_v1`, and no profiling. Each cache case must print `[CacheHitWarmup] ... completed=50` before its 50 scored samples. Keep all samples, including a slow initial sample if one remains; do not compare this graph-enabled round directly against graph-disabled validation or the synchronization diagnostic.

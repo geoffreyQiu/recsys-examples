@@ -45,6 +45,7 @@ class BenchmarkConfig:
     max_batch_size: int = 16
     disable_cudagraph: bool = False
     sync_cache_alloc: bool = False
+    cache_hit_warmup_iters: int = 0
     flexkv_config_path: str = ""
     flexkv_num_cpu_blocks: int = 4096
     flexkv_num_local_blocks: int = 4096
@@ -416,6 +417,49 @@ def drain_offload_queue(kvcache_mgr, tag: str, log_every_s: float = 30.0) -> Non
         torch.cuda.nvtx.range_pop()
 
 
+def warmup_cached_prefixes(
+    model_predict,
+    scenario: str,
+    user_batches: list[list[int]],
+    history_len: int,
+    num_candidates: int,
+    max_seqlen: int,
+    warmup_iters: int,
+) -> None:
+    """Warm the only-onboard path with fresh requests and existing prefixes.
+
+    forward_with_kvcache mutates each request by stripping its cached history,
+    so never consume a request reserved for the timed run during warmup.
+    """
+    if warmup_iters == 0:
+        return
+    if warmup_iters < 0 or not user_batches:
+        raise ValueError("Cache-hit warmup needs a nonnegative count and prepared users")
+    if scenario not in {"gpu_hit", "cpu_hit"}:
+        raise ValueError(f"Unsupported cache-hit warmup scenario: {scenario}")
+    kvcache_mgr = model_predict.dense_module.kvcache
+    drain_offload_queue(kvcache_mgr, f"{scenario}.hit_warmup.prepare_offload_wait_all")
+    for iter_idx in range(warmup_iters):
+        request = build_request(
+            user_batches[iter_idx % len(user_batches)],
+            history_len,
+            num_candidates,
+            max_seqlen,
+        )
+        if scenario == "cpu_hit":
+            # Re-establish CPU-hit residency before every warmup forward too.
+            kvcache_mgr.evict(request[1], for_gpu=True)
+        torch.cuda.synchronize()
+        model_predict.forward_with_kvcache(*request)
+        torch.cuda.synchronize()
+    drain_offload_queue(kvcache_mgr, f"{scenario}.hit_warmup.offload_wait_all")
+    print(
+        f"[CacheHitWarmup] scenario={scenario} completed={warmup_iters} "
+        f"history_len={history_len}",
+        flush=True,
+    )
+
+
 def run_scenario_gpu_hit(
     model_predict,
     history_len: int,
@@ -450,6 +494,12 @@ def run_scenario_gpu_hit(
             user_ids,
             total_history_lengths,
         )
+
+    warmup_cached_prefixes(
+        model_predict, "gpu_hit", timed_user_batches,
+        history_len, num_candidates, max_seqlen,
+        BENCHMARK_CONFIG.cache_hit_warmup_iters,
+    )
 
     # precheck
     kvcache_mgr = model_predict.dense_module.kvcache
@@ -525,6 +575,11 @@ def run_scenario_gpu_miss_host_hit(
             total_history_lengths,
         )
     drain_offload_queue(kvcache_mgr, "scenario2.warmup.offload_wait_all")
+    warmup_cached_prefixes(
+        model_predict, "cpu_hit", timed_user_batches,
+        history_len, num_candidates, max_seqlen,
+        BENCHMARK_CONFIG.cache_hit_warmup_iters,
+    )
 
     # timed run
     print("timed run")
@@ -819,6 +874,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--timed-iters", type=int, default=None)
     parser.add_argument("--warmup-iters", type=int, default=None)
+    parser.add_argument(
+        "--cache-hit-warmup-iters", type=int, default=None,
+        help="Extra untimed GPU/CPU-hit forwards after prefix preparation; requires --only-onboard.",
+    )
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--history-len", type=int, default=None)
     parser.add_argument("--append-history-len", type=int, default=None)
@@ -879,6 +938,8 @@ if __name__ == "__main__":
         cfg = replace(cfg, timed_iters=args.timed_iters)
     if args.warmup_iters is not None:
         cfg = replace(cfg, warmup_iters=args.warmup_iters)
+    if args.cache_hit_warmup_iters is not None:
+        cfg = replace(cfg, cache_hit_warmup_iters=args.cache_hit_warmup_iters)
     if args.batch_size is not None:
         cfg = replace(cfg, batch_size=args.batch_size)
     if args.history_len is not None:
@@ -926,6 +987,15 @@ if __name__ == "__main__":
         raise ValueError(
             "no_cache cannot be combined with gpu_hit/cpu_hit/ssd_hit. Run separately."
         )
+    if cfg.cache_hit_warmup_iters < 0:
+        raise ValueError("--cache-hit-warmup-iters must be nonnegative")
+    if cfg.cache_hit_warmup_iters > 0:
+        if not cfg.only_onboard or not scenarios <= {"gpu_hit", "cpu_hit"}:
+            raise ValueError(
+                "--cache-hit-warmup-iters requires --only-onboard and GPU/CPU-hit scenarios"
+            )
+        if cfg.timed_iters <= 0:
+            raise ValueError("Cache-hit warmup needs at least one prepared timed request")
     enable_kvcache = scenarios != {"no_cache"}
     mode = "only_onboard" if cfg.only_onboard else "end_to_end"
     allocator_impl = getattr(
@@ -937,6 +1007,7 @@ if __name__ == "__main__":
         f"disable_cudagraph={cfg.disable_cudagraph}, sync_cache_alloc={cfg.sync_cache_alloc}, "
         f"allocator_impl={allocator_impl}, "
         f"warmup_iters={cfg.warmup_iters}, timed_iters={cfg.timed_iters}, "
+        f"cache_hit_warmup_iters={cfg.cache_hit_warmup_iters}, "
         f"layerwise={cfg.flexkv_enable_layerwise}, layer_granularity={cfg.flexkv_layer_granularity}, "
         f"mode={mode}, skip_prefetch={cfg.skip_prefetch}, "
         f"prefetch_gap_ms={PREFETCH_GAP_MS_RANGE[0]}-{PREFETCH_GAP_MS_RANGE[1]}, "
