@@ -17,6 +17,7 @@ Forward latency includes the model call and its completion on CUDA; request cons
 | no_cache-20261110T085850Z-RUtt2Q | no_cache | on | no | 50 | 2.5079 | 2.5070 | 2.5178 | 2.4862–2.5595 | completed |
 | gpu_hit-20261110T085900Z-bBzka0 | gpu_hit | on | no | 0 | — | — | — | — | failed_or_incomplete; warnings |
 | gpu_hit-20261110T090542Z-unFSqH | gpu_hit | off | no | 0 | — | — | — | — | failed_or_incomplete; warnings |
+| gpu_hit-20261110T093804Z-eX4F8j | gpu_hit | off | no | 50 | 3.0681 | 2.9676 | 3.0196 | 2.9551–7.7346 | completed; warnings; alloc-sync diagnostic |
 
 ## Run details
 
@@ -126,3 +127,13 @@ Forward latency includes the model call and its completion on CUDA; request cons
 - Warning: CUDA IPC cleanup warning
 - Warning: RuntimeError: Empty GPU page mapping for a nonempty history before FlexKV PUT; see [CacheMetadataError]. No retry or cache fallback was applied.
 - Cache metadata error: `{"allocation_request": 19, "gpu_cached_lengths": [0], "history_lengths": [2048], "host_cached_lengths": [0], "page_indices_numel": 64, "page_indptr_after_sync": [1007943680, 0], "page_indptr_before_sync": [1007943680, 0], "rebuilt_slot_mapping_lengths": [0], "slot_mapping_lengths": [0], "user_ids": [28]}`.
+
+### gpu_hit-20261110T093804Z-eX4F8j
+
+- Assessment: diagnostic allocation synchronization; measured; inspect warnings.
+- Source log: `/root/recsys/junyiq/recsys-flexkv-minimal/results-flexkv-alloc-sync-check/runs/gpu_hit-20261110T093804Z-eX4F8j/gpu_hit.log`; exit code: `0` (null means imported transcript, exit status not captured).
+- Config: `{"allocator_impl": "unmarked", "append_history_len": "0", "batch_size": "1", "disable_cudagraph": "True", "history_len": "1024", "layer_granularity": "-1", "layerwise": "0", "mode": "only_onboard", "num_candidates": "256", "prefetch_gap_ms": "0.0-20.0", "scenarios": "gpu_hit", "skip_prefetch": "False", "sync_cache_alloc": "True", "timed_iters": "50", "warmup_iters": "50"}`.
+- Image: `hstu-flexkv-minimal:sm120`; GPU selection: `device=2`; profiled: `False`.
+- Transfer log samples: 50; see JSONL/run JSON for individual values. These may include warmup transfers.
+- Warning: CUDA IPC cleanup warning
+- Warning: Diagnostic CPU wait before cache allocation changes scheduling and latency

@@ -190,3 +190,37 @@ docker run --rm --gpus "$GPUS" hstu-flexkv-minimal:sm120-allocfix \
 ```
 
 Then select `IMAGE=hstu-flexkv-minimal:sm120-allocfix` and run without `--sync-cache-alloc`. Check for `allocator_impl=events_v1` and completion before accepting measurements. Start graph-disabled to match the failing diagnostic; graph-enabled formal runs follow a successful corrected-image check. No native build or GPU test was executed locally. Syntax checks, saved-log parsing, and CPU-only mocks are the local validation scope.
+
+
+The target synchronization diagnostic has now passed: run `gpu_hit-20261110T093804Z-eX4F8j`, all 50 GPU-resident prefixes verified, 50 timed forwards completed, exit 0. It used the original native extension and the diagnostic CPU wait. The source correction remains pending target validation. See `PERF_RESULTS.md` for the preserved diagnostic measurements.
+
+Run the cache-only build, regression, and matching benchmark below on the RTX server. The subshell stops on a build/test failure, saves build/test logs in a unique validation directory, and the launcher automatically collects benchmark samples and updates the cumulative record. Profiling stays disabled. This is the native-fix validation; graph-enabled formal measurements follow successful validation.
+
+```bash
+(
+  set -euo pipefail
+  git pull --ff-only
+  export GPUS=device=2 PROFILE=0
+  export BASE_IMAGE=hstu-flexkv-minimal:sm120
+  export IMAGE=hstu-flexkv-minimal:sm120-allocfix
+  export RESULTS_DIR="$PWD/results-flexkv-allocfix"
+  export PERF_RECORD_DIR="$PWD/perf"
+  mkdir -p "$RESULTS_DIR"
+  validation_dir=$(mktemp -d "$RESULTS_DIR/validation-XXXXXX")
+  echo "Validation logs: $validation_dir"
+
+  BUILD_JOBS=4 bash docker/flexkv-minimal/build-cache-fix.sh \
+    2>&1 | tee "$validation_dir/build.log"
+  docker run --rm --gpus "$GPUS" "$IMAGE" python -m pytest -q \
+    /workspace/recsys-examples/corelib/recsys_kvcache_manager/test/test_allocator_stream_ordering.py \
+    2>&1 | tee "$validation_dir/regression.log"
+
+  bash docker/flexkv-minimal/run.sh gpu_hit \
+    --warmup-iters 50 --timed-iters 50 --disable-cudagraph
+  cat "$PERF_RECORD_DIR/summary.csv"
+  run_dir=$(cat "$RESULTS_DIR/latest-run.txt")
+  cat "$run_dir/result.json"
+)
+```
+
+Expected: two regression tests passed, `allocator_impl=events_v1`, `sync_cache_alloc=False`, all 50 prefix lengths equal to 2048, and 50 completed timed forwards. Retain the initial timed sample even if it is slower. All latency remains synchronized forward wall time; neither a cache-hit label nor completion alone is a numerical output-equivalence test.
