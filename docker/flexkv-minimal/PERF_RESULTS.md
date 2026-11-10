@@ -18,6 +18,7 @@ Forward latency includes the model call and its completion on CUDA; request cons
 | gpu_hit-20261110T085900Z-bBzka0 | gpu_hit | on | no | 0 | — | — | — | — | failed_or_incomplete; warnings |
 | gpu_hit-20261110T090542Z-unFSqH | gpu_hit | off | no | 0 | — | — | — | — | failed_or_incomplete; warnings |
 | gpu_hit-20261110T093804Z-eX4F8j | gpu_hit | off | no | 50 | 3.0681 | 2.9676 | 3.0196 | 2.9551–7.7346 | completed; warnings; alloc-sync diagnostic |
+| allocator-validation-1SfHJj | allocator_validation | ? | no | 0 | — | — | — | — | build_completed_validation_blocked; warnings |
 
 ## Run details
 
@@ -137,3 +138,12 @@ Forward latency includes the model call and its completion on CUDA; request cons
 - Transfer log samples: 50; see JSONL/run JSON for individual values. These may include warmup transfers.
 - Warning: CUDA IPC cleanup warning
 - Warning: Diagnostic CPU wait before cache allocation changes scheduling and latency
+
+### allocator-validation-1SfHJj
+
+- Assessment: native image build and events_v1 import check passed; regression tests and benchmark did not start; no latency measured.
+- Source log: `/root/recsys/junyiq/recsys-flexkv-minimal/results-flexkv-allocfix/validation-1SfHJj/build.log and regression.log (user-provided transcript)`; exit code: `None` (null means imported transcript, exit status not captured).
+- Config: `{"benchmark_started": "False", "phase": "build_and_regression"}`.
+- Image: `hstu-flexkv-minimal:sm120-allocfix`; GPU selection: `device=2`; profiled: `False`.
+- Transfer log samples: 0; see JSONL/run JSON for individual values. These may include warmup transfers.
+- Warning: Regression launcher: /usr/bin/python: No module named pytest

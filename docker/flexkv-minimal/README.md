@@ -184,8 +184,9 @@ BUILD_JOBS=4 IMAGE=hstu-flexkv-minimal:sm120-allocfix \
 The target-only regression tests pending writes on default and non-default caller streams. Run it after building the corrected image, without any further compilation:
 
 ```bash
-docker run --rm --gpus "$GPUS" hstu-flexkv-minimal:sm120-allocfix \
-  python -m pytest -q /workspace/recsys-examples/corelib/recsys_kvcache_manager/test/test_allocator_stream_ordering.py \
+docker run --rm --gpus "$GPUS" \
+  -v "$PWD/corelib/recsys_kvcache_manager/test/test_allocator_stream_ordering.py:/tmp/test_allocator_stream_ordering.py:ro" \
+  hstu-flexkv-minimal:sm120-allocfix python /tmp/test_allocator_stream_ordering.py \
   2>&1 | tee allocator-regression.log
 ```
 
@@ -211,8 +212,9 @@ Run the cache-only build, regression, and matching benchmark below on the RTX se
 
   BUILD_JOBS=4 bash docker/flexkv-minimal/build-cache-fix.sh \
     2>&1 | tee "$validation_dir/build.log"
-  docker run --rm --gpus "$GPUS" "$IMAGE" python -m pytest -q \
-    /workspace/recsys-examples/corelib/recsys_kvcache_manager/test/test_allocator_stream_ordering.py \
+  docker run --rm --gpus "$GPUS" \
+    -v "$PWD/corelib/recsys_kvcache_manager/test/test_allocator_stream_ordering.py:/tmp/test_allocator_stream_ordering.py:ro" \
+    "$IMAGE" python /tmp/test_allocator_stream_ordering.py \
     2>&1 | tee "$validation_dir/regression.log"
 
   bash docker/flexkv-minimal/run.sh gpu_hit \
@@ -224,3 +226,37 @@ Run the cache-only build, regression, and matching benchmark below on the RTX se
 ```
 
 Expected: two regression tests passed, `allocator_impl=events_v1`, `sync_cache_alloc=False`, all 50 prefix lengths equal to 2048, and 50 completed timed forwards. Retain the initial timed sample even if it is slower. All latency remains synchronized forward wall time; neither a cache-hit label nor completion alone is a numerical output-equivalence test.
+
+
+## Resume after the corrected image was built
+
+The target built `hstu-flexkv-minimal:sm120-allocfix`, image ID `sha256:a5d4d98ea8fb979b9c03b0fe13e67b8e0e76d880f24f66ff83bcda966b772f5c`. The build's native `events_v1` marker check passed. The next command stopped before running tests because the minimal image does not contain pytest. The benchmark was not reached; no new latency samples were collected.
+
+The regression now uses Python's built-in `unittest` runner. Mount the updated test into the existing image; no installation or image rebuild is required. The following block resumes validation, saves its log, and then runs/collects the matching benchmark. It stops if either step fails.
+
+```bash
+(
+  set -euo pipefail
+  git pull --ff-only
+  export GPUS=device=2 PROFILE=0
+  export IMAGE=hstu-flexkv-minimal:sm120-allocfix
+  export RESULTS_DIR="$PWD/results-flexkv-allocfix"
+  export PERF_RECORD_DIR="$PWD/perf"
+  mkdir -p "$RESULTS_DIR"
+  validation_dir=$(mktemp -d "$RESULTS_DIR/validation-XXXXXX")
+  echo "Validation logs: $validation_dir"
+
+  docker run --rm --gpus "$GPUS" \
+    -v "$PWD/corelib/recsys_kvcache_manager/test/test_allocator_stream_ordering.py:/tmp/test_allocator_stream_ordering.py:ro" \
+    "$IMAGE" python /tmp/test_allocator_stream_ordering.py \
+    2>&1 | tee "$validation_dir/regression.log"
+
+  bash docker/flexkv-minimal/run.sh gpu_hit \
+    --warmup-iters 50 --timed-iters 50 --disable-cudagraph
+  cat "$PERF_RECORD_DIR/summary.csv"
+  run_dir=$(cat "$RESULTS_DIR/latest-run.txt")
+  cat "$run_dir/result.json"
+)
+```
+
+Expected regression output: both named tests `ok`, `Ran 2 tests`, and `OK`. CUDA absence or an old native-extension marker is an error, not a skip. The benchmark must show `allocator_impl=events_v1`, `sync_cache_alloc=False`, all 50 prefix lengths equal to 2048, and 50 completed timed samples. The original pytest launch failure is retained as an `allocator_validation` event in the running record, with no benchmark latency attributed to it.
