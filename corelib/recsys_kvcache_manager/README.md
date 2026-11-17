@@ -13,6 +13,7 @@ It supports lookup, offloading to lower-tier storage, onboarding to GPU memory f
 - [Installation](#installation)
 - [Basic APIs](#basic-apis)
 - [FlexKV Backend Options](#flexkv-backend-options)
+- [C++ Cache Owner](#c-cache-owner)
 - [Important Notes](#important-notes)
 - [Examples](#example)
 - [Future Plans](#future-plans)
@@ -119,6 +120,88 @@ enable_3rd_remote: false
 ```
 
 Before using SSD cache, update `ssd_cache_dir` to a writable local SSD path and set `ssd_cache_gb` > 0.
+
+## C++ Cache Owner
+
+Set `owner_loop: 1` in the YAML selected by `KVCACHE_MANAGER_CONFIG_FILE`
+to use the shared C++ owner with the tensor-only `kvcache_manager_ops` API.
+`owner_loop: 0` selects the legacy control path. Both use the same lookup,
+allocation, onboard and offload operator signatures. Graphs that have no
+request-completion boundary should be re-exported with `request_finish` as
+shown below before using paged owner execution.
+The legacy path blocks on the producer CUDA stream before offload publication;
+the owner path uses its recorded completion event instead.
+Legacy callers must also reap/flush completed offloads before reusing pinned
+pages under allocation pressure; the owner performs this drain automatically.
+Both paths drain pending offloads on shutdown. The test's `--legacy` mode
+records its explicit allocation-pressure flush separately from the owner's
+automatic progress check.
+
+`onboard_child_tasks: 1` selects child-task completion/cleanup for the pinned
+FlexKV adapter that retains merged child records. The default `0` preserves
+aggregate-task completion for newer adapters. The HSTU startup helpers select
+the pinned-adapter policy when its older configuration API is detected;
+an explicit YAML value overrides that compatibility default.
+For retained-child servers, polling requires terminal completion before
+reaping child records; an early readiness response alone does not clean them up.
+
+The owner serializes cache metadata access, dispatches FlexKV transfers, and
+progresses completion on its worker thread. `onboard_launch` queues work;
+`onboard_wait` remains the required dependency before consuming restored K/V.
+`offload_launch` records the producer CUDA stream, so publication cannot read
+unfinished K/V. `offload_reap_completed` collects completed publications and
+`offload_flush` drains them. Shutdown drains outstanding work before releasing
+cache storage; stop the FlexKV server **after** `shutdown_runtime`.
+
+Finish each request with `result = torch.ops.kvcache_manager_ops.request_finish(result)`.
+This op returns a fresh clone of the output and records CUDA completion after
+the clone. Returning that tensor keeps the completion call live through
+`torch.export` and AOTInductor without changing the public output structure.
+If the graph launches offload, pass its ticket as the optional second input:
+`request_finish(result, offload_ticket)`. This dependency keeps publication
+live without exposing the ticket as a model output.
+Paged allocation/eviction protects pages until the previous request and its
+transfers complete. This is conservative lifetime protection for the existing
+single-instance execution model, not a concurrent multi-request allocator.
+Use the model's consuming CUDA stream and do not capture these host-driven
+standard operators in a CUDA graph.
+
+Specialized layout adapters can link the exported `CacheOwner` API from
+`src/runtime/cache_owner.h` (installed under `include/recsys_kvcache_manager`).
+The fixed-history converter uses this same worker directly and keeps its
+resident-hit metadata and CUDA-graph replay adapters; it does not create a
+second owner queue.
+
+Python AOTI can hold the GIL while calling native operators. `OwnerWaitGuard`
+releases an already-held GIL around blocking owner waits, allowing tensor
+reference cleanup on the worker. It resolves optional CPython symbols at
+runtime and is a no-op in Python-free C++ serving. A focused CPU-only regression
+can be run from the repository root:
+
+```bash
+python corelib/recsys_kvcache_manager/test/test_owner_wait_guard.py \
+  --output /tmp/recsys-owner-wait-guard
+```
+
+The HSTU [AOTI example](../../examples/hstu/inference_aoti/README.md) enables
+the owner and queues history publication by default. The following small
+test exercises GPU → FlexKV CPU → GPU without a checkpoint:
+
+```bash
+python corelib/recsys_kvcache_manager/test/test_owner_runtime.py \
+  --library corelib/recsys_kvcache_manager/build/kvcache_manager_ops.so \
+  --output /tmp/recsys-owner-validation --aoti
+```
+
+Run from the repository root with the manager and pinned FlexKV adapter
+installed. The test uses two layers, 32-token pages, twelve GPU pages, and real
+FlexKV CPU storage. It checks partial-prefix append, GPU/CPU/miss mixtures,
+producer-stream ordering under allocation pressure, error recovery, shutdown,
+and small native-op AOTI graphs. `result.json` lists the checks; `read_graph.py`
+and the small PT2 files permit inspection of retained calls. The test is
+validation, not a performance benchmark. Cache writes and model execution run
+under `torch.inference_mode()`, matching the owner-allocated inference tensors
+and the HSTU inference path.
 
 ## Important Notes
 

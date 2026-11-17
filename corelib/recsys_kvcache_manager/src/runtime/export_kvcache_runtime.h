@@ -11,6 +11,7 @@ class ExportKVCacheRuntime : public IKVCacheRuntime {
 public:
     ExportKVCacheRuntime();
     virtual ~ExportKVCacheRuntime();
+    void shutdown_runtime() override;
 
     std::vector<at::Tensor> lookup_kvcache(
         at::Tensor user_ids,
@@ -35,6 +36,10 @@ public:
         at::Tensor kv_page_indptr
     ) override;
     void onboard_kvcache_wait(at::Tensor user_ids) override;
+    bool onboard_kvcache_poll(at::Tensor task_ids) override;
+    bool fixed_allocation_available(at::Tensor user_ids) override;
+    bool try_resident_slots(at::Tensor user_ids, int64_t length,
+                            int64_t banks, at::Tensor cpu_slots) override;
     at::Tensor offload_kvcache_launch(
         at::Tensor user_ids,
         at::Tensor seqlens,
@@ -61,6 +66,12 @@ private:
     std::list<std::tuple<int64_t, int64_t, int32_t, int32_t>> offload_tasks_;
 
 private:
+    std::vector<at::Tensor> fixed_slot_mappings(at::Tensor user_ids, at::Tensor seqlens);
+    bool fixed_history_slots_ = false;
+    bool batch_lookup_ = false;
+    bool fast_metadata_ = false;
+    // Server capability: merged children remain observable until individually reaped.
+    bool onboard_child_tasks_ = false;
     at::Tensor lookup_token_index_;  // in recsys only namespace matters, so we can pre-allocate a tensor for the token index in get_match.
     at::Tensor token_slot_mappings_in_page_;  // reuse for slot mapping building in onboard_kvcache_launch
     at::Tensor cache_tensor_;

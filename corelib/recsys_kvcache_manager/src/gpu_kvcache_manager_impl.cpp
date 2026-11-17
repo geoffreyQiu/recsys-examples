@@ -118,11 +118,11 @@ int64_t GPUKVCacheManagerImpl::getUIdToEvict(std::unordered_set<int64_t> extra_f
             continue;
         return *it;
     }
-    if (num_offloading_uids == 0) assert(false);
-    return _lru_list.front();
+    TORCH_CHECK(false, "cache_capacity_busy: all slots are pinned or protected; retry after transfer completion");
 };
 
 void GPUKVCacheManagerImpl::evict(int64_t uid) {
+    TORCH_CHECK(!_uid_offload_lock.count(uid), "cannot evict a slot while D2H is in flight");
     auto const tableIt = _lru_lookup_table.find(uid);
     if (_lru_lookup_table.end() != tableIt) {
         _lru_list.erase(tableIt->second);

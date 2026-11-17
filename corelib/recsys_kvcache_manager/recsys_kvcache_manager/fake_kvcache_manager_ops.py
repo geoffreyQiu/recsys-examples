@@ -287,6 +287,14 @@ def _shutdown_runtime_fake(dummy: torch.Tensor) -> None:
     return None
 
 
+def _request_finish_fake(
+    output: torch.Tensor, dependency: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    # The native op clones its input; it does not return an alias or a token.
+    del dependency
+    return torch.empty_like(output)
+
+
 def register_fake_kvcache_manager_ops() -> bool:
     global _REGISTERED
 
@@ -320,6 +328,8 @@ def register_fake_kvcache_manager_ops() -> bool:
     _register_fake("get_cache_tables", _get_cache_tables_fake)
     _register_fake("offload_flush", _offload_flush_fake)
     _register_fake("evict_kvcache", _evict_kvcache_fake)
+    if _has_op("request_finish"):
+        _register_fake("request_finish", _request_finish_fake)
 
     _REGISTERED = True
     return True

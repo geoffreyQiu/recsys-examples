@@ -87,6 +87,10 @@ public:
 
     std::vector<uint8_t> send_and_recv(const std::vector<uint8_t>& payload, int timeoutMs = 25000) {
         send_only(payload);
+        return recv_response(timeoutMs);
+    }
+
+    std::vector<uint8_t> recv_response(int timeoutMs = 25000) {
         log_flexkv_client_message(
             "waiting for response timeout_ms=" + std::to_string(timeoutMs)
         );
@@ -171,6 +175,29 @@ std::pair<int64_t, at::Tensor> FlexKVCppClient::get_match(
         layer_granularity,
         namespace_list);
     return decodeGetMatchResponse(impl_->send_and_recv(request));
+}
+
+std::vector<std::pair<int64_t, at::Tensor>> FlexKVCppClient::get_match_batch(
+    const std::vector<at::Tensor>& token_ids,
+    int layer_granularity,
+    const std::vector<std::vector<std::string>>& namespaces) {
+    TORCH_CHECK(token_ids.size()==namespaces.size(), "lookup batch size mismatch");
+    std::vector<std::pair<int64_t,at::Tensor>> results(token_ids.size());
+    std::unordered_map<int64_t,size_t> expected;
+    // One socket owner and no outstanding response-generating command is
+    // required. Send the independent lookups before waiting for any reply.
+    for(size_t i=0;i<token_ids.size();++i) {
+        auto task=impl_->next_task_id();expected.emplace(task,i);
+        impl_->send_only(encodeGetMatchRequest(impl_->dp_client_id_,task,token_ids[i],
+                                             std::nullopt,layer_granularity,namespaces[i]));
+    }
+    for(size_t i=0;i<token_ids.size();++i) {
+        auto response=decodeGetMatchResponse(impl_->recv_response());
+        auto it=expected.find(response.first);
+        TORCH_CHECK(it!=expected.end(),"unexpected or duplicate batched lookup response: ",response.first);
+        results[it->second]=std::move(response);expected.erase(it);
+    }
+    return results;
 }
 
 int64_t FlexKVCppClient::put_async(

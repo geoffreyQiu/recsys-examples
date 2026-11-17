@@ -12,13 +12,6 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 import torch
-from flexkv.common.config import (  # noqa: E402
-    CacheConfig,
-    ModelConfig,
-    RankInfo,
-    UserConfig,
-    update_default_config_from_user_config,
-)
 from flexkv.server.server import KVServer  # noqa: E402
 from kvcache_runtime_config import (  # noqa: E402
     DEFAULT_KVCACHE_CONFIG_FILE,
@@ -27,7 +20,8 @@ from kvcache_runtime_config import (  # noqa: E402
     config_optional_int,
     config_torch_dtype,
     extra_flexkv_configs,
-    load_kvcache_runtime_yaml,
+    make_flexkv_server_configs,
+    prepare_flexkv_runtime_yaml,
     required_config,
     reset_ipc_socket,
 )
@@ -96,7 +90,7 @@ def _host_capacity_per_layer(config_values: Dict[str, Any], dtype: torch.dtype) 
 def _make_kvcache_config_from_yaml(
     config_file: Optional[str],
 ) -> tuple[KVCacheConfig, str]:
-    config, resolved_config_file = load_kvcache_runtime_yaml(config_file)
+    config, resolved_config_file = prepare_flexkv_runtime_yaml(config_file)
     config_values = {
         field_name: config_int(config, yaml_name)
         for yaml_name, field_name in _INT_CONFIG_FIELDS.items()
@@ -131,19 +125,6 @@ def _make_kvcache_config_from_yaml(
 
 
 def _start_flexkv_server(kvcache_config: KVCacheConfig):
-    model_config = ModelConfig()
-    cache_config = CacheConfig()
-    user_config = UserConfig()
-
-    model_config.num_layers = kvcache_config.num_layers
-    model_config.num_kv_heads = kvcache_config.num_heads
-    model_config.head_size = kvcache_config.head_dim
-    model_config.dtype = kvcache_config.dtype
-    model_config.kv_dim = 2
-    model_config.tp_size = 1
-    model_config.dp_size = 1
-    cache_config.tokens_per_block = kvcache_config.page_size
-
     cpu_cache_gb = kvcache_config.cpu_cache_gb or max(
         1,
         math.ceil(
@@ -152,14 +133,8 @@ def _start_flexkv_server(kvcache_config: KVCacheConfig):
             / (1024**3)
         ),
     )
-    ssd_cache_gb = kvcache_config.ssd_cache_gb
-    user_config.cpu_cache_gb = cpu_cache_gb
-    user_config.ssd_cache_gb = ssd_cache_gb
-    for name, value in (kvcache_config.extra_configs or {}).items():
-        setattr(user_config, name, value)
-
-    update_default_config_from_user_config(
-        RankInfo(model_config=model_config), cache_config, user_config
+    model_config, cache_config = make_flexkv_server_configs(
+        kvcache_config, cpu_cache_gb, kvcache_config.ssd_cache_gb,
     )
 
     reset_ipc_socket(kvcache_config.server_recv_port)

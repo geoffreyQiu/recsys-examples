@@ -35,11 +35,13 @@ class ExportKVCachedInferenceRankingGR(torch.nn.Module):
         sparse_module: torch.nn.Module,
         dense_module: InferenceDenseModule,
         kvcache_config: KVCacheConfig,
+        offload_to_cpu: bool = True,
     ):
         super().__init__()
         self.sparse_module = sparse_module
         self.dense_module = dense_module
         self.kvcache_config = kvcache_config
+        self.offload_to_cpu = offload_to_cpu
 
         self.register_buffer(
             "_offload_slot_mapping_sentinel",
@@ -199,4 +201,24 @@ class ExportKVCachedInferenceRankingGR(torch.nn.Module):
             )
 
             jagged_data = self.dense_module._hstu_block._postprocessor(jagged_data)
-            return self.dense_module._mlp(jagged_data.values)
+            logits = self.dense_module._mlp(jagged_data.values)
+            offload_ticket = None
+            if self.offload_to_cpu:
+                offload_ticket = torch.ops.kvcache_manager_ops.offload_launch(
+                    user_ids,
+                    total_history_lengths,
+                    lookup_res[1],
+                    lookup_res[5],
+                    lookup_res[2],
+                    lookup_res[3],
+                    alloc_result[0],
+                    alloc_result[2],
+                    [self._offload_slot_mapping_sentinel.cpu()],
+                    logits,
+                )
+            # Keep request completion in the exported dataflow. The native op
+            # returns a fresh logits tensor and records completion of this CUDA
+            # stream, so later allocation cannot recycle pages still being read.
+            # The ticket also retains asynchronous publication; neither native
+            # call can be pruned while the serving output remains logits only.
+            return torch.ops.kvcache_manager_ops.request_finish(logits, offload_ticket)

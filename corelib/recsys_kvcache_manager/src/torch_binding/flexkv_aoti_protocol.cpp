@@ -1,6 +1,7 @@
 #include "flexkv_aoti_protocol.h"
 
 #include <c10/util/Exception.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 
 #include <cuda_runtime_api.h>
 
@@ -48,8 +49,17 @@ int32_t scalarTypeToProtocolCode(at::ScalarType scalarType) {
 
 void writeTensorHandle(FlexKVBufferWriter& writer, const at::Tensor& tensor) {
     TORCH_CHECK(tensor.is_cuda(), "FlexKV TP registration expects CUDA tensors");
+    TORCH_CHECK(tensor.is_contiguous(), "FlexKV raw IPC registration requires contiguous storage");
+    size_t allocation_bytes = 0;
+    void* allocation_base = c10::cuda::CUDACachingAllocator::getBaseAllocation(
+        tensor.data_ptr(), &allocation_bytes);
+    const auto offset_bytes = static_cast<const char*>(tensor.data_ptr()) -
+                              static_cast<const char*>(allocation_base);
+    TORCH_CHECK(offset_bytes >= 0 &&
+                static_cast<size_t>(offset_bytes) + tensor.nbytes() <= allocation_bytes,
+                "FlexKV tensor exceeds its CUDA IPC allocation");
     cudaIpcMemHandle_t handle;
-    const auto result = cudaIpcGetMemHandle(&handle, tensor.data_ptr());
+    const auto result = cudaIpcGetMemHandle(&handle, allocation_base);
     TORCH_CHECK(result == cudaSuccess, "cudaIpcGetMemHandle failed with code ", result);
     writer.writeI32(static_cast<int32_t>(sizeof(handle)));
     writer.writeBytes(&handle, sizeof(handle));
@@ -58,7 +68,7 @@ void writeTensorHandle(FlexKVBufferWriter& writer, const at::Tensor& tensor) {
         writer.writeI64(dim);
     }
     writer.writeI32(scalarTypeToProtocolCode(tensor.scalar_type()));
-    writer.writeI64(0);
+    writer.writeI64(static_cast<int64_t>(offset_bytes));
 }
 
 } // namespace

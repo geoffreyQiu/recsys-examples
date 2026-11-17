@@ -31,6 +31,7 @@ endif()
 
 find_package(Torch REQUIRED)
 find_package(CUDAToolkit REQUIRED)
+find_package(Threads REQUIRED)
 
 
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
@@ -49,6 +50,8 @@ set(KVCACHE_MANAGER_OPS_SOURCES
     src/torch_binding/kvcache_manager_context.cpp
     src/runtime/kvcache_runtime_config.cpp
     src/runtime/export_kvcache_runtime.cpp
+    src/runtime/cache_owner.cpp
+    src/runtime/owner_kvcache_runtime.cpp
     src/gpu_kvcache_manager_impl.cpp
     src/torch_binding/flexkv_cpp_client.cpp
     src/torch_binding/flexkv_aoti_protocol.cpp
@@ -98,7 +101,9 @@ target_compile_definitions(kvcache_manager_ops PRIVATE
 
 target_link_libraries(kvcache_manager_ops PRIVATE
     ${TORCH_LIBRARIES}
+    ${CMAKE_DL_LIBS}
     CUDA::cudart
+    Threads::Threads
     zmq
 )
 
@@ -111,4 +116,9 @@ set_target_properties(kvcache_manager_ops PROPERTIES
 install(TARGETS kvcache_manager_ops
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+# Public native owner API for external model/runtime adapters.
+install(FILES src/runtime/cache_owner.h src/runtime/owner_wait_guard.h
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/recsys_kvcache_manager
 )

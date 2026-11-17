@@ -121,6 +121,9 @@ at::ScalarType get_config_dtype(const ConfigMap& config) {
     if (dtype == "float16" || dtype == "fp16" || dtype == "half") {
         return at::kHalf;
     }
+    if (dtype == "float32" || dtype == "fp32" || dtype == "float") {
+        return at::kFloat;
+    }
     TORCH_CHECK(false, "Unsupported KV-cache dtype: ", dtype);
 }
 

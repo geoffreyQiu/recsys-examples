@@ -13,10 +13,15 @@
 TORCH_LIBRARY_FRAGMENT(kvcache_manager_ops, m) {
     m.def("init_kvcache(Tensor ordering_tensor) -> int");
     m.def("shutdown_runtime(Tensor ordering_tensor) -> ()");
+    m.def("request_finish(Tensor output, Tensor? dependency=None) -> Tensor");
     m.def("lookup(Tensor user_ids, Tensor seqlens, Tensor ordering_tensor) -> Tensor[]");
     m.def("allocate(Tensor user_ids, Tensor seqlens, Tensor merged_cached_lengths, Tensor host_cached_lengths) -> Tensor[]");
     m.def("onboard_launch(Tensor user_ids, Tensor seqlens, Tensor[] lookup_results, Tensor kv_page_indices, Tensor kv_page_indptr) -> (Tensor, Tensor, Tensor)");
     m.def("onboard_wait(Tensor task_ids, Tensor? ordering_tensor=None) -> Tensor[]");
+    m.def("onboard_poll(Tensor(a!) task_ids) -> bool");
+    m.def("offload_pending(Tensor anchor) -> int");
+    m.def("fixed_allocation_available(Tensor user_ids) -> bool");
+    m.def("try_resident_slots(Tensor user_ids, int length, int banks, Tensor(a!) cpu_slots) -> bool");
     m.def("offload_launch(Tensor user_ids, Tensor seqlens, Tensor merged_cached_lengths, Tensor host_cached_lengths, Tensor gpu_cached_startpos, Tensor gpu_cached_lengths, Tensor kv_page_indices, Tensor kv_page_indptr, Tensor[] slot_mappings, Tensor ordering_tensor) -> Tensor");
     m.def("offload_reap_completed(Tensor ordering_tensor) -> Tensor");
     m.def("get_cache_tables(Tensor ordering_tensor) -> Tensor[]");
@@ -75,10 +80,18 @@ int64_t init_kvcache(at::Tensor ordering_tensor) {
     return 0;
 }
 
+at::Tensor request_finish_impl(at::Tensor output, std::optional<at::Tensor> dependency) {
+    // The optional dependency keeps an asynchronous publication in graph order.
+    (void)dependency;
+    auto result=output.clone();
+    KVCacheRuntimeContext::instance().manager()->record_request_completion();
+    return result;
+}
+
 void shutdown_runtime_impl(at::Tensor ordering_tensor) {
     (void)ordering_tensor;
     log_op("shutdown_runtime", "enter");
-    KVCacheRuntimeContext::instance().clear_manager();
+    KVCacheRuntimeContext::shutdown_current();
     log_op("shutdown_runtime", "exit");
 }
 
@@ -182,6 +195,22 @@ std::vector<at::Tensor> onboard_wait_impl(
     return result;
 }
 
+bool onboard_poll_impl(at::Tensor tasks) {
+    TORCH_CHECK(!tasks.is_cuda(), "CPU task IDs required");
+    return KVCacheRuntimeContext::instance().manager()->onboard_kvcache_poll(tasks);
+}
+bool fixed_allocation_available_impl(at::Tensor ids) {
+    return KVCacheRuntimeContext::instance().manager()->fixed_allocation_available(ids);
+}
+bool try_resident_slots_impl(at::Tensor ids, int64_t length, int64_t banks,
+                            at::Tensor cpu_slots) {
+    return KVCacheRuntimeContext::instance().manager()->try_resident_slots(
+        ids, length, banks, cpu_slots);
+}
+int64_t offload_pending_impl(at::Tensor anchor) {
+    return KVCacheRuntimeContext::instance().manager()->get_num_offload_tasks();
+}
+
 at::Tensor offload_launch_impl(
     at::Tensor user_ids,
     at::Tensor seqlens,
@@ -251,7 +280,10 @@ at::Tensor offload_flush_impl(at::Tensor ordering_tensor) {
         {0, 3}, at::dtype(torch::kInt64).device(at::kCPU));
     while (runtime->get_num_offload_tasks() > 0) {
         reap_result = runtime->offload_kvcache_reap_completed();
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));  // sleep for a while before checking again
+        for(int64_t i=0;i<reap_result.size(0);++i)
+            TORCH_CHECK(reap_result.data_ptr<int64_t>()[3*i+2]==0,"FlexKV offload failed during flush");
+        if(runtime->get_num_offload_tasks()>0)
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
         log_tensor("offload_flush_result", reap_result);
     }
     log_op("offload_flush", "exit");
@@ -280,10 +312,15 @@ at::Tensor evict_kvcache_impl(
 TORCH_LIBRARY_IMPL(kvcache_manager_ops, CUDA, m) {
     m.impl("init_kvcache", &kvcache_manager::init_kvcache);
     m.impl("shutdown_runtime", &kvcache_manager::shutdown_runtime_impl);
+    m.impl("request_finish", &kvcache_manager::request_finish_impl);
     m.impl("lookup", &kvcache_manager::lookup_impl);
     m.impl("allocate", &kvcache_manager::allocate_impl);
     m.impl("onboard_launch", &kvcache_manager::onboard_launch_impl);
     m.impl("onboard_wait", &kvcache_manager::onboard_wait_impl);
+    m.impl("onboard_poll", &kvcache_manager::onboard_poll_impl);
+    m.impl("offload_pending", &kvcache_manager::offload_pending_impl);
+    m.impl("fixed_allocation_available", &kvcache_manager::fixed_allocation_available_impl);
+    m.impl("try_resident_slots", &kvcache_manager::try_resident_slots_impl);
     m.impl("offload_launch", &kvcache_manager::offload_launch_impl);
     m.impl("offload_reap_completed", &kvcache_manager::offload_reap_completed_impl);
     m.impl("get_cache_tables", &kvcache_manager::get_cache_tables_impl);
@@ -295,10 +332,15 @@ TORCH_LIBRARY_IMPL(kvcache_manager_ops, CUDA, m) {
 TORCH_LIBRARY_IMPL(kvcache_manager_ops, CPU, m) {
     m.impl("init_kvcache", &kvcache_manager::init_kvcache);
     m.impl("shutdown_runtime", &kvcache_manager::shutdown_runtime_impl);
+    m.impl("request_finish", &kvcache_manager::request_finish_impl);
     m.impl("lookup", &kvcache_manager::lookup_impl);
     m.impl("allocate", &kvcache_manager::allocate_impl);
     m.impl("onboard_launch", &kvcache_manager::onboard_launch_impl);
     m.impl("onboard_wait", &kvcache_manager::onboard_wait_impl);
+    m.impl("onboard_poll", &kvcache_manager::onboard_poll_impl);
+    m.impl("offload_pending", &kvcache_manager::offload_pending_impl);
+    m.impl("fixed_allocation_available", &kvcache_manager::fixed_allocation_available_impl);
+    m.impl("try_resident_slots", &kvcache_manager::try_resident_slots_impl);
     m.impl("offload_launch", &kvcache_manager::offload_launch_impl);
     m.impl("offload_reap_completed", &kvcache_manager::offload_reap_completed_impl);
     m.impl("get_cache_tables", &kvcache_manager::get_cache_tables_impl);

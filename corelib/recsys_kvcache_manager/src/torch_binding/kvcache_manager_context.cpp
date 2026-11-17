@@ -1,5 +1,8 @@
 #include "kvcache_manager_context.h"
 #include "export_kvcache_runtime.h"
+#include "owner_kvcache_runtime.h"
+#include "cache_owner.h"
+#include "kvcache_runtime_config.h"
 
 #include <ATen/ATen.h>
 #include <iostream>
@@ -74,7 +77,12 @@ KVCacheRuntimeContext& KVCacheRuntimeContext::instance() {
             "thread=" + c10::str(std::this_thread::get_id())
             + " creating ExportKVCacheRuntime"
         );
-        context.set_manager(std::make_shared<ExportKVCacheRuntime>());
+        auto config=load_yaml_config(find_config_path());
+        bool owner_enabled=config.count("owner_loop") && get_config_int(config,"owner_loop")!=0;
+        if(owner_enabled && !cache_owner_worker_thread())
+            context.set_manager(make_owner_kvcache_runtime());
+        else
+            context.set_manager(std::make_shared<ExportKVCacheRuntime>());
         log_kvcache_context_message(
             "thread=" + c10::str(std::this_thread::get_id())
             + " ExportKVCacheRuntime ready"
@@ -112,6 +120,14 @@ void KVCacheRuntimeContext::clear_manager() {
         "thread=" + c10::str(std::this_thread::get_id())
         + " clear_manager manager=" + c10::str(kvcache_manager_.get())
     );
+    shutdown_current();
+}
+
+void KVCacheRuntimeContext::shutdown_current() {
+    if (!kvcache_manager_) return;
+    // Keep the runtime and its GPU storage alive if draining fails or times
+    // out. The caller can retry shutdown after resolving the server failure.
+    kvcache_manager_->shutdown_runtime();
     kvcache_manager_.reset();
 }
 

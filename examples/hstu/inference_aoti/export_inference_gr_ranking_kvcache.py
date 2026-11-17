@@ -32,13 +32,6 @@ from commons.datasets.hstu_sequence_dataset import get_dataset
 from commons.hstu_data_preprocessor import get_common_preprocessors
 from commons.utils.stringify import stringify_dict
 from configs import HSTUConfig, InferenceHSTUConfig, get_inference_hstu_config
-from flexkv.common.config import (
-    CacheConfig,
-    ModelConfig,
-    RankInfo,
-    UserConfig,
-    update_default_config_from_user_config,
-)
 from flexkv.server.server import KVServer
 from kvcache_runtime_config import (
     config_float,
@@ -47,6 +40,8 @@ from kvcache_runtime_config import (
     config_torch_dtype,
     extra_flexkv_configs,
     load_kvcache_runtime_yaml,
+    make_flexkv_server_configs,
+    prepare_flexkv_runtime_yaml,
     required_config,
     reset_ipc_socket,
 )
@@ -80,23 +75,10 @@ def start_flexkv_server(
     kvcache_config: KVCacheConfig,
     config_file: Optional[str] = None,
 ):
-    runtime_config, resolved_config_file = load_kvcache_runtime_yaml(config_file)
+    runtime_config, resolved_config_file = prepare_flexkv_runtime_yaml(config_file)
     os.environ["KVCACHE_MANAGER_CONFIG_FILE"] = str(resolved_config_file)
 
-    model_config = ModelConfig()
-    cache_config = CacheConfig()
-    user_config = UserConfig()
-
-    model_config.num_layers = kvcache_config.num_layers
-    model_config.num_kv_heads = kvcache_config.num_heads
-    model_config.head_size = kvcache_config.head_dim
-    model_config.dtype = kvcache_config.dtype
-    model_config.kv_dim = 2
-    model_config.tp_size = 1
-    model_config.dp_size = 1
-    cache_config.tokens_per_block = kvcache_config.page_size
-
-    user_config.cpu_cache_gb = config_optional_int(
+    cpu_cache_gb = config_optional_int(
         runtime_config, "cpu_cache_gb"
     ) or max(
         1,
@@ -106,22 +88,9 @@ def start_flexkv_server(
             / (1024**3)
         ),
     )
-    user_config.ssd_cache_gb = config_optional_int(runtime_config, "ssd_cache_gb") or 0
-    extra_configs = kvcache_config.extra_configs or {}
-    for name in (
-        "enable_p2p_cpu",
-        "enable_p2p_ssd",
-        "enable_3rd_remote",
-        "redis_host",
-        "redis_port",
-        "local_ip",
-        "redis_password",
-    ):
-        if name in extra_configs:
-            setattr(user_config, name, extra_configs[name])
-
-    update_default_config_from_user_config(
-        RankInfo(model_config=model_config), cache_config, user_config
+    model_config, cache_config = make_flexkv_server_configs(
+        kvcache_config, cpu_cache_gb,
+        config_optional_int(runtime_config, "ssd_cache_gb") or 0,
     )
 
     server_recv_port = str(required_config(runtime_config, "server_recv_port"))
@@ -557,7 +526,7 @@ def export_inference_gr_ranking(
             )
             if auxiliary_output is not None:
                 raise RuntimeError(
-                    "Expected the no-offload model to return logits only"
+                    "Expected the KV-cache model to return logits only"
                 )
             print(f"[INFO] Warmup logits shape: {tuple(logits.shape)}")
             if stop_after_warmup:
@@ -637,7 +606,7 @@ def export_inference_gr_ranking(
                     )
                     if auxiliary_output is not None:
                         raise RuntimeError(
-                            "Expected the no-offload model to return logits only"
+                            "Expected the KV-cache model to return logits only"
                         )
                     return logits.float().cpu()
 
@@ -724,7 +693,7 @@ def export_inference_gr_ranking(
                     logits, auxiliary_output = compiled_results[dump_idx]
                     if auxiliary_output is not None:
                         raise RuntimeError(
-                            "Expected the compiled no-offload AOTI model to "
+                            "Expected the compiled KV-cache AOTI model to "
                             "return logits only"
                         )
 

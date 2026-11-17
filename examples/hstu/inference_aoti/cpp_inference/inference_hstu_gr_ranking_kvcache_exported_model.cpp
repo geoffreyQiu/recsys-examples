@@ -354,7 +354,7 @@ bool run_one_batch(torch::inductor::AOTIModelPackageLoader &loader,
       " loader.run returned outputs=" + std::to_string(outputs.size()));
   check_cuda_after("loader.run");
   TORCH_CHECK(outputs.size() == 1,
-              "Expected one logits output from the no-offload model, got ",
+              "Expected one logits output from the KV-cache model, got ",
               outputs.size(), ".");
 
   log_demo_debug("[INFO] Batch " + std::to_string(batch_idx) +

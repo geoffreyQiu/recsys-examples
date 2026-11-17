@@ -16,6 +16,9 @@ dtype: bfloat16
 
 host_capacity_per_layer: 6710886400
 host_kvstorage_backend: flexkv
+# Run transfer dispatch/completion in corelib's owner thread. Set 0 to use the
+# legacy synchronous control path with the same exported operator ABI.
+owner_loop: 1
 onload_timeout_ms: 0.0
 offload_timeout_ms: 100.0
 offload_mode: lazy

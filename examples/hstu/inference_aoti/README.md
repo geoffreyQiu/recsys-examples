@@ -17,6 +17,48 @@ The workflow covers five stages:
 For lower-level build and deployment details, see the
 [HSTU KV-cache AOTI setup guide](./guide_to_hstu_aoti_inference_setup.md).
 
+### Cache owner and request lifetime
+
+The shared [runtime YAML](./kvcache_cpp_runtime.yaml) enables corelib's C++ cache
+owner with `owner_loop: 1`. Python export, native C++ replay and Triton use the
+same existing KV operators and configuration; set `owner_loop: 0` to opt out.
+The legacy fallback blocks before offload publication to protect unfinished
+producer work. Startup selects `onboard_child_tasks: 1` for the pinned FlexKV
+adapter's merged-child cleanup; newer adapters keep the default `0`. An
+explicit YAML setting takes precedence. When adaptation is needed, the helper
+writes a derived YAML under `/tmp` and prints its path; use that path for C++
+replay/Triton as instructed by the server launcher.
+The owner handles transfer dispatch and completion. Onboarding starts before
+embedding/preprocessing and waits immediately before the HSTU cache consumer.
+
+The model queues `offload_launch` after the final logits and returns
+`request_finish(logits, offload_ticket)`. This native op returns a fresh
+logits tensor and records the model CUDA stream's completion, protecting pages
+from reuse by the next request. Its live output keeps the completion call in
+the exported graph, including publication through the ticket dependency.
+Rebuild the manager and re-export existing HSTU packages
+to include this completion op. The serving output remains logits only. Python and C++
+shutdown drain the runtime before releasing the FlexKV server/cache storage.
+
+The demo eagerly publishes complete history pages after each forward; the
+owner dispatches this work asynchronously. For a GPU-only export, construct
+`ExportKVCachedInferenceRankingGR(..., offload_to_cpu=False)` before export.
+That static option retains request completion and disables CPU publication.
+To validate paged CPU restoration, partial-prefix append and native AOTI
+without an HSTU checkpoint, run the companion from the repository root:
+
+```bash
+python corelib/recsys_kvcache_manager/test/test_owner_runtime.py \
+  --library corelib/recsys_kvcache_manager/build/kvcache_manager_ops.so \
+  --output /tmp/recsys-owner-validation --aoti
+```
+
+This starts an isolated FlexKV CPU server, validates GPU/CPU/miss mixtures and
+transfer/page lifetimes, and writes `result.json` plus small inspectable AOTI
+artifacts. It uses the same standard operators and the same
+`offload_launch → request_finish` dependency, with explicit flushes at test
+publication boundaries. The HSTU output contract remains logits only.
+
 ---
 
 ## Scope

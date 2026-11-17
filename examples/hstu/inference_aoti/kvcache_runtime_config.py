@@ -1,4 +1,5 @@
 import os
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -22,6 +23,28 @@ def load_kvcache_runtime_yaml(
         config = yaml.safe_load(config_stream) or {}
     if not isinstance(config, dict):
         raise ValueError(f"KV-cache config must be a YAML mapping: {path}")
+    return config, path
+
+
+def prepare_flexkv_runtime_yaml(
+    config_file: Optional[str] = None,
+) -> tuple[Dict[str, Any], Path]:
+    """Select task cleanup for the installed adapter without editing user YAML.
+
+    The pinned adapter predating RankInfo retains child records after batched
+    completion. Newer adapters use the default aggregate-task policy. An
+    explicit YAML setting takes precedence over this compatibility default.
+    """
+    from flexkv.common import config as flexkv_config
+
+    config, path = load_kvcache_runtime_yaml(config_file)
+    if "onboard_child_tasks" not in config and not hasattr(flexkv_config, "RankInfo"):
+        config["onboard_child_tasks"] = 1
+        with tempfile.NamedTemporaryFile(
+            mode="w", prefix="recsys-kvcache-runtime-", suffix=".yaml", delete=False
+        ) as derived:
+            yaml.safe_dump(config, derived, sort_keys=False)
+            path = Path(derived.name)
     return config, path
 
 
@@ -116,3 +139,46 @@ def extra_flexkv_configs(config: Dict[str, Any]) -> Dict[str, Any]:
     if redis_port is not None:
         configs["redis_port"] = redis_port
     return configs
+
+
+def make_flexkv_server_configs(kvcache_config, cpu_cache_gb: int, ssd_cache_gb: int):
+    """Build config for the pinned binary-protocol adapter or newer FlexKV."""
+    from flexkv.common import config as flexkv_config
+
+    model = flexkv_config.ModelConfig(
+        num_layers=kvcache_config.num_layers,
+        num_kv_heads=kvcache_config.num_heads,
+        head_size=kvcache_config.head_dim,
+        dtype=kvcache_config.dtype,
+        tp_size=1,
+        dp_size=1,
+    )
+    extras = kvcache_config.extra_configs or {}
+    if hasattr(flexkv_config, "RankInfo"):
+        cache = flexkv_config.CacheConfig(tokens_per_block=kvcache_config.page_size)
+        user = flexkv_config.UserConfig()
+        user.cpu_cache_gb = cpu_cache_gb
+        user.ssd_cache_gb = ssd_cache_gb
+        for name, value in extras.items():
+            setattr(user, name, value)
+        flexkv_config.update_default_config_from_user_config(
+            flexkv_config.RankInfo(model_config=model), cache, user
+        )
+    else:
+        # FlexKV 1.0's binary-protocol adapter uses explicit block counts.
+        # Keep its CPU-only startup usable without importing newer helpers.
+        if ssd_cache_gb or any(extras.get(key) for key in (
+            "enable_p2p_cpu", "enable_p2p_ssd", "enable_3rd_remote"
+        )):
+            raise ValueError("This FlexKV adapter needs a newer config API for SSD/P2P/remote tiers")
+        element_bytes = torch.empty((), dtype=kvcache_config.dtype).element_size()
+        block_bytes = (kvcache_config.num_layers * 2 * kvcache_config.page_size
+                       * kvcache_config.num_heads * kvcache_config.head_dim * element_bytes)
+        blocks = max(1, int(cpu_cache_gb * 1024**3 // block_bytes))
+        cache = flexkv_config.CacheConfig(
+            tokens_per_block=kvcache_config.page_size,
+            num_cpu_blocks=blocks, num_local_blocks=blocks,
+            num_tmp_cpu_blocks=max(16, kvcache_config.max_batch_size),
+            enable_ssd=False, enable_p2p_cpu=False, enable_p2p_ssd=False,
+        )
+    return model, cache

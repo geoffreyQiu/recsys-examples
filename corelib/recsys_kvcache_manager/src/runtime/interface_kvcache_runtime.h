@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <ATen/ATen.h>
 
 namespace kvcache_manager {
 
@@ -8,6 +9,8 @@ class IKVCacheRuntime {
 public:
     IKVCacheRuntime() = default;
     virtual ~IKVCacheRuntime() = default;
+    virtual void record_request_completion() {}
+    virtual void shutdown_runtime() {}
 
     virtual std::vector<at::Tensor> lookup_kvcache(
         at::Tensor user_ids,
@@ -32,6 +35,14 @@ public:
         at::Tensor kv_page_indptr
     ) = 0;
     virtual void onboard_kvcache_wait(at::Tensor user_ids) = 0;
+    virtual bool onboard_kvcache_poll(at::Tensor task_ids) = 0;
+    virtual bool fixed_allocation_available(at::Tensor user_ids) = 0;
+    // Optional fixed-slot fast path. The serialized caller protects active
+    // inference storage through completion; this is not a concurrent lease API.
+    virtual bool try_resident_slots(at::Tensor user_ids, int64_t length,
+                                    int64_t banks, at::Tensor cpu_slots) {
+        return false;
+    }
     virtual at::Tensor offload_kvcache_launch(
         at::Tensor user_ids,
         at::Tensor seqlens,

@@ -45,6 +45,11 @@ public:
         int layer_granularity = -1,
         const std::vector<std::string>& namespace_list = {});
 
+    std::vector<std::pair<int64_t, at::Tensor>> get_match_batch(
+        const std::vector<at::Tensor>& token_ids,
+        int layer_granularity,
+        const std::vector<std::vector<std::string>>& namespaces);
+
     int64_t put_async(
         const at::Tensor& token_ids,
         const at::Tensor& slot_mapping,

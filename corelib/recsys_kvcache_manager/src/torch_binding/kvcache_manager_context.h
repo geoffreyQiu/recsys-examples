@@ -9,6 +9,8 @@ class IKVCacheRuntime;
 class __attribute__((visibility("default"))) KVCacheRuntimeContext {
 public:
     static KVCacheRuntimeContext& instance();
+    // Does not lazily construct a runtime; repeated shutdown is a no-op.
+    static void shutdown_current();
     std::shared_ptr<IKVCacheRuntime> manager() const;
     void clear_manager();
 
