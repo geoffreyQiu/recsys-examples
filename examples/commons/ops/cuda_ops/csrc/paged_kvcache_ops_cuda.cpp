@@ -186,6 +186,22 @@ at::Tensor append_paged_kv_cache(at::Tensor append_key, at::Tensor append_value,
 
   cudaError_t status;
   switch (kv_scalar_dtype) {
+    case at::ScalarType::Float:
+        status =
+        AppendPagedKVCache(static_cast<float*>(paged_k_cache.data_ptr()),
+                           static_cast<float*>(paged_v_cache.data_ptr()),
+                           static_cast<int32_t*>(kv_indices.data_ptr()),
+                           static_cast<int32_t*>(kv_indptr.data_ptr()),
+                           num_heads, head_dim, page_size, stride_page, stride_n, stride_h,
+                           static_cast<float*>(append_key.data_ptr()),
+                           static_cast<float*>(append_value.data_ptr()),
+                           static_cast<int32_t*>(batch_indices.data_ptr()),
+                           static_cast<int32_t*>(positions.data_ptr()),
+                           static_cast<int32_t*>(seqlen_offsets.data_ptr()),
+                           static_cast<int32_t*>(nnz_cuda.data_ptr()),
+                           nnz, append_k_stride_n, append_k_stride_h,
+                           append_v_stride_n, append_v_stride_h, num_sms, stream);
+        break;
     case at::ScalarType::BFloat16:
         status =
         AppendPagedKVCache(static_cast<nv_bfloat16*>(paged_k_cache.data_ptr()),
@@ -328,10 +344,20 @@ PYBIND11_MODULE(paged_kvcache_ops, m) {
 }
 #endif
 
+void append_paged_kv_cache_mutate(at::Tensor key, at::Tensor value,
+    at::Tensor batch_indices, at::Tensor positions, at::Tensor offsets,
+    at::Tensor nnz, int64_t max_nnz, at::Tensor table, at::Tensor indices,
+    at::Tensor indptr, at::Tensor last_page_len, int64_t layout) {
+  append_paged_kv_cache(key, value, batch_indices, positions, offsets, nnz,
+                       max_nnz, table, indices, indptr, last_page_len, layout);
+}
+
 TORCH_LIBRARY_FRAGMENT(paged_kvcache_ops, m) {
+  m.def("append_kvcache.mutate(Tensor append_key, Tensor append_value, Tensor batch_indices, Tensor positions, Tensor seqlen_offsets, Tensor nnz_cuda, int max_nnz, Tensor(a!) kv_cache_table, Tensor kv_indices, Tensor kv_indptr, Tensor kv_last_page_len, int kv_layout) -> ()");
   m.def("append_kvcache(Tensor append_key, Tensor append_value, Tensor batch_indices, Tensor positions, Tensor seqlen_offsets, Tensor nnz_cuda, int max_nnz, Tensor kv_cache_table, Tensor kv_indices, Tensor kv_indptr, Tensor kv_last_page_len, int kv_layout) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(paged_kvcache_ops, CUDA, m) {
   m.impl("append_kvcache", &append_paged_kv_cache);
+  m.impl("append_kvcache.mutate", &append_paged_kv_cache_mutate);
 }

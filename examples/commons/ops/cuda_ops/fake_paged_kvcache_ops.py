@@ -29,9 +29,30 @@ def _append_kvcache_fake(
     return kv_cache_table
 
 
-if hasattr(torch.ops, "paged_kvcache_ops") and hasattr(
-    torch.ops.paged_kvcache_ops, "append_kvcache"
+if (
+    hasattr(torch.ops.paged_kvcache_ops, "append_kvcache")
+    and hasattr(torch.ops.paged_kvcache_ops.append_kvcache, "default")
+    and not torch._C._dispatch_has_kernel_for_dispatch_key(
+        "paged_kvcache_ops::append_kvcache", "Meta"
+    )
 ):
     torch.library.register_fake("paged_kvcache_ops::append_kvcache")(
         _append_kvcache_fake
+    )
+
+
+def _append_kvcache_mutate_fake(*args):
+    _append_kvcache_fake(*args)
+    return None
+
+
+if (
+    hasattr(torch.ops.paged_kvcache_ops, "append_kvcache")
+    and hasattr(torch.ops.paged_kvcache_ops.append_kvcache, "mutate")
+    and not torch._C._dispatch_has_kernel_for_dispatch_key(
+        "paged_kvcache_ops::append_kvcache.mutate", "Meta"
+    )
+):
+    torch.library.register_fake("paged_kvcache_ops::append_kvcache.mutate")(
+        _append_kvcache_mutate_fake
     )

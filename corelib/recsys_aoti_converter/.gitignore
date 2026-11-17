@@ -1,0 +1,12 @@
+build/
+artifacts/
+__pycache__/
+*.pyc
+*.so
+*.o
+*.pt
+*.pt2
+*.npz
+*.npy
+*.nsys-rep
+*.sqlite

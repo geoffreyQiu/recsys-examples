@@ -193,6 +193,26 @@ cudaError_t AppendPagedKVCache(DType* k_data,
   return cudaGetLastError();
 }
 
+template
+cudaError_t AppendPagedKVCache<float, int32_t>(
+  float* k_data,
+  float* v_data,
+  int32_t* indices,
+  int32_t* indptr,
+  uint32_t num_heads,
+  uint32_t head_dim,
+  uint32_t page_size,
+  uint32_t stride_page,
+  uint32_t stride_n,
+  uint32_t stride_h,
+  float* append_key, float* append_value, int32_t* batch_indices,
+  int32_t* positions, int32_t* offsets,
+  int32_t* nnz_cuda, uint32_t nnz,
+  size_t append_k_stride_n, size_t append_k_stride_h,
+  size_t append_v_stride_n, size_t append_v_stride_h,
+  int num_sms,
+  cudaStream_t stream);
+
 template 
 cudaError_t AppendPagedKVCache<nv_bfloat16, int32_t>(
   nv_bfloat16* k_data,
