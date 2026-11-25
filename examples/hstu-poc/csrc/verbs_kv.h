@@ -28,7 +28,14 @@ class VerbsKV {
   uint64_t flags_device_ptr() const;           // GPU-visible pointer to uint32 flags[max_layers]
   // segs: host array of 4 x int64 {remote offset, local offset, bytes, tag}; layer_ptr: [n_layers + 1]
   void post_reads(const int64_t* segs, const int* layer_ptr, int n_layers, uint32_t seq);
-  // writes (6' reference): post RDMA WRITEs for segs (local -> remote) after the caller's event; blocking helper
+  // W path (6' reference for CPU verbs): layer l's writes are posted once the GPU stores seq into wflags[l]
+  // (set_flag_seq kernel after the layer's K/V exist); after the last layer an 8-byte read per QP fences them,
+  // then done = seq (the GPU can wait on it with wait_flags_seq(done_ptr, 0, seq)).
+  void post_writes(const int64_t* segs, const int* layer_ptr, int n_layers, uint32_t seq, int64_t fence_remote,
+                   int64_t fence_local);
+  uint64_t wflags_device_ptr() const;
+  uint64_t done_device_ptr() const;
+  // writes (blocking helper): post RDMA WRITEs for segs (local -> remote) and wait
   void write_sync(const int64_t* segs, int n);
   void wait_idle();                            // block until the worker finished every posted request
   // CPU time the worker thread spent (seconds, from CLOCK_THREAD_CPUTIME_ID), and requests served

@@ -7,6 +7,7 @@
 #include "gin_kv.h"
 #include "kvutil.h"
 #include "verbs_kv.h"
+#include "raw_gdaki.h"
 
 namespace py = pybind11;
 using namespace hpoc;
@@ -75,6 +76,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                         cur());
            },
            py::arg("segs"), py::arg("ticket"), py::arg("peer"), py::arg("ctx") = 1, py::arg("threads") = 32)
+      .def("put_multi",
+           [](GinKV& g, torch::Tensor segs, int peer, int ctx0, int n_ctx) {
+             need_cuda(segs, "segs");
+             g.put_multi((const Seg*)segs.data_ptr(), (int)segs.size(0), peer, ctx0, n_ctx, cur());
+           },
+           py::arg("segs"), py::arg("peer"), py::arg("ctx0"), py::arg("n_ctx") = 2)
+      .def("fence",
+           [](GinKV& g, int peer, int ctx0, int n_ctx, int64_t remote_off, int64_t local_off, int sig,
+              std::optional<torch::Tensor> t_done) {
+             g.fence(peer, ctx0, n_ctx, remote_off, local_off, sig, ptr_or_null<uint64_t>(t_done), cur());
+           },
+           py::arg("peer"), py::arg("ctx0"), py::arg("n_ctx"), py::arg("remote_off"), py::arg("local_off"),
+           py::arg("sig") = -1, py::arg("t_done") = py::none())
       .def("wait_ticket", [](GinKV& g, torch::Tensor ticket, int ctx) { g.wait_ticket(ticket.data_ptr(), ctx, cur()); },
            py::arg("ticket"), py::arg("ctx") = 1)
       .def("commit", [](GinKV& g, int peer, int ctx, int sig) { g.commit(peer, ctx, sig, cur()); }, py::arg("peer"),
@@ -133,6 +147,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              TORCH_CHECK(!layer_ptr.is_cuda() && layer_ptr.scalar_type() == torch::kInt32, "layer_ptr cpu int32");
              v.post_reads(segs.data_ptr<int64_t>(), layer_ptr.data_ptr<int>(), (int)layer_ptr.numel() - 1, seq);
            })
+      .def("post_writes",
+           [](VerbsKV& vk, torch::Tensor segs, torch::Tensor layer_ptr, uint32_t seq, int64_t fr, int64_t fl) {
+             TORCH_CHECK(!segs.is_cuda() && segs.scalar_type() == torch::kInt64 && segs.is_contiguous(), "segs cpu int64");
+             vk.post_writes(segs.data_ptr<int64_t>(), layer_ptr.data_ptr<int>(), (int)layer_ptr.numel() - 1, seq, fr, fl);
+           })
+      .def("wflags_ptr", &VerbsKV::wflags_device_ptr)
+      .def("done_ptr", &VerbsKV::done_device_ptr)
       .def("write_sync",
            [](VerbsKV& v, torch::Tensor segs) {
              py::gil_scoped_release nogil;
@@ -146,7 +167,38 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("requests_done", &VerbsKV::requests_done)
       .def("gdr_writes_ordering", &VerbsKV::gdr_writes_ordering)
       .def("destroy", &VerbsKV::destroy);
+  py::class_<RawGdaki>(m, "RawGdaki")
+      .def(py::init<const std::string&, int64_t, int, int>(), py::arg("dev"), py::arg("bytes"), py::arg("nqp") = 4,
+           py::arg("sq_depth") = 4096)
+      .def("local_info", &RawGdaki::local_info)
+      .def("connect", &RawGdaki::connect)
+      .def("local", [](RawGdaki& r) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        return torch::from_blob(r.buffer(), {r.bytes()}, [](void*) {},
+                                torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA, dev));
+      })
+      .def("nqp", &RawGdaki::nqp)
+      .def("post_gets",
+           [](RawGdaki& r, torch::Tensor segs, torch::Tensor layer_ptr, torch::Tensor tickets,
+              std::optional<torch::Tensor> t_post) {
+             need_cuda(segs, "segs");
+             need_cuda(layer_ptr, "layer_ptr");
+             TORCH_CHECK(tickets.numel() >= (int64_t)r.nqp() * (layer_ptr.numel() - 1), "tickets too small");
+             r.post_gets((const Seg*)segs.data_ptr(), layer_ptr.data_ptr<int>(), (int)layer_ptr.numel() - 1,
+                         (uint64_t*)tickets.data_ptr(), ptr_or_null<uint64_t>(t_post), cur());
+           },
+           py::arg("segs"), py::arg("layer_ptr"), py::arg("tickets"), py::arg("t_post") = py::none())
+      .def("wait_layer",
+           [](RawGdaki& r, torch::Tensor tickets, int layer, std::optional<torch::Tensor> t_done) {
+             r.wait_layer((const uint64_t*)tickets.data_ptr(), layer, ptr_or_null<uint64_t>(t_done), cur());
+           },
+           py::arg("tickets"), py::arg("layer"), py::arg("t_done") = py::none())
+      .def("destroy", &RawGdaki::destroy);
   m.def("seq_inc", [](torch::Tensor seq) { seq_inc_gpu((uint32_t*)seq.data_ptr(), cur()); });
+  m.def("set_flag_seq", [](int64_t flags_addr, int layer, torch::Tensor seq) {
+    set_flag_seq_gpu((volatile uint32_t*)flags_addr, layer, (const uint32_t*)seq.data_ptr(), cur());
+  });
   m.def("wait_flags_seq",
         [](int64_t flags_addr, int layer, torch::Tensor seq, std::optional<torch::Tensor> stamp) {
           wait_flags_seq_gpu((const volatile uint32_t*)flags_addr, layer, (const uint32_t*)seq.data_ptr(),

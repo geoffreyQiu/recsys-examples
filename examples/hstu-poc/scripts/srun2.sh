@@ -20,4 +20,4 @@ PYP=$POC:$D/hstu-kv-rdma/repos/FBGEMM/fbgemm_gpu/experimental/hstu
 if [ "$ONE" = 1 ]; then LAYOUT=(-N1 -n1 -w "$A"); else LAYOUT=(-N2 -n$((2 * N)) --ntasks-per-node="$N" -w "$A,$B"); fi
 exec srun --jobid="$J" --overlap "${LAYOUT[@]}" --container-image="$IMG" --container-mounts="$D:$D" \
   --container-workdir="$POC" --export=ALL,MASTER_ADDR="$A",MASTER_PORT="${MASTER_PORT:-29511}" \
-  "$D/run.sh" env PYTHONPATH="$PYP" HPOC_BUILD_DIR="$POC/build/ext" "${ENVS[@]}" "$@"
+  "$D/run.sh" env PYTHONPATH="$PYP" HPOC_BUILD_DIR="${HPOC_BUILD_DIR:-$POC/build/ext}" "${ENVS[@]}" "$@"

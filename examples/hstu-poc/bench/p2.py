@@ -16,7 +16,7 @@ import grid  # noqa: E402
 
 from hstu_poc import dist as hd  # noqa: E402
 from hstu_poc.ext import ext  # noqa: E402
-from hstu_poc.kvsource import GinKVSource, VerbsKVSource  # noqa: E402
+from hstu_poc.kvsource import GinKVSource, RawGdakiSource, VerbsKVSource  # noqa: E402
 
 NICS = ["mlx5_0", "mlx5_3", "mlx5_4", "mlx5_5", "mlx5_6", "mlx5_9", "mlx5_10", "mlx5_11"]
 WORKER_CORES = [48, 50, 52, 54, 104, 106, 108, 110]   # on the socket of GPU/NIC k (DGX H100)
@@ -31,7 +31,7 @@ def fill_pool(E, buf, seed, chunk=1 << 30):
 def main():
     ap = argparse.ArgumentParser()
     grid.add_args(ap)
-    ap.add_argument("--transport", required=True, choices=["gin", "verbs"])
+    ap.add_argument("--transport", required=True, choices=["gin", "verbs", "raw"])
     ap.add_argument("--pool-gb", type=float, default=48)
     ap.add_argument("--local-gb", type=float, default=36)
     ap.add_argument("--nctx", type=int, default=4, help="GIN contexts for reads (P2: 4 needed for line rate with queued reads)")
@@ -60,6 +60,15 @@ def main():
         tr = E.GinKV(uid, rank, world, nbytes, not infer, n_ctx=a.nctx + 2, queue_depth=2048, strong_signals=True,
                      n_signals=4)
         make = lambda cfg: GinKVSource(cfg, tr, E, peer, pool, n_ctx=a.nctx)  # noqa: E731
+    elif a.transport == "raw":
+        # raw GDAKI on the inference side; the store is the same GPU-less verbs pool as for CPU verbs
+        if infer:
+            tr = E.RawGdaki(NICS[local], int(a.local_gb * 2**30), a.nqp, 4096)
+        else:
+            tr = E.VerbsKV(NICS[local], pool, False, a.nqp, 64, 0, -1)
+        infos = hd.gather(tr.local_info())
+        tr.connect(infos[peer])
+        make = lambda cfg: RawGdakiSource(cfg, tr, pool)  # noqa: E731
     else:
         nbytes = int(a.local_gb * 2**30) if infer else pool
         tr = E.VerbsKV(NICS[local], nbytes, infer, a.nqp, 64, a.flush, WORKER_CORES[local])

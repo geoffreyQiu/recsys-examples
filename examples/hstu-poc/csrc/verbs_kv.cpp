@@ -39,6 +39,8 @@ struct Job {
   int n_layers = 0;
   uint32_t seq = 0;
   bool write = false;
+  bool gated = false;          // W path: layer l waits for wflags[l] >= seq, fence + done flag at the end
+  int64_t fence_remote = 0, fence_local = 0;
 };
 
 struct VerbsImpl {
@@ -58,6 +60,10 @@ struct VerbsImpl {
   uint32_t rkey = 0;
   uint32_t* flags_host = nullptr;
   uint32_t* flags_dev = nullptr;
+  uint32_t* wflags_host = nullptr;   // GPU -> CPU: layer l's new K/V are ready to be written
+  uint32_t* wflags_dev = nullptr;
+  uint32_t* done_host = nullptr;     // CPU -> GPU: request seq's writes are durable
+  uint32_t* done_dev = nullptr;
   int max_layers = 0, flush_mode = 0, cpu_core = -1, gdr_order = -1;
   int sq_depth = 4096;
   std::thread worker;
@@ -156,6 +162,80 @@ static void run_job(VerbsImpl* p, const Job& j) {
   }
 }
 
+// W path: post layer l's RDMA WRITEs once the GPU says its K/V rows exist, then an 8-byte RDMA READ per QP as a
+// durability fence (served after the earlier writes on that QP), then done = seq.
+static void run_write_job(VerbsImpl* p, const Job& j) {
+  const int nqp = (int)p->qps.size();
+  int expect = 0, got = 0;
+  std::vector<ibv_sge> sges;
+  std::vector<ibv_send_wr> wrs;
+  ibv_wc wc[64];
+  auto drain = [&]() {
+    int n = ibv_poll_cq(p->cq, 64, wc);
+    if (n < 0) throw std::runtime_error("ibv_poll_cq failed");
+    for (int k = 0; k < n; ++k) {
+      if (wc[k].status != IBV_WC_SUCCESS)
+        throw std::runtime_error(std::string("work completion error: ") + ibv_wc_status_str(wc[k].status));
+      got++;
+    }
+  };
+  for (int l = 0; l < j.n_layers; ++l) {
+    while (__atomic_load_n(&p->wflags_host[l], __ATOMIC_ACQUIRE) < j.seq) drain();
+    int s0 = j.lp[l], s1 = j.lp[l + 1];
+    for (int q = 0; q < nqp; ++q) {
+      sges.clear();
+      wrs.clear();
+      for (int i = s0 + q; i < s1; i += nqp) {
+        const int64_t* sg = &j.segs[4 * (size_t)i];
+        ibv_sge g{};
+        g.addr = (uint64_t)p->buf + (uint64_t)sg[1];
+        g.length = (uint32_t)sg[2];
+        g.lkey = p->mr->lkey;
+        sges.push_back(g);
+      }
+      if (sges.empty()) continue;
+      wrs.resize(sges.size());
+      for (size_t k = 0; k < sges.size(); ++k) {
+        const int64_t* sg = &j.segs[4 * (size_t)(s0 + q + (int)k * nqp)];
+        ibv_send_wr& w = wrs[k];
+        memset(&w, 0, sizeof(w));
+        w.wr_id = ((uint64_t)l << 8) | (uint64_t)q;
+        w.sg_list = &sges[k];
+        w.num_sge = 1;
+        w.opcode = IBV_WR_RDMA_WRITE;
+        w.send_flags = (k + 1 == sges.size()) ? IBV_SEND_SIGNALED : 0;
+        w.wr.rdma.remote_addr = p->raddr + (uint64_t)sg[0];
+        w.wr.rdma.rkey = p->rkey;
+        w.next = (k + 1 < sges.size()) ? &wrs[k + 1] : nullptr;
+      }
+      ibv_send_wr* bad = nullptr;
+      int r = ibv_post_send(p->qps[q], wrs.data(), &bad);
+      if (r) throw std::runtime_error("ibv_post_send (write) failed: " + std::string(strerror(r)));
+      expect++;
+    }
+  }
+  for (int q = 0; q < nqp; ++q) {   // fence: 8-byte read after the writes on each QP
+    ibv_sge g{};
+    g.addr = (uint64_t)p->buf + (uint64_t)j.fence_local + 8 * q;
+    g.length = 8;
+    g.lkey = p->mr->lkey;
+    ibv_send_wr w{};
+    w.wr_id = 0xFFFF00ull | (uint64_t)q;
+    w.sg_list = &g;
+    w.num_sge = 1;
+    w.opcode = IBV_WR_RDMA_READ;
+    w.send_flags = IBV_SEND_SIGNALED;
+    w.wr.rdma.remote_addr = p->raddr + (uint64_t)j.fence_remote;
+    w.wr.rdma.rkey = p->rkey;
+    ibv_send_wr* bad = nullptr;
+    int r = ibv_post_send(p->qps[q], &w, &bad);
+    if (r) throw std::runtime_error("ibv_post_send (fence) failed: " + std::string(strerror(r)));
+    expect++;
+  }
+  while (got < expect) drain();
+  __atomic_store_n(&p->done_host[0], j.seq, __ATOMIC_RELEASE);
+}
+
 static void worker_main(VerbsImpl* p) {
   if (p->cpu_core >= 0) {
     cpu_set_t set;
@@ -175,7 +255,8 @@ static void worker_main(VerbsImpl* p) {
     }
     int64_t t0 = thread_ns();
     try {
-      run_job(p, j);
+      if (j.gated) run_write_job(p, j);
+      else run_job(p, j);
     } catch (const std::exception& e) {
       std::lock_guard<std::mutex> lk(p->mu);
       p->err = e.what();
@@ -237,6 +318,11 @@ VerbsKV::VerbsKV(const std::string& dev, int64_t bytes, bool gpu_buffer, int nqp
     CUDACHK(cudaHostAlloc((void**)&p_->flags_host, max_layers * sizeof(uint32_t), cudaHostAllocMapped));
     memset(p_->flags_host, 0, max_layers * sizeof(uint32_t));
     CUDACHK(cudaHostGetDevicePointer((void**)&p_->flags_dev, p_->flags_host, 0));
+    CUDACHK(cudaHostAlloc((void**)&p_->wflags_host, (max_layers + 1) * sizeof(uint32_t), cudaHostAllocMapped));
+    memset(p_->wflags_host, 0, (max_layers + 1) * sizeof(uint32_t));
+    CUDACHK(cudaHostGetDevicePointer((void**)&p_->wflags_dev, p_->wflags_host, 0));
+    p_->done_host = p_->wflags_host + max_layers;
+    p_->done_dev = p_->wflags_dev + max_layers;
   }
   p_->worker = std::thread(worker_main, p_);
 }
@@ -328,6 +414,23 @@ void VerbsKV::post_reads(const int64_t* segs, const int* layer_ptr, int n_layers
   submit(p_, std::move(j));
 }
 
+void VerbsKV::post_writes(const int64_t* segs, const int* layer_ptr, int n_layers, uint32_t seq, int64_t fence_remote,
+                          int64_t fence_local) {
+  if (n_layers > p_->max_layers) throw std::runtime_error("verbs: too many layers");
+  Job j;
+  j.n_layers = n_layers;
+  j.lp.assign(layer_ptr, layer_ptr + n_layers + 1);
+  j.segs.assign(segs, segs + 4 * (size_t)layer_ptr[n_layers]);
+  j.seq = seq;
+  j.write = true;
+  j.gated = true;
+  j.fence_remote = fence_remote;
+  j.fence_local = fence_local;
+  submit(p_, std::move(j));
+}
+uint64_t VerbsKV::wflags_device_ptr() const { return (uint64_t)p_->wflags_dev; }
+uint64_t VerbsKV::done_device_ptr() const { return (uint64_t)p_->done_dev; }
+
 void VerbsKV::write_sync(const int64_t* segs, int n) {
   Job j;
   j.n_layers = 1;
@@ -367,6 +470,8 @@ void VerbsKV::destroy() {
     else munmap(p_->buf, p_->bytes);
   }
   if (p_->flags_host) cudaFreeHost(p_->flags_host);
+  if (p_->wflags_host) cudaFreeHost(p_->wflags_host);
+  p_->wflags_host = nullptr;
   p_->buf = nullptr;
   p_->flags_host = nullptr;
 }

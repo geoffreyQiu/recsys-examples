@@ -14,7 +14,10 @@ def init():
     rank = int(os.environ.get("SLURM_PROCID", os.environ.get("RANK", 0)))
     world = int(os.environ.get("SLURM_NTASKS", os.environ.get("WORLD_SIZE", 1)))
     local = int(os.environ.get("SLURM_LOCALID", os.environ.get("LOCAL_RANK", 0)))
+    local += int(os.environ.get("HPOC_LOCAL_OFFSET", 0))   # e.g. 7: use GPU 7 / NIC 7 next to another run on GPU 0
     os.environ.setdefault("MASTER_PORT", "29511")
+    if os.environ.get("HPOC_MASTER_PORT"):   # enroot's PyTorch hook overrides MASTER_PORT per job; steps sharing
+        os.environ["MASTER_PORT"] = os.environ["HPOC_MASTER_PORT"]   # a job need distinct ports
     if world > 1:
         dist.init_process_group("gloo", rank=rank, world_size=world, timeout=datetime.timedelta(minutes=15))
     if torch.cuda.is_available():

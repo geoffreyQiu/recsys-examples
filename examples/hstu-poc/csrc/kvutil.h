@@ -35,6 +35,8 @@ void wait_flag_gpu(const volatile uint32_t* flag, uint32_t value, uint64_t* stam
 // Request sequence numbers for CPU-posted transports inside CUDA graphs: the graph's first kernel does
 // (*seq)++, and the per-layer wait spins until flags[layer] >= *seq (the CPU stores seq into flags[layer]).
 void seq_inc_gpu(uint32_t* seq, cudaStream_t s);
+// flags[layer] = *seq, after a system-scope fence (host-mapped flags read by a CPU thread)
+void set_flag_seq_gpu(volatile uint32_t* flags, int layer, const uint32_t* seq, cudaStream_t s);
 void wait_flags_seq_gpu(const volatile uint32_t* flags, int layer, const uint32_t* seq, uint64_t* stamp,
                         cudaStream_t s);
 

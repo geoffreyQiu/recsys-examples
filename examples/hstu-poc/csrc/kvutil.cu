@@ -95,6 +95,13 @@ __global__ void wait_flags_seq_kernel(const volatile uint32_t* flags, int layer,
   if (stamp) stamp[layer] = gtimer();
 }
 void seq_inc_gpu(uint32_t* seq, cudaStream_t s) { seq_inc_kernel<<<1, 1, 0, s>>>(seq); }
+__global__ void set_flag_seq_kernel(volatile uint32_t* flags, int layer, const uint32_t* seq) {
+  __threadfence_system();
+  flags[layer] = *seq;
+}
+void set_flag_seq_gpu(volatile uint32_t* flags, int layer, const uint32_t* seq, cudaStream_t s) {
+  set_flag_seq_kernel<<<1, 1, 0, s>>>(flags, layer, seq);
+}
 void wait_flags_seq_gpu(const volatile uint32_t* flags, int layer, const uint32_t* seq, uint64_t* stamp,
                         cudaStream_t s) {
   wait_flags_seq_kernel<<<1, 1, 0, s>>>(flags, layer, seq, stamp);

@@ -94,6 +94,41 @@ __global__ void gin_put_kernel(ncclDevComm dcomm, ncclWindow_t win, int ctx, int
   if (threadIdx.x == 0 && ticket) gin.flushAsync(team, peer, ticket);
 }
 
+// Writes over n_ctx contexts (warp w -> context ctx0 + w), no completion action: the fence below covers them.
+__global__ void gin_put_multi_kernel(ncclDevComm dcomm, ncclWindow_t win, int ctx0, int n_ctx, int peer,
+                                     const Seg* segs, int n) {
+  const int w = threadIdx.x / 32, lane = threadIdx.x % 32;
+  ncclGin gin(dcomm, ctx0 + w);
+  ncclTeam team = ncclTeamWorld(dcomm);
+  for (int i = w + n_ctx * lane; i < n; i += n_ctx * 32) {
+    Seg sg = segs[i];
+    gin.put(team, peer, win, (size_t)sg.remote, win, (size_t)sg.local, (size_t)sg.bytes, ncclGin_None{},
+            ncclGin_None{}, ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_device,
+            cuda::thread_scope_device, ncclGinOptFlagsDefault, ncclGin_SegmentMixed{});
+  }
+}
+
+// Durability fence for writes: on every write context, an 8-byte get after the puts (same QP, so the read is
+// served only after the earlier writes have landed), then wait for it. Optionally commit with a strong signal
+// (all earlier puts on that context settled at the peer) so the store can see it. t_done: globaltimer.
+__global__ void gin_fence_kernel(ncclDevComm dcomm, ncclWindow_t win, int ctx0, int n_ctx, int peer,
+                                 int64_t remote_off, int64_t local_off, int sig, uint64_t* t_done) {
+  ncclTeam team = ncclTeamWorld(dcomm);
+  for (int c = 0; c < n_ctx; ++c) {
+    ncclGin gin(dcomm, ctx0 + c);
+    gin.get(team, peer, win, (size_t)remote_off, win, (size_t)(local_off + 8 * c), 8, ncclCoopThread{},
+            ncclGin_None{}, ncclGinOptFlagsDefault, ncclGin_SegmentMixed{});
+    ncclGinRequest_t r;
+    gin.flushAsync(team, peer, &r);
+    gin.wait(r);
+  }
+  if (sig >= 0) {
+    ncclGin gin(dcomm, ctx0);
+    gin.signal(team, peer, ncclGin_StrongSignalInc{(ncclGinSignal_t)sig});
+  }
+  if (t_done) *t_done = globaltimer();
+}
+
 __global__ void gin_wait_ticket_kernel(ncclDevComm dcomm, int ctx, ncclGinRequest_t* ticket) {
   ncclGin gin(dcomm, ctx);
   ncclGinRequest_t r = *ticket;
@@ -251,6 +286,18 @@ void GinKV::wait_layer(void* tickets, int layer, int ctx0, int n_ctx, uint64_t* 
 
 void GinKV::put_segs(const Seg* segs, int n_segs, void* ticket, int peer, int ctx, int threads, cudaStream_t s) {
   gin_put_kernel<<<1, threads, 0, s>>>(p_->dcomm, p_->win, ctx, peer, segs, n_segs, (ncclGinRequest_t*)ticket);
+  CUDA_OK(cudaGetLastError());
+}
+
+void GinKV::put_multi(const Seg* segs, int n_segs, int peer, int ctx0, int n_ctx, cudaStream_t s) {
+  if (n_segs <= 0) return;
+  gin_put_multi_kernel<<<1, 32 * n_ctx, 0, s>>>(p_->dcomm, p_->win, ctx0, n_ctx, peer, segs, n_segs);
+  CUDA_OK(cudaGetLastError());
+}
+
+void GinKV::fence(int peer, int ctx0, int n_ctx, int64_t remote_off, int64_t local_off, int sig, uint64_t* t_done,
+                  cudaStream_t s) {
+  gin_fence_kernel<<<1, 1, 0, s>>>(p_->dcomm, p_->win, ctx0, n_ctx, peer, remote_off, local_off, sig, t_done);
   CUDA_OK(cudaGetLastError());
 }
 

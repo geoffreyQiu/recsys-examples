@@ -49,6 +49,11 @@ class GinKV {
   // context to the peer) incrementing signal `sig` at the peer.
   void put_segs(const Seg* segs, int n_segs, void* ticket, int peer, int ctx, int threads, cudaStream_t s);
   void wait_ticket(void* ticket, int ctx, cudaStream_t s);
+  // W path: puts spread over write contexts [ctx0, ctx0 + n_ctx); then fence(): per context an 8-byte get after
+  // the puts + wait (everything written has landed), optional strong-signal commit, globaltimer into *t_done.
+  void put_multi(const Seg* segs, int n_segs, int peer, int ctx0, int n_ctx, cudaStream_t s);
+  void fence(int peer, int ctx0, int n_ctx, int64_t remote_off, int64_t local_off, int sig, uint64_t* t_done,
+             cudaStream_t s);
   void commit(int peer, int ctx, int sig, cudaStream_t s);
   // Store side: wait until signal `sig` reaches `value` (GPU kernel on the store rank's GPU).
   void wait_signal(int ctx, int sig, uint64_t value, cudaStream_t s);

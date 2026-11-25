@@ -236,3 +236,30 @@ class VerbsKVSource(RemoteKV):
     def release(self):
         self.v.wait_idle()
         super().release()
+
+
+class RawGdakiSource(RemoteKV):
+    """Raw GDAKI (DOCA GPUNetIO, no NCCL), 5'a like GIN: a post kernel issues every get (spread over the QPs) and
+    keeps one ticket per (layer, QP); a 1-thread wait kernel per layer. The store is a GPU-less verbs pool."""
+    name = "raw"
+
+    def __init__(self, cfg, raw, pool_bytes, device="cuda"):
+        super().__init__(cfg, raw.local(), pool_bytes, device)
+        self.r = raw
+
+    def setup(self, b):
+        super().setup(b)
+        self.dev_tables = [t.to(self.dev) for t in self.tables]
+        self.segs = self.dev_tables[0].clone()
+        self.lp = self.layer_ptr_cpu.to(self.dev)
+        self.tickets = torch.zeros(self.cfg.layers * self.r.nqp(), dtype=torch.int64, device=self.dev)
+
+    def pre_replay(self, i):
+        self.cur = i % self.variants
+        self.segs.copy_(self.dev_tables[self.cur], non_blocking=True)
+
+    def start(self):
+        self.r.post_gets(self.segs, self.lp, self.tickets)
+
+    def before_attn(self, l):
+        self.r.wait_layer(self.tickets, l)
