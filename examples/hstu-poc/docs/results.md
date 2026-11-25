@@ -9,15 +9,16 @@ The study asked whether an HSTU ranking request should fetch its user's cached h
 store over RDMA (one 400 Gb/s NIC per H100) or recompute them, and how fast the RDMA path can be made, for one
 request at a time (plain-run latency) and for a server under load (throughput).
 
-- **Fastest RDMA implementation: CPU verbs with a spinning worker, inline posting and per-tile waits.** The history is
-  posted in 128-row chunks from its end and the attention waits per K tile, so each layer computes while it is still
-  arriving. It is the fastest at nearly every grid point; raw GDAKI with the fused wait is the fastest without a CPU
-  core. Against basic CPU verbs it gains up to 11% (S), 4% (M) and 2.5% (L) per request, most for single users; above
-  ~1 ms per request every implementation of every mechanism transfers at line rate.
+- **Fastest RDMA implementation measured: CPU verbs with a spinning worker, inline posting and per-tile waits.** The
+  history is posted in 128-row chunks from its end and the attention waits per K tile, so each layer computes while it
+  is still arriving. It is the fastest at nearly every grid point. Per-tile waits are built only for CPU verbs so far;
+  without a CPU core, the fastest implementation measured is raw GDAKI with the fused wait. Against basic CPU verbs
+  the fastest gains up to 11% (S), 4% (M) and 2.5% (L) per request, most for single users; above ~1 ms per request
+  every implementation of every mechanism transfers at line rate.
 - **Per-request break-even: ~13–14k history tokens for M and ~9k for L** (S: 10–13k). It is lowest for single users
   (M 12.8k, L 8.5k, S 9.9k) and equals the throughput break-even from B ≈ 8 (M 14.4k, L 9.7k, S 12.8k). The
   optimizations lowered the single-user break-even by 0.5–5k tokens; it is now within 0.3k tokens of what a
-  zero-overhead RDMA at line rate would give, except for single-user S.
+  zero-overhead RDMA at line rate would give, except for S with 1–2 users.
 - **Serving: overlapping requests takes fetch to its NIC limit, not beyond.** The serving break-even is ~16k (M) and
   ~12k (L) at a 100 ms p99 target, and ~15k / ~10k when the target is relaxed up to the highest sustained load. Above
   it, fetch serves 1.6–2.2× the users of recompute at 32k (M); below it, 0.6–0.8×. The per-request optimizations do
@@ -28,6 +29,10 @@ request at a time (plain-run latency) and for a server under load (throughput).
   free of the other job (green context) keeps the fetch server's latency.
 - **What would move the break-even further is outside the rules**: more bandwidth per GPU (a 1.5× faster NIC: ~5k for
   M, estimate), fewer bytes per user (FP8 K/V), or a hybrid server that uses both the NIC and the GPU (P7).
+- **Not yet at its limit: the latency of small requests.** Below ~30 MB per request (e.g. M at 1k for one user, S up
+  to ~4k) the fastest implementation is still a median 13% above the ideal bound. Per-tile waits are not built yet for
+  the GDAKI mechanisms, which post faster than CPU verbs on the smallest requests, so the fastest small-request and
+  no-CPU implementations are not established.
 
 ## 1. Goal, rules and expectations
 
@@ -157,8 +162,10 @@ Considered and not pursued:
 - **Queue-pair and chunk tuning**: every mechanism already runs at line rate from ~1 ms per request; below that, the
   cost is posting and waiting, which the optimizations above address (per-tile chunks of 64 rows gave the same
   latency as 128).
-- **Per-tile waits for the GDAKI mechanisms**: they need a completion ticket per chunk and a poller that publishes
-  chunk progress; not built. CPU verbs, the fastest mechanism, has them.
+
+Not built yet: **per-tile waits for the GDAKI mechanisms** (raw GDAKI, GIN-GDAKI, GIN-Proxy). They need the post kernel
+to post the chunks with a completion ticket each and a GPU poller that publishes chunk progress; the attention side is
+shared with CPU verbs. See §9.
 
 ## 4. Plain-run latency
 
@@ -265,11 +272,12 @@ overlap of compute and transfer.*
   compute take about equally long (single-user M at 1k, S at 0.5k with B = 16). Below 30 MB it is a median 13% above
   it (up to 27% for S at 0.5k with B = 4). What remains is compute that no transfer can overlap: the candidates'
   projections before the first tile lands, the last layer's output and the head after the last one.
-- **The break-even is now within 0.3k tokens of an ideal RDMA.** With fetch at exactly the ideal bound (a
-  zero-overhead RDMA at line rate), the break-even would be 12.5k for M and 8.3k for L at B = 1 (measured 12.8k and
-  8.5k), and identical to the measured one from B = 4 up for S, M and L. The one exception is single-user S (7.3k ideal
-  vs 9.9k measured), whose 3-layer, sub-millisecond requests are dominated by non-overlappable compute. Within the
-  rules of §1, the remaining limit is NIC bandwidth against GPU compute.
+- **The break-even is now close to that of an ideal RDMA.** With fetch at exactly the ideal bound (a zero-overhead
+  RDMA at line rate), the break-even would be 12.5k for M and 8.3k for L at B = 1 (measured 12.8k and 8.5k), and within
+  0.3k of the measured one at every batch size for M and L and from B = 4 up for S. The exception is S with 1–2 users
+  (7.3k and 11.4k ideal vs 9.9k and 12.1k measured), whose 3-layer, sub-millisecond requests are dominated by compute
+  that cannot overlap the transfer. For the break-even, the remaining limit is NIC bandwidth against GPU compute; for
+  the latency of small requests it is not (see above, and the GDAKI mechanisms without per-tile waits, §3).
 
 ## 5. Serving throughput
 
@@ -456,7 +464,7 @@ written range was read back and compared (0 mismatched bytes).
    transfer can overlap.
 2. **Break-even.** Fetching beats recomputing above ~13–14k history tokens for M and ~9k for L (S: 10–13k); single
    users cross earliest. RDMA-side optimization lowered the single-user break-even by 0.5–5k tokens and left at most
-   0.3k to an ideal RDMA (except single-user S). The batched break-even, equal to the throughput break-even, is fixed
+   0.3k to an ideal RDMA (except S with 1–2 users). The batched break-even, equal to the throughput break-even, is fixed
    by NIC bandwidth against batched recompute.
 3. **Serving.** Cross-request overlap is necessary, since it takes fetch to its NIC ceiling, but cannot lower the
    break-even. At a 100 ms p99 target both servers sit at the queueing limit of a first-come-first-served server; with
@@ -471,16 +479,19 @@ written range was read back and compared (0 mismatched bytes).
    GIN-GDAKI with adaptive contexts and the fused wait for NCCL integration; GIN-Proxy only with the fused wait.
 6. **A GPU shared with other work needs SM isolation to keep the fetch server's latency** (a green context), whichever
    mechanism is used.
-7. **Within the rules of §1, the RDMA path is at its limit**: per request at the line-rate bound (break-even within
-   0.3k tokens of an ideal RDMA, except single-user S), and in serving at the NIC ceiling or the queueing limit. What
-   remains is outside the rules: more bandwidth per GPU, fewer bytes per user, or the hybrid server.
+7. **Within the rules of §1, the break-even and serving capacity are at their limits; the latency of small requests
+   is not.** The break-even is within 0.3k tokens of an ideal RDMA (except S with 1–2 users) and serving sits at the
+   NIC ceiling or the queueing limit; moving either needs more bandwidth per GPU, fewer bytes per user or the hybrid
+   server. Below ~30 MB per request the fastest implementation is still a median 13% above the ideal bound, and the
+   GDAKI mechanisms, which post faster on the smallest requests, do not have per-tile waits yet.
 
 ## 9. Next steps
 
+- **Per-tile waits for the GDAKI mechanisms** (chunked posting from the history's end with a completion ticket per
+  chunk, and a GPU poller that publishes chunk progress to the attention's existing per-tile wait): the open in-scope
+  optimization. It decides the fastest no-CPU implementation, and possibly the fastest overall on small requests.
 - **Hybrid server (P7):** one scheduler that sends each request, or each layer, to fetch or recompute by history
   length and load, to turn the additive capacity of §5.5 into a serving result; M and L with more layers.
-- **Per-tile waits for the GDAKI mechanisms** (a completion ticket per chunk and a poller that publishes chunk
-  progress), so that the no-CPU path matches CPU verbs on small requests.
 - **Fewer bytes per user:** FP8 or otherwise compressed K/V (half the bytes acts like a 2× faster NIC on transfer).
 - **More bandwidth per GPU:** two NICs per GPU (e.g. borrowing a neighbour's idle NIC) or 800 Gb/s NICs.
 - **Paged KV and realistic traffic** (mixed history lengths, cache misses; P8) and a remote GPU-memory store (P9).
