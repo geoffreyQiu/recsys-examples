@@ -41,6 +41,13 @@ struct Job {
   bool write = false;
   bool gated = false;          // W path: layer l waits for wflags[l] >= seq, fence + done flag at the end
   int64_t fence_remote = 0, fence_local = 0;
+  std::vector<int> expect;     // per layer: signaled (layer, QP) posts to wait for
+  bool posted = false;         // inline mode: the caller thread already posted the reads
+  // tiled reads (per-tile waits): every segment split into chunks of tile_bytes posted from its END backwards (the
+  // attention consumes key blocks last-to-first); step k of a layer = chunk k of every segment of the layer
+  int64_t tile_bytes = 0;
+  std::vector<std::vector<int>> step_cnt;
+  std::vector<int> n_steps;
 };
 
 struct VerbsImpl {
@@ -60,6 +67,8 @@ struct VerbsImpl {
   uint32_t rkey = 0;
   uint32_t* flags_host = nullptr;
   uint32_t* flags_dev = nullptr;
+  uint64_t* prog_host = nullptr;     // tiled reads: per layer (seq << 32) | steps landed (contiguous from step 0)
+  uint64_t* prog_dev = nullptr;
   uint32_t* wflags_host = nullptr;   // GPU -> CPU: layer l's new K/V are ready to be written
   uint32_t* wflags_dev = nullptr;
   uint32_t* done_host = nullptr;     // CPU -> GPU: request seq's writes are durable
@@ -75,6 +84,11 @@ struct VerbsImpl {
   std::atomic<int64_t> done{0};
   std::atomic<int64_t> cpu_ns{0};
   std::string err;
+  // latency options: spin = the worker busy-polls for new jobs (no futex wake-up per request, one core always busy);
+  // inline_post = the submitting thread posts the reads itself when nothing is in flight (the worker only polls the CQ)
+  std::atomic<int64_t> pending{0};
+  std::atomic<bool> spin{false}, stop_a{false};
+  bool inline_post = false;
 };
 
 static int nic_numa(const std::string& dev) {
@@ -100,9 +114,106 @@ static int64_t thread_ns() {
   return (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec;
 }
 
-static void run_job(VerbsImpl* p, const Job& j) {
+static void post_tiled(VerbsImpl* p, Job& j) {
   const int nqp = (int)p->qps.size();
-  std::vector<int> expect(j.n_layers, 0), got(j.n_layers, 0);
+  const int64_t tb = j.tile_bytes;
+  j.step_cnt.assign(j.n_layers, {});
+  j.n_steps.assign(j.n_layers, 0);
+  j.expect.assign(j.n_layers, 0);
+  std::vector<std::vector<ibv_sge>> sges(nqp);
+  std::vector<std::vector<ibv_send_wr>> wrs(nqp);
+  int rr = 0;
+  for (int l = 0; l < j.n_layers; ++l) {
+    const int s0 = j.lp[l], s1 = j.lp[l + 1];
+    int64_t maxb = 0;
+    size_t total = 0;
+    for (int i = s0; i < s1; ++i) {
+      maxb = std::max(maxb, j.segs[4 * (size_t)i + 2]);
+      total += (size_t)((j.segs[4 * (size_t)i + 2] + tb - 1) / tb);
+    }
+    const int ns = (int)((maxb + tb - 1) / tb);
+    j.n_steps[l] = ns;
+    j.step_cnt[l].assign(ns, 0);
+    for (int q = 0; q < nqp; ++q) {
+      sges[q].clear();
+      wrs[q].clear();
+      sges[q].reserve(total);
+      wrs[q].reserve(total);
+    }
+    for (int k = 0; k < ns; ++k) {
+      for (int i = s0; i < s1; ++i) {
+        const int64_t* s = &j.segs[4 * (size_t)i];
+        const int64_t bytes = s[2];
+        if (bytes <= k * tb) continue;
+        const int64_t len = std::min(tb, bytes - k * tb);
+        const int64_t off = bytes - k * tb - len;
+        const int q = rr++ % nqp;
+        ibv_sge g{};
+        g.addr = (uint64_t)p->buf + (uint64_t)(s[1] + off);
+        g.length = (uint32_t)len;
+        g.lkey = p->mr->lkey;
+        sges[q].push_back(g);
+        ibv_send_wr w;
+        memset(&w, 0, sizeof(w));
+        w.wr_id = ((uint64_t)l << 32) | (uint64_t)k;
+        w.num_sge = 1;
+        w.opcode = IBV_WR_RDMA_READ;
+        w.send_flags = IBV_SEND_SIGNALED;
+        w.wr.rdma.remote_addr = p->raddr + (uint64_t)(s[0] + off);
+        w.wr.rdma.rkey = p->rkey;
+        wrs[q].push_back(w);
+        j.step_cnt[l][k]++;
+      }
+    }
+    for (int q = 0; q < nqp; ++q) {
+      if (wrs[q].empty()) continue;
+      for (size_t m = 0; m < wrs[q].size(); ++m) {
+        wrs[q][m].sg_list = &sges[q][m];
+        wrs[q][m].next = (m + 1 < wrs[q].size()) ? &wrs[q][m + 1] : nullptr;
+      }
+      ibv_send_wr* bad = nullptr;
+      int r = ibv_post_send(p->qps[q], wrs[q].data(), &bad);
+      if (r) throw std::runtime_error("ibv_post_send (tiled) failed: " + std::string(strerror(r)));
+    }
+  }
+  j.posted = true;
+}
+
+static void poll_tiled(VerbsImpl* p, Job& j) {
+  std::vector<std::vector<int>> got(j.n_layers);
+  std::vector<int> done(j.n_layers, 0);
+  for (int l = 0; l < j.n_layers; ++l) got[l].assign(j.n_steps[l], 0);
+  int next = 0;
+  ibv_wc wc[64];
+  while (true) {
+    for (int l = next; l < j.n_layers; ++l) {
+      int d = done[l];
+      while (d < j.n_steps[l] && got[l][d] >= j.step_cnt[l][d]) ++d;
+      if (d != done[l]) {
+        done[l] = d;
+        __atomic_store_n(&p->prog_host[l], ((uint64_t)j.seq << 32) | (uint64_t)d, __ATOMIC_RELEASE);
+      }
+    }
+    while (next < j.n_layers && done[next] >= j.n_steps[next]) {
+      __atomic_store_n(&p->flags_host[next], j.seq, __ATOMIC_RELEASE);
+      ++next;
+    }
+    if (next >= j.n_layers) break;
+    int n = ibv_poll_cq(p->cq, 64, wc);
+    if (n < 0) throw std::runtime_error("ibv_poll_cq failed");
+    for (int k = 0; k < n; ++k) {
+      if (wc[k].status != IBV_WC_SUCCESS)
+        throw std::runtime_error(std::string("work completion error: ") + ibv_wc_status_str(wc[k].status));
+      got[wc[k].wr_id >> 32][wc[k].wr_id & 0xffffffffull]++;
+    }
+  }
+}
+
+static void post_job(VerbsImpl* p, Job& j) {
+  if (j.tile_bytes > 0) return post_tiled(p, j);
+  const int nqp = (int)p->qps.size();
+  std::vector<int>& expect = j.expect;
+  expect.assign(j.n_layers, 0);
   std::vector<ibv_sge> sges;
   std::vector<ibv_send_wr> wrs;
   for (int l = 0; l < j.n_layers; ++l) {
@@ -140,6 +251,14 @@ static void run_job(VerbsImpl* p, const Job& j) {
       expect[l]++;
     }
   }
+  j.posted = true;
+}
+
+static void run_job(VerbsImpl* p, Job& j) {
+  if (!j.posted) post_job(p, j);
+  if (j.tile_bytes > 0) return poll_tiled(p, j);
+  const std::vector<int>& expect = j.expect;
+  std::vector<int> got(j.n_layers, 0);
   int next = 0;
   ibv_wc wc[64];
   while (next < j.n_layers) {
@@ -246,12 +365,19 @@ static void worker_main(VerbsImpl* p) {
   if (p->gpu) cudaSetDevice(p->cuda_dev);
   while (true) {
     Job j;
+    if (p->spin.load(std::memory_order_relaxed)) {
+      while (p->pending.load(std::memory_order_acquire) == 0) {
+        if (p->stop_a.load(std::memory_order_relaxed) || !p->spin.load(std::memory_order_relaxed)) break;
+        __builtin_ia32_pause();
+      }
+    }
     {
       std::unique_lock<std::mutex> lk(p->mu);
       p->cv.wait(lk, [p] { return p->stop || !p->jobs.empty(); });
       if (p->stop && p->jobs.empty()) return;
       j = std::move(p->jobs.front());
       p->jobs.pop_front();
+      p->pending--;
     }
     int64_t t0 = thread_ns();
     try {
@@ -318,6 +444,9 @@ VerbsKV::VerbsKV(const std::string& dev, int64_t bytes, bool gpu_buffer, int nqp
     CUDACHK(cudaHostAlloc((void**)&p_->flags_host, max_layers * sizeof(uint32_t), cudaHostAllocMapped));
     memset(p_->flags_host, 0, max_layers * sizeof(uint32_t));
     CUDACHK(cudaHostGetDevicePointer((void**)&p_->flags_dev, p_->flags_host, 0));
+    CUDACHK(cudaHostAlloc((void**)&p_->prog_host, max_layers * sizeof(uint64_t), cudaHostAllocMapped));
+    memset(p_->prog_host, 0, max_layers * sizeof(uint64_t));
+    CUDACHK(cudaHostGetDevicePointer((void**)&p_->prog_dev, p_->prog_host, 0));
     CUDACHK(cudaHostAlloc((void**)&p_->wflags_host, (max_layers + 1) * sizeof(uint32_t), cudaHostAllocMapped));
     memset(p_->wflags_host, 0, (max_layers + 1) * sizeof(uint32_t));
     CUDACHK(cudaHostGetDevicePointer((void**)&p_->wflags_dev, p_->wflags_host, 0));
@@ -392,6 +521,8 @@ void VerbsKV::connect(const std::string& remote) {
 void* VerbsKV::buffer() const { return p_->buf; }
 int64_t VerbsKV::bytes() const { return (int64_t)p_->bytes; }
 uint64_t VerbsKV::flags_device_ptr() const { return (uint64_t)p_->flags_dev; }
+uint64_t VerbsKV::progress_device_ptr() const { return (uint64_t)p_->prog_dev; }
+
 int VerbsKV::gdr_writes_ordering() const { return p_->gdr_order; }
 
 static void submit(VerbsImpl* p, Job&& j) {
@@ -400,9 +531,16 @@ static void submit(VerbsImpl* p, Job&& j) {
     if (!p->err.empty()) throw std::runtime_error("verbs worker failed earlier: " + p->err);
     p->jobs.push_back(std::move(j));
     p->submitted++;
+    p->pending++;
   }
   p->cv.notify_one();
 }
+
+void VerbsKV::set_spin(bool on) {
+  p_->spin = on;
+  p_->cv.notify_all();
+}
+void VerbsKV::set_inline_post(bool on) { p_->inline_post = on; }
 
 void VerbsKV::post_reads(const int64_t* segs, const int* layer_ptr, int n_layers, uint32_t seq) {
   if (n_layers > p_->max_layers) throw std::runtime_error("verbs: too many layers");
@@ -411,6 +549,22 @@ void VerbsKV::post_reads(const int64_t* segs, const int* layer_ptr, int n_layers
   j.lp.assign(layer_ptr, layer_ptr + n_layers + 1);
   j.segs.assign(segs, segs + 4 * (size_t)layer_ptr[n_layers]);
   j.seq = seq;
+  // inline posting only when the worker is idle: its CQ then holds no completions of an earlier request, so the
+  // per-layer completion counts cannot mix two requests
+  if (p_->inline_post && p_->done.load() == p_->submitted) post_job(p_, j);
+  submit(p_, std::move(j));
+}
+
+void VerbsKV::post_reads_tiled(const int64_t* segs, const int* layer_ptr, int n_layers, uint32_t seq,
+                               int64_t tile_bytes) {
+  if (n_layers > p_->max_layers) throw std::runtime_error("verbs: too many layers");
+  Job j;
+  j.n_layers = n_layers;
+  j.lp.assign(layer_ptr, layer_ptr + n_layers + 1);
+  j.segs.assign(segs, segs + 4 * (size_t)layer_ptr[n_layers]);
+  j.seq = seq;
+  j.tile_bytes = tile_bytes;
+  if (p_->inline_post && p_->done.load() == p_->submitted) post_job(p_, j);
   submit(p_, std::move(j));
 }
 
@@ -456,6 +610,7 @@ void VerbsKV::destroy() {
     std::lock_guard<std::mutex> lk(p_->mu);
     p_->stop = true;
   }
+  p_->stop_a = true;
   p_->cv.notify_all();
   if (p_->worker.joinable()) p_->worker.join();
   for (auto* q : p_->qps) ibv_destroy_qp(q);
@@ -470,6 +625,7 @@ void VerbsKV::destroy() {
     else munmap(p_->buf, p_->bytes);
   }
   if (p_->flags_host) cudaFreeHost(p_->flags_host);
+  if (p_->prog_host) cudaFreeHost(p_->prog_host);
   if (p_->wflags_host) cudaFreeHost(p_->wflags_host);
   p_->wflags_host = nullptr;
   p_->buf = nullptr;

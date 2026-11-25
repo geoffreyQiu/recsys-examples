@@ -40,7 +40,7 @@ class GinKV {
   //   segs: device array of Seg; layer_ptr: device int array [n_layers + 1] (prefix offsets into segs).
   //   Reads use contexts [ctx0, ctx0 + n_ctx); tickets holds n_layers * n_ctx entries.
   void post_gets(const Seg* segs, const int* layer_ptr, int n_layers, void* tickets, int peer, int ctx0,
-                 int n_ctx, uint64_t* t_post, cudaStream_t s);
+                 int n_ctx, uint64_t* t_post, cudaStream_t s, const int* var = nullptr, int64_t var_stride = 0);
   // wait_layer: one thread waits on layer's tickets (every read context); optional timestamp (globaltimer ns).
   void wait_layer(void* tickets, int layer, int ctx0, int n_ctx, uint64_t* t_done, cudaStream_t s);
   // P4 fused: a 1-thread poller waits on every layer's tickets in order and stores ready[l] = *seq

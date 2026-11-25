@@ -38,27 +38,36 @@ def main():
     ap.add_argument("--slow-ms", type=float, default=2.0)
     ap.add_argument("--pool-gb", type=float, default=16)
     ap.add_argument("--seed", type=int, default=99)
+    ap.add_argument("--tuned", action="store_true", help="latency options on (GDAKI: zero-copy descriptor, side-branch "
+                    "post; GIN: adaptive contexts; CPU verbs: spinning worker, inline posting)")
     a = ap.parse_args()
     rank, world, local = hd.init()
     n = world // 2
     infer = rank < n
     peer = rank + n if infer else rank - n
     E = ext()
+
+    def tune(src):
+        src.zc = src.side_post = src.adapt_ctx = a.tuned
+        return src
     RemoteKV.variants = 1                     # the same users for every request: identical data across variants
     pool = int(a.pool_gb) * 2**30
     if a.transport == "gin":
         uid = hd.bcast(E.gin_unique_id() if rank == 0 else None)
         tr = E.GinKV(uid, rank, world, pool, not infer, n_ctx=6, queue_depth=2048, strong_signals=True, n_signals=4)
-        make = lambda cfg: GinKVSource(cfg, tr, E, peer, pool, n_ctx=4)  # noqa: E731
+        make = lambda cfg: tune(GinKVSource(cfg, tr, E, peer, pool, n_ctx=4))  # noqa: E731
     elif a.transport == "raw":
         tr = E.RawGdaki(NICS[local], pool, 4, 4096) if infer else E.VerbsKV(NICS[local], pool, False, 4, 64, 0, -1)
         infos = hd.gather(tr.local_info())
         tr.connect(infos[peer])
-        make = lambda cfg: RawGdakiSource(cfg, tr, E, pool)  # noqa: E731
+        make = lambda cfg: tune(RawGdakiSource(cfg, tr, E, pool))  # noqa: E731
     else:
         tr = E.VerbsKV(NICS[local], pool, infer, 4, 64, 0, WORKER_CORES[local])
         infos = hd.gather(tr.local_info())
         tr.connect(infos[peer])
+        if infer and a.tuned:
+            tr.set_spin(True)
+            tr.set_inline_post(True)
         make = lambda cfg: VerbsKVSource(cfg, tr, E, pool)  # noqa: E731
     if not infer:
         fill_pool(E, tr.local(), a.seed)
@@ -70,7 +79,7 @@ def main():
         items = torch.randint(0, cfg.n_items, (b.total_q,), device="cuda", generator=torch.Generator("cuda").manual_seed(5))
         out = {}
         with torch.inference_mode():
-            for variant in ["5a", "copy", "pdl", "fused", "pdl_early", "nowait"]:
+            for variant in ["5a", "copy", "pdl", "fused", "pdl_early"] + (["tile"] if a.transport == "verbs" else []) + ["nowait"]:
                 slow = 0 if variant == "5a" else int(a.slow_ms * 1e6)
                 src = make(cfg).p4_init("copy" if variant == "nowait" else variant, slow_ns=slow)
                 if variant == "nowait":

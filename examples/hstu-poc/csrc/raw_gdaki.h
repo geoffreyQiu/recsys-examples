@@ -23,8 +23,9 @@ class RawGdaki {
   int64_t bytes() const;
   int nqp() const;
   // tickets: device array of n_layers * nqp uint64 (0 = nothing posted on that QP for the layer)
+  // var (optional, device-visible pinned host int): the kernel uses segs + (*var) * var_stride (zero-copy index)
   void post_gets(const Seg* segs, const int* layer_ptr, int n_layers, uint64_t* tickets, uint64_t* t_post,
-                 cudaStream_t s);
+                 cudaStream_t s, const int* var = nullptr, int64_t var_stride = 0);
   void wait_layer(const uint64_t* tickets, int layer, uint64_t* t_done, cudaStream_t s);
   void poll(const uint64_t* tickets, int n_layers, const uint32_t* seq, uint32_t* ready, cudaStream_t s);   // P4 fused
   void destroy();

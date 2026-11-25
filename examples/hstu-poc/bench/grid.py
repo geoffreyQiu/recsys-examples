@@ -114,13 +114,21 @@ def run_cell(model, cfg, mode, hist, cand, args, extra_sources):
           for _ in range(n)]
     cpu0 = time.process_time()
     prev = None
+    host = np.zeros(n) if getattr(args, "clock", "gpu") == "host" else None
     for i, (e0, e1) in enumerate(ev):
         if args.isolated and prev is not None:   # each request alone: request i+1 starts after request i ends
             prev.synchronize()
+        # host clock (end to end): from before any work of the request (CPU posting included) until the host sees
+        # the output event complete (spin); the same boundary for every mode
+        t0 = time.perf_counter()
         e0.record()
         pre(i + 3)
         g.replay()
         e1.record()
+        if host is not None:
+            while not e1.query():
+                pass
+            host[i] = (time.perf_counter() - t0) * 1e3
         prev = e1
     ev[-1][1].synchronize()
     cpu_s = time.process_time() - cpu0
@@ -134,6 +142,10 @@ def run_cell(model, cfg, mode, hist, cand, args, extra_sources):
         tflops=flops / (ms.mean() / 1e3) / 1e12, mem_gb=torch.cuda.max_memory_allocated() / 1e9,
         gbs=moved / (ms.mean() / 1e3) / 1e9, bytes=moved, cpu_ms_per_req=cpu_s / n * 1e3, isolated=bool(args.isolated),
     )
+    if host is not None:
+        res.update(clock="host", host_mean_ms=float(host.mean()), host_p50_ms=float(np.percentile(host, 50)),
+                   host_p99_ms=float(np.percentile(host, 99)), host_min_ms=float(host.min()),
+                   host_std_ms=float(host.std(ddof=1)) if n > 1 else 0.0)
     if bad is not None:
         res["check_bad_words"] = bad
     res["eta"] = res["tflops"] / PEAK_TFLOPS
@@ -158,6 +170,8 @@ def add_args(ap):
     ap.add_argument("--tag", default="")
     ap.add_argument("--isolated", action="store_true", help="sync before each request (no overlap between requests)")
     ap.add_argument("--eager", action="store_true", help="no CUDA graph (P4 baseline)")
+    ap.add_argument("--clock", default="gpu", choices=["gpu", "host"], help="host: also time each request end to end "
+                    "on the host (request issued -> output event seen complete); needs --isolated")
 
 
 def main():
@@ -167,7 +181,8 @@ def main():
     a.ext, a.seed = None, 0
     rank, world, local = hd.init() if a.sync else (int(os.environ.get("SLURM_PROCID", 0)),
                                                    int(os.environ.get("SLURM_NTASKS", 1)),
-                                                   int(os.environ.get("SLURM_LOCALID", 0)))
+                                                   int(os.environ.get("SLURM_LOCALID", 0))
+                                                   + int(os.environ.get("HPOC_LOCAL_OFFSET", 0)))
     torch.cuda.set_device(local)
     run_grid(a, rank, world, {})
 

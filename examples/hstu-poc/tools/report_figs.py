@@ -34,7 +34,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dir")
     ap.add_argument("--cost", required=True)
-    ap.add_argument("--xport", required=True)
+    ap.add_argument("--xport", default=None)
     ap.add_argument("--configs", default="M,L")
     ap.add_argument("--bbig", type=int, default=16)
     a = ap.parse_args()
@@ -85,6 +85,8 @@ def main():
     fig.savefig(a.cost, bbox_inches="tight", facecolor=SURFACE)
     print("wrote", a.cost)
 
+    if not a.xport:
+        return
     # transport overhead vs bytes moved, relative to CPU verbs (median per bytes bin, all configs and batch sizes)
     pts = defaultdict(list)
     for (m, c, B, L), v in lat.items():

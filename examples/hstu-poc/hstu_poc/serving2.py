@@ -92,8 +92,12 @@ class _Common:
 
 class FetchServer(_Common):
     def __init__(self, model, cfg, L, C, kind, tr, E, window, pool_bytes, peer=None, n_ctx=4, max_batch=32, depth=2,
-                 chunks=2, n_slots=None, nic_gbs=49.4, check_every=8, seed=99, lead_ms=0.5, fetch_stream=None):
-        """kind: 'raw' (raw GDAKI), 'gin' (GIN-GDAKI or GIN-Proxy by NCCL_GIN_TYPE), 'verbs' (CPU verbs)."""
+                 chunks=2, n_slots=None, nic_gbs=49.4, check_every=8, seed=99, lead_ms=0.5, fetch_stream=None,
+                 p4="5a"):
+        """kind: 'raw' (raw GDAKI), 'gin' (GIN-GDAKI or GIN-Proxy by NCCL_GIN_TYPE), 'verbs' (CPU verbs).
+        p4: '5a' = a 1-thread wait kernel before each layer's attention; 'fused' = no per-layer kernels: a 1-thread
+        poller on a side branch of each batch graph publishes per-layer ready words (GDAKI: from the batch's newest
+        tickets; CPU verbs: relayed from the host flags) and the attention kernel spins on its layer's word."""
         self.model, self.cfg, self.L, self.C, self.kind, self.tr, self.E = model, cfg, L, C, kind, tr, E
         self.peer, self.n_ctx, self.depth, self.lead = peer, n_ctx, depth, lead_ms / 1e3
         self.check_every, self.seed = check_every, seed
@@ -135,6 +139,21 @@ class FetchServer(_Common):
             self.seq_dev = torch.zeros(1, dtype=torch.int32, device=dev)
             self.flags = tr.flags_ptr()
             self._wait = lambda l: E.wait_flags_seq(self.flags, l, self.seq_dev)  # noqa: E731
+        self.p4 = p4
+        if p4 == "fused":
+            self.ready = torch.zeros(cfg.layers, dtype=torch.int32, device=dev)
+            self.side = torch.cuda.Stream()
+            if kind == "verbs":
+                self.kseq = self.seq_dev                       # the batch's newest request's sequence number
+                self._poll = lambda: E.relay_flags(self.flags, cfg.layers, self.seq_dev, self.ready)  # noqa: E731
+            else:
+                self.kseq = torch.zeros(1, dtype=torch.int32, device=dev)   # incremented by every batch graph
+                if kind == "raw":
+                    self._poll = lambda: tr.poll(self.bt, cfg.layers, self.kseq, self.ready)  # noqa: E731
+                else:
+                    self._poll = lambda: tr.poll(self.bt, cfg.layers, 0, n_ctx, self.kseq, self.ready)  # noqa: E731
+        elif p4 != "5a":
+            raise ValueError(f"serving p4 variant {p4}: 5a or fused")
         self.posted = [torch.cuda.Event() for _ in range(self.n_slots)]
         self.fs = fetch_stream or torch.cuda.Stream()      # GDAKI post kernels (P6: a small green context)
         self.check_stream = torch.cuda.Stream()
@@ -166,6 +185,11 @@ class FetchServer(_Common):
         gpu_ceiling = max(B / (self.compute_ms[B] / 1e3) for B in self.buckets)
         self.ceiling = min(nic_ceiling, gpu_ceiling)
         self.nic_ceiling, self.gpu_ceiling = nic_ceiling, gpu_ceiling
+
+    def _attn(self, l, q, K, V, b, model):
+        from .attn_ext import hstu_fwd
+        return hstu_fwd(q, K, V, b.cu_q, b.cu_k, b.max_q, b.max_k, model.cfg.max_len, b.num_targets, model.alpha,
+                        kv_ready=self.ready.data_ptr() + 4 * l, kv_seq=self.kseq.data_ptr(), mode=1)
 
     def _post(self, s):
         if self.kind == "verbs":
@@ -317,6 +341,16 @@ class _FetchExec:
         items = torch.randint(0, cfg.n_items, (b.total_q,), device=dev)
 
         def fwd():
+            if srv.p4 == "fused":
+                if srv.kind != "verbs":
+                    srv.E.seq_inc(srv.kseq)
+                srv.side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(srv.side):
+                    srv._poll()
+                x = model.embed(items, None, b.pos_q)
+                y = model.forward_cached(x, b, srv.ring.kv, attn_fn=srv._attn)
+                torch.cuda.current_stream().wait_stream(srv.side)
+                return y
             x = model.embed(items, None, b.pos_q)
             return model.forward_cached(x, b, srv.ring.kv, before_attn=srv._wait)
         self.items = items

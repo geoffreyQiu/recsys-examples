@@ -6,31 +6,30 @@ recsys-examples, branch `hstu-kv-rdma-poc`. Data, scripts and reproduction: Appe
 ## Summary
 
 The study asked whether an HSTU ranking request should fetch its user's cached history K/V from a remote host-memory
-store over RDMA (one 400 Gb/s NIC per H100) or recompute them, and which RDMA mechanism should move them.
+store over RDMA (one 400 Gb/s NIC per H100) or recompute them, and how fast the RDMA path can be made, for one
+request at a time (plain-run latency) and for a server under load (throughput).
 
-- **Fetching wins only for long histories.** Per request, the break-even is ~14k history tokens for config M and
-  ~9–10k for config L, at every batch size. Fetch cost is fixed by the NIC (0.68 ms per 1k tokens for M); recompute
-  costs about the same per token below the break-even and more above it. This is the upper end of the pre-analysis
-  (6.9k–14.8k).
-- **Overlapping requests takes fetching to its NIC limit, not beyond it, so the break-even does not move lower.** With
-  later requests' transfers running under earlier requests' compute, a fetch server sustains 96–100% of NIC bandwidth
-  ÷ KV bytes per user. Within a 100 ms p99 SLO, one GPU fetching serves 0.58× (1k) to 0.99× (16k) of the users that
-  recompute serves for M; fetching leads from ~16k for M and ~12.5k for L, by 1.5× at 24k and 2.2× at 32k for M.
-- **Fetching frees the GPU, and the two strategies add up.** A fetched request needs 3.6× (1k) to 36× (16k) less GPU
-  time than a recomputed one (M). Placed on a GPU already saturated by a recompute job, a fetch server still served
-  90% of its NIC limit within the SLO while the recompute job kept 96–98% of its throughput: ~1.55× the users of the
-  recompute job alone (M, 4k). The fetch server's latency then depends on getting SMs; keeping 8 SMs free of the other
-  job (green context) restores it.
-- **Use CPU verbs, or raw GDAKI where CPU cores are scarce.** All four mechanisms reach line rate and serve identical
-  capacity. They differ only on requests under ~3 ms (overhead vs CPU verbs: raw GDAKI ≤ 6%, GIN-GDAKI ≤ 21%,
-  GIN-Proxy ≤ 34%) and in CPU use (CPU verbs up to one core per GPU, GIN-Proxy one core always, GDAKI none). On a busy
-  GPU they behave the same.
-- **A lower break-even needs more bandwidth per GPU or fewer bytes per user**: a 1.5× faster NIC would bring it to
-  5k or less for M and a 2× faster one below 0.5k (estimate); FP8 K/V would halve the bytes. Kernel-level tuning of the wait
-  for fetched data (PDL, early release of the waiting kernel's SMs) gains nothing measurable, and writing new K/V back
-  to the store adds no latency.
+- **Fastest RDMA implementation: CPU verbs with a spinning worker, inline posting and per-tile waits.** The history is
+  posted in 128-row chunks from its end and the attention waits per K tile, so each layer computes while it is still
+  arriving. It is the fastest at nearly every grid point; raw GDAKI with the fused wait is the fastest without a CPU
+  core. Against basic CPU verbs it gains up to 11% (S), 4% (M) and 2.5% (L) per request, most for single users; above
+  ~1 ms per request every implementation of every mechanism transfers at line rate.
+- **Per-request break-even: ~13–14k history tokens for M and ~9k for L** (S: 10–13k). It is lowest for single users
+  (M 12.8k, L 8.5k, S 9.9k) and equals the throughput break-even from B ≈ 8 (M 14.4k, L 9.7k, S 12.8k). The
+  optimizations lowered the single-user break-even by 0.5–5k tokens; it is now within 0.3k tokens of what a
+  zero-overhead RDMA at line rate would give, except for single-user S.
+- **Serving: overlapping requests takes fetch to its NIC limit, not beyond.** The serving break-even is ~16k (M) and
+  ~12k (L) at a 100 ms p99 target, and ~15k / ~10k when the target is relaxed up to the highest sustained load. Above
+  it, fetch serves 1.6–2.2× the users of recompute at 32k (M); below it, 0.6–0.8×. The per-request optimizations do
+  not change serving capacity: the NIC is the bottleneck.
+- **RDMA frees the GPU, and fetch and recompute add up on one GPU.** A fetched request needs 3.6× (1k) to 36× (16k)
+  less GPU time than a recomputed one (M). Next to a recompute job that saturates the GPU, a fetch server still served
+  90% of its NIC limit within the 100 ms target at a 2–4% cost to that job (~1.55× the users, M 4k). Keeping 8 SMs
+  free of the other job (green context) keeps the fetch server's latency.
+- **What would move the break-even further is outside the rules**: more bandwidth per GPU (a 1.5× faster NIC: ~5k for
+  M, estimate), fewer bytes per user (FP8 K/V), or a hybrid server that uses both the NIC and the GPU (P7).
 
-## 1. Question and expectations
+## 1. Goal, rules and expectations
 
 **The request.** HSTU ranks C candidate items for one user from the user's history of L tokens. Each layer projects
 every token into U, V, Q and K and runs causal attention; the output is one score per candidate (here C = 256).
@@ -39,10 +38,19 @@ with L². With a KV cache, the history's K and V for every layer are kept from a
 computes only its candidates, which attend to the cached history.
 
 **The question.** If the cache lives in a remote store (host memory of another node), is fetching a user's K/V over
-RDMA faster or cheaper than recomputing them, and which RDMA mechanism should move them?
+RDMA faster than recomputing them, and what is the best RDMA implementation? Two targets: the latency of one request
+(plain run) and the throughput of a server under a latency target. Two baselines: recompute (no cache), and the
+basic RDMA implementation (CPU verbs, a wait kernel before each layer).
 - Fetching costs NIC time: the user's KV bytes ÷ NIC bandwidth (49.4 GB/s per GPU here), plus computing the
   candidates.
 - Recomputing costs GPU time: the history's FLOPs ÷ (η × 989 TFLOPS), where η is the achieved fraction of BF16 peak.
+
+**What may be optimized.** Input and output are fixed; the K/V live in host memory of a remote node and are needed in
+the local GPU. Only the remote-fetch path is optimized: how transfers are posted, ordered, waited for and scheduled.
+Anything that would also speed up recompute (CUDA graphs, batching, serving overlap) is applied to both strategies.
+Excluded: other transfer paths (local or remote GPU memory, NVLink, host memory of the same node), fewer bytes (FP8 or
+compressed K/V change the output), more than one NIC per GPU, and recomputing part of the history (the hybrid server,
+P7).
 
 **Pre-analysis** (study doc §4, config M). Fetching takes 0.68 ms per 1k history tokens. Recomputing takes
 0.5–0.8 ms per 1k tokens at η = 30–50% up to ~8k tokens, and more beyond (attention is quadratic). The predicted
@@ -51,11 +59,11 @@ MB-sized transfers the RDMA mechanism was not expected to change the transfer ti
 in per-request overhead, CPU cost and behaviour on a busy GPU.
 
 **What was measured**
-1. The cost of one request, recompute vs remote fetch, over history length × batch size, and the break-even (§3.1).
-2. Serving capacity within a latency SLO, each strategy on its own with consecutive requests overlapped as far as
-   the hardware allows (§3.2), and with the GPU shared with another job (§3.3).
-3. The four RDMA mechanisms against each other (§3.4) and kernel-level ways to wait for fetched data (§3.5).
-4. Writing new K/V back to the store (§3.6) and all eight GPUs of a node fetching at once (§3.7).
+1. Plain-run latency of recompute, a local hit and every RDMA mechanism with every optimization, over history length
+   × batch size × model configuration (§4).
+2. Serving capacity from a 100 ms p99 target up to the highest sustained load, each strategy on its own with
+   consecutive requests overlapped (§5.1–5.4), and on a GPU shared with another job (§5.5).
+3. CPU cost and node scale of the mechanisms (§6) and writing new K/V back to the store (§7).
 
 ## 2. Setup
 
@@ -97,86 +105,197 @@ weights).
 ### 2.4 How a remote fetch proceeds
 
 The fetch is posted all at once and consumed layer by layer. When a request starts, the reads of every layer are
-posted in layer order, each layer's K and V spread over 4 queue pairs. Before layer l's attention, a 1-thread wait
-kernel blocks until layer l's K/V have landed, and only those (it polls the completion queue for raw GDAKI, NCCL's
-completion counters for GIN, and a host-mapped flag set by the CPU worker for CPU verbs). Later layers keep
-transferring while earlier layers compute, so a transfer-bound request takes its transfer time plus about one
-layer's compute. Each request is one CUDA graph.
+posted in layer order, each layer's K and V spread over 4 queue pairs. Before layer l's attention, the request waits
+until layer l's K/V have landed, and only those. Later layers keep transferring while earlier layers compute, so a
+transfer-bound request takes its transfer time plus about one layer's compute. With per-tile waits (§3) a layer's
+attention also starts on the layer's first chunks, which removes most of that remainder. Each request is one CUDA
+graph.
 
 ### 2.5 Batch size and the two measurement modes
 
-- **Isolated requests** (§3.1, §3.4–3.6) measure the cost of one forward pass. A request is a batch of B users
-  processed together, each with history L and 256 candidates. A grid point fixes B and L and replays that request
-  10–300 times, one at a time, with nothing else running; the result is the mean latency (mean and median differ by
-  less than 0.6% at 95% of the points and at most 1.9%). The **cost per user is latency ÷ B**. B stands for how many users a server
-  has batched: batching helps recompute (the GPU fills up) but not fetching (the bytes grow with B).
-- **Serving** (§3.2, §3.3) measures throughput. Requests are single users arriving as an open-loop Poisson stream at a
-  fixed rate; the server forms its own batches (B varies from batch to batch) and overlaps consecutive requests.
-  Latency runs from arrival to output, queueing included. A load point **meets the SLO** when the p99 latency is at
-  most 100 ms (about 10× the time of one M request at 16k), at least 99% of requests finish within 100 ms with correct
-  data, and at least 90% of the offered rate is achieved. **Capacity** is the highest offered load (users/s per GPU)
-  that meets the SLO.
+- **Plain run** (§4) measures the latency of one forward pass. A request is a batch of B users processed together,
+  each with history L and 256 candidates. A grid point fixes B and L and replays that request 10–1000 times, one at
+  a time, with nothing else running. Latency is measured on the host from the moment the request is issued (before
+  any posting or launch) until the output is seen complete; the result is the mean (mean and median differ by less
+  than 1.1% at 95% of the points). The **cost per user is latency ÷ B**. B stands for how many users a server has
+  batched: batching helps recompute (the GPU fills up) but not fetching (the bytes grow with B).
+- **Serving** (§5) measures throughput. Requests are single users arriving as an open-loop Poisson stream at a fixed
+  rate; the server forms its own batches (B varies from batch to batch) and overlaps consecutive requests. Latency
+  runs from arrival to output, queueing included. **Capacity** at a p99 target X is the highest offered load whose
+  p99 latency is at most X (≥ 99% of requests within X) with correct data and ≥ 90% of the offered rate achieved.
+  Targets: 100 ms (about 10× one M request at 16k), 200 ms, 500 ms and 1 s, plus **sustained**: the highest load the
+  server keeps up with (≥ 97% of the offered rate achieved, p99 ≤ 2 s). Beyond it the queue grows without bound and
+  every request eventually times out.
 
-## 3. Results
+## 3. RDMA optimizations
 
-### 3.1 Per-request cost and the break-even
+| Level | Optimization | What it does | Applies to |
+|---|---|---|---|
+| Mechanism | transport | CPU verbs (baseline), raw GDAKI, GIN-GDAKI, GIN-Proxy | – |
+| Posting | spinning worker | the CPU worker busy-polls for new requests instead of sleeping on a condition variable (no wake-up delay; one core always busy) | CPU verbs |
+| Posting | inline posting | the request thread posts the reads itself when no request is in flight (no hand-off to the worker) | CPU verbs |
+| Posting | zero-copy descriptor | the post kernel reads the request's segment-table index from pinned host memory written by the CPU, instead of a per-request device copy of the table | raw GDAKI, GIN |
+| Posting | side-branch posting | the post kernel runs on a parallel branch of the request's graph, so the candidates' compute starts at once; the main branch joins it before the first wait | raw GDAKI, GIN |
+| Posting | adaptive contexts | a request uses only as many GIN contexts as a layer has data segments (no flush and wait on empty contexts) | GIN |
+| Waiting | wait kernel (basic) | a 1-thread kernel before each layer's attention spins until the layer has landed | all |
+| Waiting | PDL | the attention is launched with programmatic dependent launch behind the wait kernel, which triggers it on entry; the attention's launch and prologue overlap the wait | all |
+| Waiting | PDL, early release | the first kernel only triggers the dependent launch and exits (its CTA and SM are free at once); the PDL-launched attention takes over the data dependency and spins on the layer's ready word before its first K/V load | all |
+| Waiting | fused wait | no per-layer kernel: a 1-thread poller on a side branch publishes per-layer ready words and the attention kernel spins on its layer's word before its first K/V load | all |
+| Waiting | per-tile wait | the history is posted in chunks of 128 rows from its end backwards (the attention consumes key blocks last to first); the CPU worker publishes per layer how many chunks have landed, a 1-thread relay copies that to a device word, and the attention's load warp waits before each K tile only for the chunks that tile needs: a layer's attention runs while the layer is still arriving | CPU verbs |
+| Serving | overlapped requests | a request's transfer is posted on arrival into a ring of per-request KV slots; batches are formed from landed requests; one graph per batch size, re-pointed per batch; two batches queued on the GPU | all |
+| Serving | fused wait, spinning worker | as above, inside every batch graph | all |
+
+Every option and wait variant was checked with a slow producer (posting delayed by 2 ms, KV rows zeroed before each
+request): outputs are bit-identical to the basic implementation on every mechanism, and a variant without any wait
+produces different outputs. Every grid point and every 8th served batch compares fetched rows with the store's data
+pattern: 0 mismatches.
+
+Considered and not pursued:
+- **Stream memory-operation waits** (`cuStreamWaitValue32` instead of a wait kernel): still launches the attention only
+  after the wait; the fused wait already removes the per-layer kernels and has the attention resident.
+- **RDMA writes pushed by the store's CPU**: the same bytes over the same link; reads already reach line rate.
+- **Queue-pair and chunk tuning**: every mechanism already runs at line rate from ~1 ms per request; below that, the
+  cost is posting and waiting, which the optimizations above address (per-tile chunks of 64 rows gave the same
+  latency as 128).
+- **Per-tile waits for the GDAKI mechanisms**: they need a completion ticket per chunk and a poller that publishes
+  chunk progress; not built. CPU verbs, the fastest mechanism, has them.
+
+## 4. Plain-run latency
+
+### 4.1 Recompute vs remote fetch
 
 ![Cost per user](figs/cost-per-user.png)
 
 *Per-user cost (request latency ÷ B) of single-user requests (solid) and of batches of 16 (dashed). Remote fetch
-uses the fastest mechanism at each point. Local hit (grey) is the candidates' compute alone, for reference.*
+uses the fastest implementation at each point (§4.2). Local hit (grey) is the candidates' compute alone, for
+reference.*
 
 - **Fetch cost is set by the NIC and does not fall with batching**: 0.68 ms per 1k history tokens for M and 1.36 ms
   for L, at any B.
-- **Recompute gets cheaper per user with batching** as the GPU fills up: M at 1k costs 0.77 ms for one user but
+- **Recompute gets cheaper per user with batching** as the GPU fills up: M at 1k costs 0.78 ms for one user but
   0.43 ms per user in a batch of 16. Its efficiency rises with history length (attention's share) from 18% of BF16
   peak (M, 1k, B = 1) to 51–58% at 16k–32k.
-- **The two cross where attention dominates recompute**, at nearly the same history length for every B:
+- **The two cross where attention dominates recompute**:
 
 ![Break-even](figs/breakeven.png)
 
-*Recompute latency ÷ fetch latency per (L, B): red, recompute is faster; blue, fetch is faster. Dots: latency
-break-even per batch size. Dashed line: throughput break-even, where fetch's ceiling (NIC rate ÷ KV bytes per user)
-equals recompute's ceiling (its best batch size).*
+*Recompute latency ÷ fetch latency per (L, B), fetch by its fastest implementation: red, recompute is faster; blue,
+fetch is faster. Dots: latency break-even per batch size. Dashed line: throughput break-even, where fetch's ceiling
+(NIC rate ÷ KV bytes per user) equals recompute's ceiling (its best batch size).*
 
 | Config | Latency break-even (B = 1 … 32) | Throughput break-even |
 |---|---|---|
-| S | 12.9k – 15.0k | 12.7k |
-| M | 14.0k – 14.4k | 14.4k |
-| L | 9.0k – 9.6k | 9.6k |
+| S | 9.9k – 12.9k | 12.8k |
+| M | 12.8k – 14.4k | 14.4k |
+| L | 8.5k – 9.7k | 9.7k |
 
-- **M lands at the upper end of the pre-analysis** (14.8k predicted at η = 50%; measured η is 45–52% at 12k–16k).
-  Near the break-even the cost ratio changes by only ~4% per 1k tokens, so a 10% change in recompute speed (the
-  largest difference between this grid and the serving runs, at 16k) moves it by ~2.5k tokens.
-- **L breaks even ~5k tokens earlier than M**: its dense compute per token is 4× M's, its KV bytes only 2×. Recompute
-  does not become 4× slower because L's larger GEMMs run more efficiently (η = 35% vs 18% at 1k, B = 1).
-- **Above the break-even, fetch's lead grows with L**: at 32k and B = 1, fetch is 1.6× faster for M (22.5 vs
-  36.4 ms) and 1.8× for L (44.2 vs 79.6 ms).
+- **The break-even rises with B and settles at the throughput break-even from B ≈ 8.** Single users break even
+  earlier because per-tile waits (§4.2) hide most of their compute behind the transfer, while batched recompute is
+  more efficient per user.
+- **M lands near the upper end of the pre-analysis** (14.8k predicted at η = 50%; measured η is 46–52% at 12k–16k).
+- **L breaks even ~4–5k tokens earlier than M**: its dense compute per token is 4× M's, its KV bytes only 2×.
+  Recompute does not become 4× slower because L's larger GEMMs run more efficiently (η = 35% vs 18% at 1k, B = 1).
+- **Above the break-even, fetch's lead grows with L**: at 32k and B = 1, fetch is 1.7× faster for M (21.8 vs
+  36.4 ms) and 1.85× for L (43.4 vs 80.3 ms).
 - **The break-even is very sensitive to bandwidth per GPU.** Below it, fetch and recompute cost about the same per
   token (M: 0.68 vs 0.4–0.8 ms per 1k tokens). Scaling only the transfer part of the measurements, a NIC 1.5× faster
-  (~600 Gb/s) moves the break-even to 4–5k for M (B ≥ 4) and below 0.5k for L; 2× (800 Gb/s) below 0.5k for all
+  (~600 Gb/s) would move the break-even to 4–5k for M (B ≥ 4) and below 0.5k for L; 2× (800 Gb/s) below 0.5k for all
   three (estimate).
 
-### 3.2 Serving capacity with requests overlapped
+### 4.2 The fastest RDMA implementation
+
+![Fastest implementation](figs/best-impl.png)
+
+*For every grid point with history ≤ 4k and B ≤ 8, where all 25 implementations were measured, the fastest one and
+its gain over basic CPU verbs; '≈ basic' = within the run-to-run noise of a repeated basic run (0.95% at the 95th
+percentile). Beyond that range, the basic, fused-wait and per-tile implementations were measured.*
+
+![Optimizations](figs/opt-ablation.png)
+
+*Every implementation on the smallest requests (0.5k history, one user), relative to basic CPU verbs.*
+
+- **The fastest implementation is CPU verbs with every option and per-tile waits**: the fastest or within noise of it
+  at 68 of 72 grid points up to 4k and B ≤ 8, and at every longer single-user request. Raw GDAKI with every option and
+  the fused wait is the fastest at 0.5k for single users of S and M, and the fastest implementation that needs no CPU
+  core.
+- **Gain over basic CPU verbs**: up to 10.6% for S, 3.8% for M and 2.5% for L on single-user requests, shrinking with
+  the batch size (B = 8: up to 3% for S, within noise for M and L). Unlike the other options, per-tile waits keep their
+  gain at long histories: against the fused wait they cut 8–9% from every single-user S request up to 32k, 3.1% for M
+  and 1.6% for L.
+- **The options matter most for the mechanisms that were slow.** On single-user requests at 0.5k, basic GIN-Proxy is
+  18–26% slower than basic CPU verbs and basic GIN-GDAKI 5–17%. With every option and the fused wait, GIN-Proxy is
+  within 1.5% of basic CPU verbs and GIN-GDAKI up to 6% faster. For GIN, adaptive contexts and removing the per-layer
+  wait kernel do most of it; for raw GDAKI (+4.7% → −2.9% on M), side-branch posting.
+- **Wait variants**, every other option on, change vs the wait kernel:
+
+| Mechanism | PDL | PDL, early release | Fused wait | Per-tile wait |
+|---|---|---|---|---|
+| CPU verbs | −1.0 … +0.6% | −2.7 … +1.4% | −4.8 … 0.0% | −9.3 … −0.3% (median −1.3%) |
+| raw GDAKI | −0.3 … +0.4% | −1.0 … +2.4% | −4.1 … +0.2% | – |
+| GIN-GDAKI | −0.1 … +0.6% | −5.4 … +0.3% | −7.7 … +1.2% | – |
+| GIN-Proxy | −0.8 … +0.9% | −15.1 … +0.4% | −16.9 … +0.8% | – |
+
+  *History ≤ 4k, B ≤ 8, S/M/L. The medians of PDL, early release and the fused wait are 0.0 ± 0.1%: their gains are
+  on requests under ~1 ms.*
+
+  - **PDL changes nothing**: it overlaps the attention's launch with a wait kernel that does no work.
+  - **Early release helps only where the wait itself is slow** (GIN): the trigger kernel exits at once and the
+    attention takes over the wait. Where the wait kernel is cheap (raw GDAKI) the extra kernel can cost up to 2.4%.
+  - **The fused wait removes the per-layer kernels**, which pays on requests under ~1 ms.
+  - **Per-tile waits change what can overlap**: a layer's attention runs while the layer is still arriving, so only
+    the compute after the last tile remains exposed. This pays wherever a layer's compute is not negligible against
+    its transfer, at every history length.
+- **CUDA graphs are essential for small requests**: launching every kernel from the CPU adds up to 0.4 ms per request
+  (+162% for raw GDAKI at 0.5k).
+
+### 4.3 How close to the bound
+
+![Distance to the bound](figs/rdma-vs-bound.png)
+
+*Plain-run latency of basic CPU verbs and of the fastest implementation, relative to the ideal bound: the larger of
+the local-hit latency (the compute alone) and the transfer at the measured line rate (49.5 GB/s), i.e. perfect
+overlap of compute and transfer.*
+
+- **With a wait per layer, nothing is left.** A layer's compute cannot start before all of the layer has landed, so a
+  request needs at least max(transfer + one layer's compute, one layer's transfer + all compute). The fastest
+  per-layer implementation (the fused wait) is within −0.3% (median) and +1.4% (worst) of that bound at every grid
+  point.
+- **Per-tile waits go below it, toward the ideal bound.** From 30 MB per request (≈ 0.6 ms of transfer) the fastest
+  implementation is a median 0.6% above the ideal bound; the exceptions, up to 11%, are requests whose transfer and
+  compute take about equally long (single-user M at 1k, S at 0.5k with B = 16). Below 30 MB it is a median 13% above
+  it (up to 27% for S at 0.5k with B = 4). What remains is compute that no transfer can overlap: the candidates'
+  projections before the first tile lands, the last layer's output and the head after the last one.
+- **The break-even is now within 0.3k tokens of an ideal RDMA.** With fetch at exactly the ideal bound (a
+  zero-overhead RDMA at line rate), the break-even would be 12.5k for M and 8.3k for L at B = 1 (measured 12.8k and
+  8.5k), and identical to the measured one from B = 4 up for S, M and L. The one exception is single-user S (7.3k ideal
+  vs 9.9k measured), whose 3-layer, sub-millisecond requests are dominated by non-overlappable compute. Within the
+  rules of §1, the remaining limit is NIC bandwidth against GPU compute.
+
+## 5. Serving throughput
+
+### 5.1 Servers and ceilings
 
 **How each server overlaps requests** (details in Appendix A):
 - *Fetch*: a request's transfer is posted as soon as the request arrives, into a ring of per-request KV slots in GPU
   memory, so the NIC streams requests back to back while the GPU computes earlier ones. The GPU runs batches of the
   requests whose data have landed; when it is idle, the oldest request starts at once and its per-layer waits overlap
-  its own transfer.
-- *Recompute*: dynamic batching (the largest power-of-two batch whose compute fits in half the SLO) or one request at
-  a time, whichever serves more at that history length.
+  its own transfer. Measured with basic CPU verbs (§5.2) and with the optimizations of §3 (raw GDAKI or CPU verbs
+  with the fused wait, §5.3–5.4).
+- *Recompute*: dynamic batching (the largest power-of-two batch whose compute fits in a cap: 50 ms for the 100 ms
+  target, 500 ms for the relaxed ones) or one request at a time, whichever serves more.
 - Both keep up to two batches queued on the GPU, so the GPU does not wait for the CPU between batches.
 
 **What overlap can and cannot do.** No schedule serves more than a strategy's ceiling: for fetch, NIC bandwidth ÷ KV
-bytes per user (M: 1,472 users/s at 1k, 92 at 16k); for recompute, its compute rate at the best batch size (M: 2,527
-at 1k, 94 at 16k). Overlap only brings a server close to its ceiling, so the throughput break-even, where the two
-ceilings cross (§3.1), is the best any schedule can reach.
+bytes per user (M: 1,472 users/s at 1k, 92 at 16k); for recompute, its compute rate at the best batch size (M: about
+2,400 at 1k, 87 at 16k). Overlap only brings a server close to its ceiling, so the throughput break-even, where the
+two ceilings cross (§4.1), is the best any schedule can reach.
+
+### 5.2 Capacity within a 100 ms p99 target
 
 ![Capacity](figs/capacity.png)
 
-*Users/s per GPU within the SLO (p99 ≤ 100 ms) per history length; dashed lines: the ceilings. Raw GDAKI and
-GIN-GDAKI served exactly the capacity of CPU verbs at every point where they were measured (Appendix C).*
+*Users/s per GPU within p99 ≤ 100 ms per history length (fetch: basic CPU verbs); dashed lines: the ceilings. Raw
+GDAKI and GIN-GDAKI served exactly the capacity of CPU verbs at every point where they were measured (Appendix C).*
 
 - **Fetch runs at its NIC ceiling up to medium histories**: 96–100% of it at 1k–4k for M and 1k–2k for L. The compute
   of earlier requests is hidden behind later transfers.
@@ -187,55 +306,94 @@ GIN-GDAKI served exactly the capacity of CPU verbs at every point where they wer
 | M | 0.58 | 0.60 | 0.66 | 0.78 | 0.93 | 0.99 | 1.49 | 2.19 |
 | L | 0.83 | 0.80 | 0.74 | 0.84 | 0.95 | 1.37 | – | – |
 
-- **At long histories the SLO, not the ceiling, limits both servers.** A request then occupies the NIC or the GPU for
-  8–36 ms, and with random arrivals the p99 exceeds 100 ms well below the ceiling. Both servers sit on the limit of an
-  ideal first-come-first-served queue with the same time per request (figure below): about 80% of the ceiling at
-  8 ms per request, 50% at 22 ms and 30% at 36 ms. No schedule can do much better without shorter requests.
-- **The SLO break-even is ~16k for M and ~12.5k for L**, above the throughput break-even of §3.1 (14.4k, 9.6k).
-  Part of the shift is the GPU: the recompute servers computed 1–10% faster at 8k–16k than the per-request grid did.
-  Around the break-even the two strategies are within 7% of each other (M 12k–16k, L 12k), about one load step, which
-  is the resolution of these capacities (6% of the ceiling). Beyond it, fetch's shorter requests add to its higher
-  ceiling: at 32k, fetching serves 2.2× the users of recompute (M: 22 vs 10 users/s).
+- **At long histories the latency target, not the ceiling, limits both servers.** A request then occupies the NIC or
+  the GPU for 8–36 ms, and with random arrivals the p99 exceeds 100 ms well below the ceiling. Both servers sit on the
+  limit of an ideal first-come-first-served queue with the same time per request (figure below): about 80% of the
+  ceiling at 8 ms per request, 50% at 22 ms and 30% at 36 ms. No schedule can do much better without shorter
+  requests.
+- **Around the break-even the two strategies are within 7% of each other** (M 12k–16k, L 12k): about one load step,
+  the resolution of these capacities (6% of the ceiling). The crossings, ~16k for M and ~12k for L, are therefore
+  uncertain by a few thousand tokens. Beyond them fetch's shorter requests add to its higher ceiling: at 32k, fetching
+  serves 2.2× the users of recompute (M: 22 vs 10 users/s).
 
 ![Queueing limit](figs/queueing.png)
 
-*Capacity within the SLO as a share of the ceiling, for every (config, strategy, history length), against the time
-one request occupies the bottleneck (1 ÷ ceiling). Dashed: the same share for an ideal first-come-first-served queue
-with Poisson arrivals and a fixed time per request (M/D/1, simulated). Points slightly above the curve are sampling
-noise of the measured p99.*
+*Capacity within p99 ≤ 100 ms as a share of the ceiling, for every (config, strategy, history length), against the
+time one request occupies the bottleneck (1 ÷ ceiling). Dashed: the same share for an ideal first-come-first-served
+queue with Poisson arrivals and a fixed time per request (M/D/1, simulated). Recompute ceilings come from three
+replays at server start, which run up to 10% faster than under sustained load at 12k–32k, so recompute's points sit
+slightly low and left. Points slightly above the curve are sampling noise.*
 
 - **Fetch needs far less GPU time per user**: 0.11–0.49 ms vs 0.40–36 ms for recompute (M, 1k–32k, compute at the
   best batch size), i.e. 3.6× less at 1k, 11× at 4k and 36× at 16k (L: 4.1× to 42×). At capacity the fetch server's
-  GPU is mostly idle; §3.3 uses that idle time.
-- **CPU**: CPU verbs used 0.5–1.0 core at capacity (it tracks NIC utilization); raw GDAKI and GIN-GDAKI used none.
-- **Correctness**: every 8th fetched batch's newest request was compared with the store's data pattern (94,173
-  batches, 0 mismatches), and the ring's re-pointed graphs are bit-identical to a plain forward.
+  GPU is mostly idle; §5.5 uses that idle time.
+- **Correctness**: every 8th fetched batch's newest request was compared with the store's data pattern (0
+  mismatches), and the ring's re-pointed graphs are bit-identical to a plain forward.
 
 ![Latency curves](figs/latency-curves.png)
 
 *p99 latency against offered load at 4k and 16k. Each point is one Poisson sample of 5–45 s (a few hundred to
 12,000 requests), so near saturation the p99 of neighbouring points can differ by tens of ms.*
 
-### 3.3 Serving on a shared GPU
+### 5.3 Relaxed latency targets and sustained throughput
 
-At its capacity the fetch server leaves most of the GPU idle (§3.2). This experiment fills that idle time with
+There is no fixed latency budget for this workload, so capacity was also measured at relaxed p99 targets and up to the
+highest load each server sustains before its queue, and with it every request's latency, grows without bound.
+
+![Serving vs latency target](figs/slo-breakeven.png)
+
+*Capacity of remote fetch ÷ capacity of recompute per history length, for each latency target. 100 ms: the campaign
+of §5.2 (fetch with basic CPU verbs). Relaxed targets: a second campaign that sweeps every load up to saturation
+(fetch with raw GDAKI and the fused wait; recompute may batch up to 500 ms of compute or run one request at a time,
+the better of the two), with identical load steps and durations for both strategies.*
+
+| Target | Break-even, M | Break-even, L | Fetch ÷ recompute at 32k, M |
+|---|---|---|---|
+| p99 ≤ 100 ms | ~16k | ~12k | 2.2 |
+| p99 ≤ 200 ms | ~16k | 12k–16k (within 5%) | 1.7 |
+| p99 ≤ 500 ms | ~14k | ~9k | 2.2 |
+| p99 ≤ 1 s | ~14k | ~9k | 1.7 |
+| sustained | ~15k | ~10k | 1.6 |
+
+- **Relaxing the target lets both servers approach their ceilings.** Sustained, fetch delivers 97–99% of the NIC
+  ceiling at every history length (M, 1k: 1,464 of 1,472 users/s) and recompute 84–100% of its compute rate (near
+  saturation the 97% criterion is within the Poisson noise of a 5–40 s run, so single points can fall short).
+- **The break-even then sits where the ceilings cross**: ~15k for M and ~10k for L, the throughput break-even of §4.1
+  (14.4k, 9.7k). Between 12k and 16k (M) and 8k and 16k (L) the two strategies are within ~10% of each other at every
+  target, so the crossing moves by a few thousand tokens with the target but never below ~14k (M) and ~9k (L).
+- **Below the break-even the target does not matter**: at 1k–8k fetch serves 0.6–0.8× of recompute's users for M and
+  0.65–0.95× for L at every target. The strict target only widens fetch's lead above the break-even, where
+  recompute's requests are the longer ones.
+
+### 5.4 Optimized vs basic fetch in serving
+
+Basic CPU verbs, CPU verbs with the spinning worker and the fused wait, and raw GDAKI with the fused wait serve the
+same capacity at every target where all were measured (M, sustained: 1,456 / 1,457 / 1,464 users/s at 1k, 362 at
+4k, 90 at 16k; L: 728 / 731 at 1k, 184 at 4k, 46 at 16k). In serving the NIC is the bottleneck at short histories and
+the transfer dominates at long ones; the microseconds the optimizations save per request disappear in the NIC's
+queue. The choice of mechanism for serving is therefore one of CPU cost (§6), not speed.
+
+### 5.5 Sharing the GPU
+
+At its capacity the fetch server leaves most of the GPU idle (§5.2). This experiment fills that idle time with
 another job and measures what each side loses. A co-located recompute job (M, 4k, batches of 8 users, 13.5 ms per
-batch, 560 users/s alone) runs back to back on its own stream. Next to it, the fetch server (M, 4k or 16k) serves 50%,
-75% and 90% of its ceiling. Four conditions: alone; shared; shared with the fetch server on high-priority streams; and
-shared with the co-located job confined to a green context of 124 SMs, which leaves 8 SMs to the fetch server.
+batch, 560 users/s alone) runs back to back on its own stream. Next to it, the fetch server (M, 4k or 16k, basic) serves
+50%, 75% and 90% of its ceiling. Four conditions: alone; shared; shared with the fetch server on high-priority
+streams; and shared with the co-located job confined to a green context of 124 SMs, which leaves 8 SMs to the fetch
+server.
 
 ![Shared GPU](figs/contention.png)
 
 *p99 latency of the fetch server against its offered load; CPU verbs (blue) and raw GDAKI (green) overlap in every
 condition.*
 
-- **The two jobs add up.** At 4k the fetch server still serves 90% of its NIC ceiling (331 users/s) within the SLO,
-  while the co-located job keeps 96–98% of its throughput. The GPU and its NIC then serve ~1.55× the users of the
-  recompute job alone.
+- **The two jobs add up.** At 4k the fetch server still serves 90% of its NIC ceiling (331 users/s) within the 100 ms
+  target, while the co-located job keeps 96–98% of its throughput. The GPU and its NIC then serve ~1.55× the users of
+  the recompute job alone.
 - **The fetch server's latency rises because of compute, not posting.** Sharing raises its p50 at 4k from 3 to 38 ms
-  (p99 at 50% load: 11 → 54 ms). At 16k it meets the SLO at 50% load but no longer at 75% (p99 112 ms). Its kernels
-  wait for SMs held by the other job's kernels; the transfers are not affected. CPU verbs, which needs no SM to post,
-  behaves exactly like raw GDAKI.
+  (p99 at 50% load: 11 → 54 ms). At 16k it meets the target at 50% load but no longer at 75% (p99 112 ms). Its
+  kernels wait for SMs held by the other job's kernels; the transfers are not affected. CPU verbs, which needs no SM
+  to post, behaves exactly like raw GDAKI.
 - **Stream priority does not help** (identical results): priority orders thread blocks that wait to launch but does
   not preempt running ones.
 - **Partitioning the SMs does.** With the co-located job in a 124-SM green context, the fetch server's latency at 16k
@@ -243,72 +401,32 @@ condition.*
   and 53 / 61 / 87 shared). The co-located job runs 3% slower in its partition and keeps 96–99% of that rate while
   sharing.
 
-### 3.4 RDMA mechanisms compared (CPU verbs as the baseline)
-
-**Bandwidth and capacity.** All four mechanisms reach the NIC limit (49.3–49.4 GB/s) on KV-sized transfers. Request
-latencies agree within 1% above ~3 ms per request, and CPU verbs, raw GDAKI and GIN-GDAKI served identical capacities
-at every serving point (§3.2; GIN-Proxy was not run in serving).
-
-![Transport overhead](figs/transport-overhead.png)
-
-*Request latency relative to CPU verbs at the same (config, L, B), against the bytes the request fetches. Dots:
-grid points; lines: medians.*
-
-**Per-request overhead.** CPU verbs is the fastest on small requests: its worker posts the reads before the
-request's graph is launched, so no kernel has to run first. Relative to it, raw GDAKI is at most 6% slower,
-GIN-GDAKI 21% and GIN-Proxy 34% (S, 0.5k, B = 1: 0.193 / 0.204 / 0.232 / 0.245 ms). Of the 144 grid points where all
-four were measured, 35 differ by more than 1%, all of them requests under 2.9 ms. GIN's extra time is its per-layer
-wait kernel, which checks four contexts; folding the wait into the attention kernel recovers 5–10 points of it (§3.5).
+## 6. RDMA mechanisms: CPU cost, node scale and choice
 
 **CPU cost.** The GDAKI mechanisms use no CPU core (GIN-GDAKI with `NCCL_RMA_DISABLE=1`; otherwise NCCL's host-RMA
-progress thread spins a core). CPU verbs keeps its worker busy while transfers are in flight: 0.5–1.0 core per GPU at
-serving capacity, in proportion to NIC utilization. GIN-Proxy's proxy thread keeps a core busy at any load.
+progress thread spins a core). Basic CPU verbs keeps its worker busy while transfers are in flight: 0.5–1.0 core per
+GPU at serving capacity, in proportion to NIC utilization; with the spinning worker, one core always. GIN-Proxy's
+proxy thread keeps a core busy at any load.
 
-**Busy GPU and node scale.** On a GPU shared with another job, CPU verbs and raw GDAKI behave identically (§3.3).
-With all eight GPUs fetching, CPU verbs and raw GDAKI reach line rate on every NIC; GIN on Eos does not, because of
-how the driver places the host memory of NCCL windows (§3.7).
+**Node scale (8 GPUs at once).** With all eight GPU–NIC pairs fetching from one store node, CPU verbs and raw GDAKI
+reach 394 GB/s per node (line rate on every pair). Served by an earlier batch-at-a-time server (Appendix A), they
+reached 2,587 / 357 users/s per node at 4k / 16k (M), 7.2× / 7.9× that server's one-GPU capacity. On Eos, GIN-GDAKI
+and GIN-Proxy reach only ~230 GB/s per node (962 / 123 users/s). The cause is page placement, not GIN: the driver
+puts every `cuMemCreate(HOST_NUMA)` allocation, which NCCL requires for host-memory windows, on NUMA node 0, so the
+four NICs of socket 1 read across the inter-socket link. Raw GDAKI with its store forced onto node 0 reproduces the
+same ~229 GB/s, and GIN windows in GPU memory reach line rate.
 
 **Choice of mechanism**
 
-| Situation | Mechanism |
+| Target | Implementation |
 |---|---|
-| A CPU core per GPU is available | **CPU verbs**: fastest on small requests, no SM, no NCCL constraints |
-| CPU cores are scarce | **raw GDAKI**: no CPU, at most 6% slower on requests under 3 ms |
-| Integration with NCCL matters | **GIN-GDAKI** with `NCCL_RMA_DISABLE=1`: no CPU, up to 21% slower on small requests; host-memory windows need correct NUMA placement at node scale |
-| – | Not GIN-Proxy: a core always busy and the slowest on small requests |
+| Lowest latency, a CPU core per GPU available | CPU verbs, spinning worker, inline posting, per-tile waits |
+| Lowest latency, no CPU core | raw GDAKI, zero-copy descriptor, side-branch posting, fused wait (per-tile waits are not built for the GDAKI mechanisms) |
+| Throughput | any mechanism (all NIC-bound and identical); raw GDAKI needs no CPU |
+| Integration with NCCL | GIN-GDAKI with adaptive contexts and the fused wait (`NCCL_RMA_DISABLE=1`); host-memory windows need correct NUMA placement at node scale |
+| – | GIN-Proxy only with the fused wait (otherwise up to 26% slower on small requests), and it keeps a core busy |
 
-### 3.5 Waiting for fetched data inside the forward
-
-Each layer's attention must not read K/V before they have landed. Four variants were compared; all gave bit-identical
-outputs in a slow-producer test (posting delayed by 2 ms):
-- **Wait kernel** (default): a 1-thread kernel before each layer's attention spins until the layer's transfer is
-  complete; the stock FBGEMM attention follows.
-- **PDL**: the attention kernel (a copy of FBGEMM's) is launched with programmatic dependent launch after the wait
-  kernel, which triggers it on entry. The attention's launch and prologue overlap the wait; it blocks in
-  `griddepcontrol.wait` before its first K/V load.
-- **PDL with early release**: the first kernel only triggers the dependent launch and exits, freeing its CTA and SM at
-  once. The attention kernel, launched with PDL, takes over the data dependency: it spins on a per-layer ready flag
-  (published by a 1-thread poller on a side stream) before its first K/V load.
-- **Fused**: no per-layer kernel at all; the attention kernel spins on the ready flag (same poller).
-
-| Change of mean request latency vs the wait kernel | raw GDAKI | GIN-GDAKI | CPU verbs |
-|---|---|---|---|
-| PDL | +0.0 … +0.7% | +0.0 … +0.8% | −0.3 … +0.8% |
-| PDL, early release | +0.0 … +2.9% | −7.6 … +0.6% | −0.8 … +1.5% |
-| Fused | −1.9 … +0.2% | −10.4 … +0.7% | −3.6 … +0.0% |
-| CUDA graph off (every kernel launched by the CPU) | up to +162% (+0.35–0.40 ms) | up to +147% | – |
-
-*S, M and L × 0.5k–4k × B = 1 and 4. The extremes are at L ≤ 1k with B = 1; every other point is within ±0.8%.*
-
-- **The data dependency dominates.** A transfer-bound request waits for its last layer's data whatever the launch
-  order, so kernel-boundary techniques can only save microseconds per layer.
-- **Early release does not pay here because the first kernel does no work.** PDL hides a kernel's launch behind the
-  tail of a long-running predecessor; here the predecessor is a trivial trigger, so the extra kernel costs more than
-  it hides. The attention also cannot load K/V before the kernels ahead of it have written the candidates' rows.
-- **Removing the per-layer kernels (fused) is the only measurable gain**, largest for GIN-GDAKI (−5 to −10% on
-  requests under 1 ms). CUDA graphs are essential for small requests.
-
-### 3.6 Writing new K/V back
+## 7. Writing new K/V back
 
 A request whose user has a cached prefix of P tokens computes S new history tokens plus the candidates and writes the
 new tokens' K/V to the store. Each layer's new rows are written as soon as the layer has produced them (GPU-initiated
@@ -328,42 +446,43 @@ written range was read back and compared (0 mismatched bytes).
 - A design that must make the new K/V durable before returning the output (so that the user's next request can read
   them at once) pays the durable time instead of the latency.
 
-### 3.7 Node scale (8 GPUs at once)
+## 8. Conclusions
 
-With all eight GPU–NIC pairs fetching from one store node, CPU verbs and raw GDAKI reach 394 GB/s per node (line rate
-on every pair). Served by the earlier batch-at-a-time server (Appendix A), they reached 2,587 / 357 users/s per node
-at 4k / 16k (M), 7.2× / 7.9× that server's one-GPU capacity. On Eos, GIN-GDAKI and GIN-Proxy reach only ~230 GB/s
-per node (962 / 123 users/s). The cause is page placement, not GIN: the driver puts
-every `cuMemCreate(HOST_NUMA)` allocation, which NCCL requires for host-memory windows, on NUMA node 0, so the four
-NICs of socket 1 read across the inter-socket link. Raw GDAKI with its store forced onto node 0 reproduces the same
-~229 GB/s, and GIN windows in GPU memory reach line rate.
+1. **Plain-run latency.** The fastest RDMA path is CPU verbs with the spinning worker, inline posting and per-tile
+   waits; without a CPU core, raw GDAKI with the zero-copy descriptor, side-branch posting and the fused wait. The
+   gains over basic CPU verbs are where per-request overhead or the per-layer pipeline matter: single users and small
+   batches (up to 11% for S, 4% for M, 2.5% for L). From ~30 MB per request the fastest implementation is a median
+   0.6% above the ideal bound (perfect overlap of transfer and compute); below that, what remains is compute that no
+   transfer can overlap.
+2. **Break-even.** Fetching beats recomputing above ~13–14k history tokens for M and ~9k for L (S: 10–13k); single
+   users cross earliest. RDMA-side optimization lowered the single-user break-even by 0.5–5k tokens and left at most
+   0.3k to an ideal RDMA (except single-user S). The batched break-even, equal to the throughput break-even, is fixed
+   by NIC bandwidth against batched recompute.
+3. **Serving.** Cross-request overlap is necessary, since it takes fetch to its NIC ceiling, but cannot lower the
+   break-even. At a 100 ms p99 target both servers sit at the queueing limit of a first-come-first-served server; with
+   relaxed targets they approach their ceilings and the break-even moves to where the ceilings cross (~15k for M,
+   ~10k for L). The mechanism and the per-request optimizations do not change serving capacity.
+4. **Below the break-even, the value of RDMA is the GPU time it frees.** Fetch and recompute are limited by different
+   resources, and on one GPU their capacities add up (~1.55× the users at M, 4k). The case for RDMA below the
+   break-even is therefore a hybrid server that fetches as many users as the NIC carries and recomputes the rest, not
+   fetching instead of recomputing.
+5. **Mechanism.** For lowest latency, CPU verbs with every option and per-tile waits if a CPU core per GPU is free;
+   otherwise raw GDAKI with every option and the fused wait. For throughput, any mechanism (choose by CPU cost).
+   GIN-GDAKI with adaptive contexts and the fused wait for NCCL integration; GIN-Proxy only with the fused wait.
+6. **A GPU shared with other work needs SM isolation to keep the fetch server's latency** (a green context), whichever
+   mechanism is used.
+7. **Within the rules of §1, the RDMA path is at its limit**: per request at the line-rate bound (break-even within
+   0.3k tokens of an ideal RDMA, except single-user S), and in serving at the NIC ceiling or the queueing limit. What
+   remains is outside the rules: more bandwidth per GPU, fewer bytes per user, or the hybrid server.
 
-## 4. Conclusions
-
-1. **With one 400 Gb/s NIC per GPU, recompute is the better choice below ~14k history tokens for M and ~9–10k for
-   L; above that, fetching is.** This holds per request at every batch size and for throughput. Under a 100 ms p99
-   SLO the break-even sits slightly higher (~16k for M, ~12.5k for L), and above it fetching's lead grows quickly
-   (M: 2.2× at 32k).
-2. **Cross-request overlap is necessary but cannot lower the break-even.** It is what lets a fetch server run at NIC
-   line rate, and at long histories both servers are close to the queueing limit of a first-come-first-served
-   server. The NIC's bytes per second per user are the hard limit for fetching.
-3. **The value of RDMA below the break-even is the GPU time it frees.** A fetched request costs 4–36× less GPU time
-   (M, 1k–16k), and fetch and recompute are limited by different resources: on one GPU, a fetch server added 331
-   users/s (M, 4k) to a saturated recompute job at a 2–4% cost to that job. The case for RDMA is therefore a hybrid
-   server that fetches as many users as the NIC carries and recomputes the rest, rather than fetching instead of
-   recomputing.
-4. **The RDMA mechanism matters little for throughput.** Use CPU verbs where a CPU core per GPU is available and raw
-   GDAKI where it is not; GIN-GDAKI when NCCL integration is worth up to 21% on small requests. Avoid GIN-Proxy.
-5. **A GPU shared with other work needs SM isolation to keep the fetch server's latency** (a green context),
-   whichever mechanism is used.
-
-## 5. Next steps
+## 9. Next steps
 
 - **Hybrid server (P7):** one scheduler that sends each request, or each layer, to fetch or recompute by history
-  length and load, to turn the additive capacity of §3.3 into a serving result; M and L with more layers.
+  length and load, to turn the additive capacity of §5.5 into a serving result; M and L with more layers.
+- **Per-tile waits for the GDAKI mechanisms** (a completion ticket per chunk and a poller that publishes chunk
+  progress), so that the no-CPU path matches CPU verbs on small requests.
 - **Fewer bytes per user:** FP8 or otherwise compressed K/V (half the bytes acts like a 2× faster NIC on transfer).
 - **More bandwidth per GPU:** two NICs per GPU (e.g. borrowing a neighbour's idle NIC) or 800 Gb/s NICs.
-- **In-kernel wait** (the fused variant) for GIN-GDAKI if requests under 1 ms matter.
 - **Paged KV and realistic traffic** (mixed history lengths, cache misses; P8) and a remote GPU-memory store (P9).
 
 ## Appendix A. Implementation
@@ -372,11 +491,21 @@ The POC is `examples/hstu-poc` in recsys-examples (branch `hstu-kv-rdma-poc`); i
 
 - **Model** (`hstu_poc/model.py`): the repository's HSTU layer math with random weights and FBGEMM's Hopper attention
   kernel. `forward_full` recomputes; `forward_cached` takes the history's K/V, computes the candidates and calls a
-  per-layer hook before each attention (the wait for fetched data).
-- **Transports** (`csrc/`): CPU verbs (RC queue pairs, a worker thread, per-layer host-mapped flags); raw GDAKI (DOCA
-  GPUNetIO from NCCL's bundled copy, GPU-side queue pairs, tickets per layer and queue pair); GIN-GDAKI and GIN-Proxy
-  (NCCL 2.32.7 device API, 4 read contexts, `NCCL_RMA_DISABLE=1`). The store is plain host memory bound to the NIC's
-  NUMA node (CPU verbs, raw GDAKI) or an NCCL host-memory window (GIN).
+  per-layer hook before each attention (the wait for fetched data), or hands the attention to the source (the fused,
+  early-release and per-tile variants use a copy of FBGEMM's kernel with an in-kernel wait,
+  `attn/hstu_hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp`).
+- **Per-tile waits** (CPU verbs): `post_reads_tiled` splits every K/V segment into chunks posted from the segment's end
+  backwards, all signaled; the worker counts completions per (layer, chunk step) and publishes per layer
+  (sequence << 32) | steps landed in host-mapped memory; a 1-thread relay kernel copies it to a device word zeroed at
+  the request's start; in the attention kernel's load warp, before each K tile, the elected thread waits until the
+  steps covering that tile's history rows have landed (acquire load, then a proxy fence before the TMA load). Chunk
+  rows: 128, or more when needed to keep a request at ≤ 2,048 reads.
+- **Transports** (`csrc/`): CPU verbs (RC queue pairs, a worker thread, per-layer host-mapped flags; optional
+  spinning worker and inline posting); raw GDAKI (DOCA GPUNetIO from NCCL's bundled copy, GPU-side queue pairs,
+  tickets per layer and queue pair; optional zero-copy descriptor); GIN-GDAKI and GIN-Proxy (NCCL 2.32.7 device API,
+  4 read contexts, `NCCL_RMA_DISABLE=1`; optional zero-copy descriptor). The store is plain host memory bound to the
+  NIC's NUMA node (CPU verbs, raw GDAKI) or an NCCL host-memory window (GIN). The per-request options and wait variants
+  live in `hstu_poc/kvsource.py`.
 - **Serving** (`hstu_poc/serving2.py`, driver `bench/p5s.py`):
   - *Remote fetch*: a ring of per-request KV slots in GPU memory. A request's transfer (all layers, each K and V block
     split over the four queue pairs) is posted as soon as the request gets a slot, so the NIC serves requests in
@@ -386,15 +515,16 @@ The POC is `examples/hstu-poc` in recsys-examples (branch `hstu-kv-rdma-poc`); i
     serves any run of consecutive slots: the attention's K/V tensor is the whole ring, and the batch's
     `cu_seqlens_k`, the candidates' row indices and the request to wait for are rewritten in device memory before
     each replay. A self-test checks that the output is bit-identical to a plain forward. Completion is in order per
-    queue pair, so waiting for the batch's newest request covers the older ones. Posting per request matters at long
-    histories: a server that fetched whole batches into two alternating regions reached 45–60 users/s at M, 16k.
-  - *Recompute*: dynamic batching to the largest power-of-two batch that computes within half the SLO, or strictly
-    one request at a time; the better policy is reported per history length.
+    queue pair, so waiting for the batch's newest request covers the older ones. With the fused wait, each batch
+    graph has a 1-thread poller on a side branch. Posting per request matters at long histories: a server that
+    fetched whole batches into two alternating regions reached 45–60 users/s at M, 16k.
+  - *Recompute*: dynamic batching to the largest power-of-two batch whose compute fits the cap, or strictly one
+    request at a time; the better policy is reported per history length and target.
   - *Both*: up to two batches queued on the GPU, the next one formed just before the GPU frees up; every graph is
     replayed once before serving; every 8th fetched batch's newest request is compared with the store's data pattern
     on a side stream.
-- **Isolated-request grid** (`bench/grid.py`, `bench/p2.py`, `bench/p3.py`): one CUDA graph per grid point, requests
-  replayed one at a time, GPU-event timing, fetched rows compared with the store's pattern after each point.
+- **Plain-run grid** (`bench/grid.py`, `bench/p2.py`): one CUDA graph per grid point, requests replayed one at a
+  time, host-clock and GPU-event timing, fetched rows compared with the store's pattern after each point.
 
 ## Appendix B. Platform notes (Eos)
 
@@ -412,6 +542,8 @@ The POC is `examples/hstu-poc` in recsys-examples (branch `hstu-kv-rdma-poc`); i
   Python's cycle collector freed an old server mid-capture, a later first launch faulted (Xid 31 with no kernel
   running). The servers are closed explicitly, every graph is replayed once before serving, and each benchmark
   process builds one server.
+- Processes that share an allocation need distinct rendezvous ports (`HPOC_MASTER_PORT`; enroot's PyTorch hook
+  overrides `MASTER_PORT`).
 - The kernel log is root-only on compute nodes; GPU core dumps (`tools/gpu_core_wrap3.sh`) are the debugging route.
 
 ## Appendix C. Data and reproduction
@@ -421,19 +553,19 @@ scripts are also in the POC's `tools/`.
 
 | What | Result rows | Campaign script | Figure / table script |
 |---|---|---|---|
-| Per-request grid and break-even (S, M, L; every mechanism, recompute, local hit) | `results/p2c/` | `tools/p2c_grid.sh` | `tools/report_figs.py`, `tools/p2c_breakeven.py` |
-| Serving capacity, each strategy alone | `results/p5s/` (`fine_*`: fine load grid at 12k+) | `tools/p5s_runs.sh`, `p5s_runs2.sh`, `p5s_fine.sh` | `tools/p5s_report.py` |
+| Plain-run latency: every mechanism × option × wait variant, recompute, local hit (S, M, L) | `results/p2t/` (per-tile: `*_verbs.t.tile`) | `tools/p2t_grid.sh` | `tools/p2t_report.py`; `tools/p2t_to_p2c.py` + `tools/report_figs.py`, `tools/p2c_breakeven.py` |
+| Serving within 100 ms, each strategy alone | `results/p5s/` (`fine_*`: fine load grid at 12k+) | `tools/p5s_runs.sh`, `p5s_runs2.sh`, `p5s_fine.sh` | `tools/p5s_report.py` |
+| Serving at relaxed targets and up to saturation | `results/p5x/` | `tools/p5x_runs.sh` | `tools/p5x_report.py` |
 | Serving on a shared GPU | `results/p6s/` | `tools/p6s_runs.sh`, `p6s_prio.sh`, `p6s_green4k.sh` | `tools/p6s_report.py` |
 | Writes | `results/p3b/` | `tools/p3_grid2.sh` | `tools/p3_report.py` |
-| Waits inside the forward (PDL, early release, fused) | `results/p4c/`, `results/p4b/` | `tools/p4c_grid.sh` | – |
 | Node scale | `results/p2/eight_*`, `results/p5b/eight_*` | `tools/p5_runs.sh` | `tools/p5_eight.py` |
 | Micro-benchmarks (bandwidth, latency) | `logs/p0/` | `tools/p0.sh` | – |
 
 `tools/make_figs.sh` regenerates every figure from the rows inside the PyTorch container (matplotlib); each report
-script prints its tables with `--md`. `results/p2c/` also holds rows of a parked 16-layer configuration (D), and
-`results/p2c/superseded/` rows that are not used.
+script prints its tables with `--md`. Earlier grids with GPU-event timing and the basic implementations
+(`results/p2c/`, `results/p4b/`, `results/p4c/`) agree with `results/p2t/` within 1–2%.
 
-**Serving capacity of every mechanism (coarse load grid; users/s within the SLO, 1 GPU)**
+**Serving capacity of every mechanism (basic implementations, 100 ms target, coarse load grid; users/s, 1 GPU)**
 
 | Config | Mechanism | 1k | 2k | 4k | 8k | 12k | 16k |
 |---|---|---|---|---|---|---|---|

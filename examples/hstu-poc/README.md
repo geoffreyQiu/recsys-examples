@@ -33,15 +33,18 @@ hstu-poc/
   README.md
   csrc/          C++/CUDA extension (JIT-built by hstu_poc/ext.py into build/ext*)
     gin_kv.*       GIN transport (NCCL 2.32.7 device API): split-phase gets over N contexts, puts, fence, pollers
-    verbs_kv.*     CPU verbs: RC QPs, worker thread, per-layer host-mapped flags, gated writes, GPU-less store side
+    verbs_kv.*     CPU verbs: RC QPs, worker thread (optionally spinning; optional inline posting), per-layer
+                   host-mapped flags, tiled reads with per-layer chunk progress, gated writes, GPU-less store side
     raw_gdaki.*    raw GDAKI: DOCA GPUNetIO (NCCL's bundled BSD-3 copy, build/doca/libhpoc_doca.so) GPU-side QPs
     kvutil.*       data pattern fill/check, spin/stamp/seq/flag kernels, SM hog, green-context streams
     bindings.cpp   pybind11 module hpoc_ext
   attn/          copy of FBGEMM's Hopper HSTU forward kernel with the P4 wait hook (op namespace hpoc_attn)
   hstu_poc/
     model.py       HSTU layers (repo math), forward_full (recompute) and forward_cached (R and W)
-    kvsource.py    KV sources: local hit, host H2D, GIN, CPU verbs, raw GDAKI; P4 wait variants
-                   (wait kernel, pdl, pdl_early = trigger-and-exit + PDL attention spinning on a ready flag, fused)
+    kvsource.py    KV sources: local hit, host H2D, GIN, CPU verbs, raw GDAKI; latency options (GDAKI zero-copy
+                   descriptor and side-branch posting, GIN adaptive contexts) and P4 wait variants (wait kernel, pdl,
+                   pdl_early = trigger-and-exit + PDL attention spinning on a ready flag, fused, tile = per-tile waits
+                   for CPU verbs: chunked reads posted from the history's end, per-K-tile wait in the attention)
     writers.py     workload W writers (GIN, CPU verbs) with a durability fence
     serving2.py    overlap-optimized servers (P5s/P6s): fetch posts each request into a ring of KV slots on arrival,
                    batches landed requests, one graph per batch size re-pointed at any run of slots; recompute with
@@ -53,17 +56,20 @@ hstu-poc/
   bench/
     p0f_tickets.py  P0-f split-phase across kernels (data checks, negative control, commit into host memory)
     p1_check.py     P1 kernel/model correctness
-    grid.py         baseline/transport grid runner (one CUDA graph per cell)
-    p2.py p3.py     two-node drivers for workloads R and W (--transport gin|raw|verbs)
+    grid.py         baseline/transport grid runner (one CUDA graph per cell; --clock host = end-to-end host timing)
+    p2.py p3.py     two-node drivers for workloads R and W (--transport gin|raw|verbs; p2: --p4 variant, --tuned or
+                    the single latency options --zc --side-post --adapt-ctx --spin --inline-post)
     p4_check.py     slow-producer correctness of the wait variants
-    p5s.py          serving capacity within the SLO per strategy (serving2; --cotenant/--green/--priority for P6s)
+    p5s.py          serving capacity per strategy (serving2; --p4 fused, --tuned, --stop sat for relaxed targets up to
+                    saturation; --cotenant/--green/--priority for the shared-GPU runs)
     p5.py           latency vs offered load of the batch-at-a-time layer (-n 8 = all GPUs at once)
     p5_v1.py        first-pass driver (serving_v1), crash reproduction only
     p6.py           transfer under SM contention / CPU contention
   scripts/srun2.sh  2-node launcher (inference ranks on node A, store ranks on node B)
   tools/           analysis and campaign scripts behind docs/results.md (plots need matplotlib): make_figs.sh
-                   (every figure), report_figs.py, p2c_breakeven.py, p5s_report.py, p6s_report.py, p3_report.py,
-                   p5_eight.py, *_runs.sh / p5s_fine.sh / p6s_*.sh (campaigns), numa_check.cu
+                   (every figure), p2t_report.py, p2t_to_p2c.py, report_figs.py, p2c_breakeven.py, p5s_report.py,
+                   p5x_report.py, p6s_report.py, p3_report.py, p5_eight.py, campaigns (p2t_grid.sh, p5s_*.sh,
+                   p5x_runs.sh, p6s_*.sh, ...), numa_check.cu
   docs/            results.md (final report), figs/, archive/ (earlier revisions)
 ```
 

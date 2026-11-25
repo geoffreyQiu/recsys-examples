@@ -39,12 +39,26 @@ def main():
     ap.add_argument("--flush", type=int, default=0, help="verbs: 1 = cuFlushGPUDirectRDMAWrites per layer")
     ap.add_argument("--seed", type=int, default=99)
     ap.add_argument("--variants", type=int, default=8, help="user sets rotated over requests (distinct users)")
-    ap.add_argument("--p4", default="5a", choices=["5a", "copy", "pdl", "fused", "pdl_early"], help="P4 wait variant")
+    ap.add_argument("--p4", default="5a", choices=["5a", "copy", "pdl", "fused", "pdl_early", "tile"],
+                    help="P4 wait variant (tile: per-tile waits, CPU verbs only)")
     ap.add_argument("--store-gpu", action="store_true", help="GIN diagnostic: store window in the store node's GPU "
                     "memory instead of host memory (no data fill, so no data check)")
     ap.add_argument("--label", default=None, help="mode name of the transport in --modes and the results (default: --transport)")
+    ap.add_argument("--zc", action="store_true", help="GDAKI: zero-copy request descriptor (no per-request table copy)")
+    ap.add_argument("--side-post", action="store_true", help="GDAKI: post kernel on a side branch of the graph")
+    ap.add_argument("--adapt-ctx", action="store_true", help="GIN: only as many contexts as a layer has segments")
+    ap.add_argument("--spin", action="store_true", help="CPU verbs: the worker busy-polls for requests")
+    ap.add_argument("--inline-post", action="store_true", help="CPU verbs: post from the request thread when idle")
+    ap.add_argument("--tuned", action="store_true", help="every latency option above that applies to the transport")
     a = ap.parse_args()
+    if a.tuned:
+        a.zc = a.side_post = a.adapt_ctx = a.spin = a.inline_post = True
     rank, world, local = hd.init()
+
+    def tune(src):
+        src.zc, src.side_post = a.zc, a.side_post
+        src.adapt_ctx = a.adapt_ctx
+        return src
     from hstu_poc.kvsource import RemoteKV
     RemoteKV.variants = a.variants
     n = world // 2
@@ -62,7 +76,7 @@ def main():
         pool = nbytes
         tr = E.GinKV(uid, rank, world, nbytes, (not infer) and not a.store_gpu, n_ctx=a.nctx + 2, queue_depth=2048, strong_signals=True,
                      n_signals=4)
-        make = lambda cfg: GinKVSource(cfg, tr, E, peer, pool, n_ctx=a.nctx).p4_init(a.p4)  # noqa: E731
+        make = lambda cfg: tune(GinKVSource(cfg, tr, E, peer, pool, n_ctx=a.nctx)).p4_init(a.p4)  # noqa: E731
     elif a.transport == "raw":
         # raw GDAKI on the inference side; the store is the same GPU-less verbs pool as for CPU verbs
         if infer:
@@ -71,12 +85,15 @@ def main():
             tr = E.VerbsKV(NICS[local], pool, False, a.nqp, 64, 0, -1)
         infos = hd.gather(tr.local_info())
         tr.connect(infos[peer])
-        make = lambda cfg: RawGdakiSource(cfg, tr, E, pool).p4_init(a.p4)  # noqa: E731
+        make = lambda cfg: tune(RawGdakiSource(cfg, tr, E, pool)).p4_init(a.p4)  # noqa: E731
     else:
         nbytes = int(a.local_gb * 2**30) if infer else pool
         tr = E.VerbsKV(NICS[local], nbytes, infer, a.nqp, 64, a.flush, WORKER_CORES[local])
         infos = hd.gather(tr.local_info())
         tr.connect(infos[peer])
+        if infer:
+            tr.set_spin(a.spin)
+            tr.set_inline_post(a.inline_post)
         make = lambda cfg: VerbsKVSource(cfg, tr, E, pool).p4_init(a.p4)  # noqa: E731
     if not infer and not (a.transport == "gin" and a.store_gpu):
         fill_pool(E, tr.local(), a.seed)

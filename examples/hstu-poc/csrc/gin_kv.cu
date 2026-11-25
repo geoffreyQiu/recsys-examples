@@ -51,8 +51,12 @@ __device__ __forceinline__ uint64_t globaltimer() {
 // tickets[layer * n_ctx + w]. One QP tops out near 42 GB/s for RDMA READ on Eos (P0-a); two reach line rate.
 __global__ void gin_post_gets_kernel(ncclDevComm dcomm, ncclWindow_t win, int ctx0, int n_ctx, int peer,
                                      const Seg* segs, const int* layer_ptr, int n_layers, ncclGinRequest_t* tickets,
-                                     uint64_t* t_post) {
+                                     uint64_t* t_post, const volatile int* var, long long var_stride) {
   if (t_post && threadIdx.x == 0) t_post[0] = globaltimer();
+  __shared__ long long s_off;   // zero-copy request descriptor (see raw_post_gets_kernel)
+  if (threadIdx.x == 0) s_off = var ? (long long)(*var) * var_stride : 0;
+  __syncthreads();
+  segs += s_off;
   const int w = threadIdx.x / 32, lane = threadIdx.x % 32;
   ncclGin gin(dcomm, ctx0 + w);
   ncclTeam team = ncclTeamWorld(dcomm);
@@ -315,9 +319,9 @@ int GinKV::rank() const { return p_->rank; }
 int GinKV::nranks() const { return p_->nranks; }
 
 void GinKV::post_gets(const Seg* segs, const int* layer_ptr, int n_layers, void* tickets, int peer, int ctx0,
-                      int n_ctx, uint64_t* t_post, cudaStream_t s) {
+                      int n_ctx, uint64_t* t_post, cudaStream_t s, const int* var, int64_t var_stride) {
   gin_post_gets_kernel<<<1, 32 * n_ctx, 0, s>>>(p_->dcomm, p_->win, ctx0, n_ctx, peer, segs, layer_ptr, n_layers,
-                                                (ncclGinRequest_t*)tickets, t_post);
+                                                (ncclGinRequest_t*)tickets, t_post, var, (long long)var_stride);
   CUDA_OK(cudaGetLastError());
 }
 

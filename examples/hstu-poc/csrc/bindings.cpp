@@ -17,6 +17,17 @@ template <typename T>
 static T* ptr_or_null(const std::optional<torch::Tensor>& t) {
   return t.has_value() ? (T*)t->data_ptr() : nullptr;
 }
+// device-visible pointer of a pinned host int32 tensor (zero-copy request descriptor), or null
+static const int* host_index_ptr(const std::optional<torch::Tensor>& t) {
+  if (!t.has_value()) return nullptr;
+  TORCH_CHECK(!t->is_cuda() && t->is_pinned() && t->scalar_type() == torch::kInt32, "var: pinned CPU int32 tensor");
+  void* d = nullptr;
+  if (cudaHostGetDevicePointer(&d, t->data_ptr(), 0) != cudaSuccess) {
+    cudaGetLastError();
+    d = t->data_ptr();   // UVA: pinned host memory is device-accessible at its host address
+  }
+  return (const int*)d;
+}
 static void need_cuda(const torch::Tensor& t, const char* what) {
   TORCH_CHECK(t.is_cuda() && t.is_contiguous(), what, " must be a contiguous CUDA tensor");
 }
@@ -49,7 +60,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("nranks", &GinKV::nranks)
       .def("post_gets",
            [](GinKV& g, torch::Tensor segs, torch::Tensor layer_ptr, torch::Tensor tickets, int peer, int ctx0,
-              int n_ctx, std::optional<torch::Tensor> t_post) {
+              int n_ctx, std::optional<torch::Tensor> t_post, std::optional<torch::Tensor> var, int64_t var_stride) {
              need_cuda(segs, "segs");
              need_cuda(layer_ptr, "layer_ptr");
              need_cuda(tickets, "tickets");
@@ -59,10 +70,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                          "tickets too small");
              TORCH_CHECK(n_ctx >= 1 && n_ctx <= 32, "n_ctx in [1, 32]");
              g.post_gets((const Seg*)segs.data_ptr(), layer_ptr.data_ptr<int>(), (int)layer_ptr.numel() - 1,
-                         tickets.data_ptr(), peer, ctx0, n_ctx, ptr_or_null<uint64_t>(t_post), cur());
+                         tickets.data_ptr(), peer, ctx0, n_ctx, ptr_or_null<uint64_t>(t_post), cur(),
+                         host_index_ptr(var), var_stride);
            },
            py::arg("segs"), py::arg("layer_ptr"), py::arg("tickets"), py::arg("peer"), py::arg("ctx0") = 0,
-           py::arg("n_ctx") = 2, py::arg("t_post") = py::none())
+           py::arg("n_ctx") = 2, py::arg("t_post") = py::none(), py::arg("var") = py::none(),
+           py::arg("var_stride") = 0)
       .def("wait_layer",
            [](GinKV& g, torch::Tensor tickets, int layer, int ctx0, int n_ctx, std::optional<torch::Tensor> t_done) {
              g.wait_layer(tickets.data_ptr(), layer, ctx0, n_ctx, ptr_or_null<uint64_t>(t_done), cur());
@@ -170,6 +183,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("worker_cpu_s", &VerbsKV::worker_cpu_s)
       .def("requests_done", &VerbsKV::requests_done)
       .def("gdr_writes_ordering", &VerbsKV::gdr_writes_ordering)
+      .def("set_spin", &VerbsKV::set_spin)
+      .def("progress_ptr", &VerbsKV::progress_device_ptr)
+      .def("post_reads_tiled",
+           [](VerbsKV& v, torch::Tensor segs, torch::Tensor layer_ptr, uint32_t seq, int64_t tile_bytes) {
+             TORCH_CHECK(!segs.is_cuda() && segs.scalar_type() == torch::kInt64 && segs.is_contiguous(), "segs cpu int64");
+             TORCH_CHECK(!layer_ptr.is_cuda() && layer_ptr.scalar_type() == torch::kInt32, "layer_ptr cpu int32");
+             TORCH_CHECK(tile_bytes > 0, "tile_bytes > 0");
+             v.post_reads_tiled(segs.data_ptr<int64_t>(), layer_ptr.data_ptr<int>(), (int)layer_ptr.numel() - 1, seq,
+                                tile_bytes);
+           })
+      .def("set_inline_post", &VerbsKV::set_inline_post)
       .def("destroy", &VerbsKV::destroy);
   py::class_<RawGdaki>(m, "RawGdaki")
       .def(py::init<const std::string&, int64_t, int, int>(), py::arg("dev"), py::arg("bytes"), py::arg("nqp") = 4,
@@ -185,14 +209,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("nqp", &RawGdaki::nqp)
       .def("post_gets",
            [](RawGdaki& r, torch::Tensor segs, torch::Tensor layer_ptr, torch::Tensor tickets,
-              std::optional<torch::Tensor> t_post) {
+              std::optional<torch::Tensor> t_post, std::optional<torch::Tensor> var, int64_t var_stride) {
              need_cuda(segs, "segs");
              need_cuda(layer_ptr, "layer_ptr");
              TORCH_CHECK(tickets.numel() >= (int64_t)r.nqp() * (layer_ptr.numel() - 1), "tickets too small");
              r.post_gets((const Seg*)segs.data_ptr(), layer_ptr.data_ptr<int>(), (int)layer_ptr.numel() - 1,
-                         (uint64_t*)tickets.data_ptr(), ptr_or_null<uint64_t>(t_post), cur());
+                         (uint64_t*)tickets.data_ptr(), ptr_or_null<uint64_t>(t_post), cur(), host_index_ptr(var),
+                         var_stride);
            },
-           py::arg("segs"), py::arg("layer_ptr"), py::arg("tickets"), py::arg("t_post") = py::none())
+           py::arg("segs"), py::arg("layer_ptr"), py::arg("tickets"), py::arg("t_post") = py::none(),
+           py::arg("var") = py::none(), py::arg("var_stride") = 0)
       .def("wait_layer",
            [](RawGdaki& r, torch::Tensor tickets, int layer, std::optional<torch::Tensor> t_done) {
              r.wait_layer((const uint64_t*)tickets.data_ptr(), layer, ptr_or_null<uint64_t>(t_done), cur());
@@ -204,6 +230,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            })
       .def("destroy", &RawGdaki::destroy);
   m.def("seq_inc", [](torch::Tensor seq) { seq_inc_gpu((uint32_t*)seq.data_ptr(), cur()); });
+  m.def("relay_tiles", [](int64_t prog, int64_t host_flags, int n_layers, torch::Tensor seq, torch::Tensor tsteps) {
+    relay_tiles_gpu((const volatile unsigned long long*)prog, (const volatile uint32_t*)host_flags, n_layers,
+                    (const uint32_t*)seq.data_ptr(), (int32_t*)tsteps.data_ptr(), cur());
+  });
   m.def("relay_flags", [](int64_t host_flags, int n_layers, torch::Tensor seq, torch::Tensor ready) {
     relay_flags_gpu((const volatile uint32_t*)host_flags, n_layers, (const uint32_t*)seq.data_ptr(), (uint32_t*)ready.data_ptr(), cur());
   });

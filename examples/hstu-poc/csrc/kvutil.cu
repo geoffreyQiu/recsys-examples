@@ -112,6 +112,31 @@ void relay_flags_gpu(const volatile uint32_t* host_flags, int n_layers, const ui
                      cudaStream_t s) {
   relay_flags_kernel<<<1, 1, 0, s>>>(host_flags, n_layers, seq, ready);
 }
+__global__ void relay_tiles_kernel(const volatile unsigned long long* prog, const volatile uint32_t* host_flags,
+                                   int n_layers, const uint32_t* seq, int32_t* tsteps) {
+  const uint32_t s = *seq;
+  for (int l = 0; l < n_layers; ++l) {
+    int last = 0;
+    while (true) {
+      const bool full = host_flags[l] >= s;           // read the flag first: then progress below is final too
+      const unsigned long long p = prog[l];
+      if ((uint32_t)(p >> 32) == s && (int)(p & 0xffffffffull) > last) {
+        last = (int)(p & 0xffffffffull);
+        __threadfence_system();
+        asm volatile("st.release.gpu.global.s32 [%0], %1;" ::"l"(tsteps + l), "r"(last) : "memory");
+      }
+      if (full) {
+        __threadfence_system();
+        asm volatile("st.release.gpu.global.s32 [%0], %1;" ::"l"(tsteps + l), "r"(0x7fffffff) : "memory");
+        break;
+      }
+    }
+  }
+}
+void relay_tiles_gpu(const volatile unsigned long long* prog, const volatile uint32_t* host_flags, int n_layers,
+                     const uint32_t* seq, int32_t* tsteps, cudaStream_t s) {
+  relay_tiles_kernel<<<1, 1, 0, s>>>(prog, host_flags, n_layers, seq, tsteps);
+}
 __global__ void set_flag_seq_kernel(volatile uint32_t* flags, int layer, const uint32_t* seq) {
   __threadfence_system();
   flags[layer] = *seq;

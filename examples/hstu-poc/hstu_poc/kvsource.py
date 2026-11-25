@@ -8,6 +8,8 @@ inside one CUDA graph per cell:
 Local GPU buffer layout: [layer][K|V][total_k][heads][head_dim]; user u's history occupies rows
 [k_off[u], k_off[u] + L_u) of each block, so one user's history in one layer is two contiguous ranges.
 """
+import os
+
 import torch
 
 from .model import Batch, Config
@@ -142,6 +144,8 @@ class P4:
             self.seq_dev = torch.zeros(1, dtype=torch.int32, device=self.dev)
         self.p4_side = torch.cuda.Stream(device=self.dev)
         self.attn_fn = None if mode == "5a" else self._p4_attn
+        if mode == "tile":        # per-tile waits: chunks landed per layer, zeroed at each request's start
+            self.tsteps = torch.zeros(self.cfg.layers, dtype=torch.int32, device=self.dev)
         if mode == "pdl_early":   # a flag word that is always set: the trigger kernel passes its check and exits
             self._sat = torch.full((self.cfg.layers,), 2**31 - 1, dtype=torch.int32, device=self.dev)
             self._sat_seq = torch.zeros(1, dtype=torch.int32, device=self.dev)
@@ -149,13 +153,16 @@ class P4:
 
     @property
     def fused_like(self):
-        return self.p4 in ("fused", "pdl_early")
+        return self.p4 in ("fused", "pdl_early", "tile")
 
     def _p4_attn(self, l, q, K, V, b, model):
         from .attn_ext import hstu_fwd
         args = (q, K, V, b.cu_q, b.cu_k, b.max_q, b.max_k, model.cfg.max_len, b.num_targets, model.alpha)
         if self.p4 == "fused":
             return hstu_fwd(*args, kv_ready=self.ready.data_ptr() + 4 * l, kv_seq=self.seq_dev.data_ptr(), mode=1)
+        if self.p4 == "tile":
+            return hstu_fwd(*args, kv_ready=self.tsteps.data_ptr() + 4 * l, kv_seq=self.seq_dev.data_ptr(),
+                            mode=3 | (self.tile_rows << 8))
         if self.p4 == "pdl_early":
             self.E.wait_flags_seq(self._sat.data_ptr(), 0, self._sat_seq)    # trigger dependents, exit at once
             return hstu_fwd(*args, kv_ready=self.ready.data_ptr() + 4 * l, kv_seq=self.seq_dev.data_ptr(), mode=1,
@@ -172,7 +179,7 @@ class P4:
             launch()
 
     def p4_join(self):
-        if self.fused_like:
+        if self.fused_like or getattr(self, "side_post", False):
             torch.cuda.current_stream().wait_stream(self.p4_side)
 
 
@@ -184,6 +191,11 @@ class RemoteKV(LocalKV, P4):
 
     base = 0               # byte offset of this source's buffers inside the transport window (P5 regions)
     post_outside = False   # P5: the transfer is posted by post() outside the compute graph (fetch at admission)
+    # GDAKI latency options (no effect for CPU verbs):
+    zc = False             # zero-copy request descriptor: the post kernel reads the request's table index from pinned
+                           # host memory written by the CPU (no per-request device copy of the segment table)
+    side_post = False      # the post kernel runs on a side branch of the graph, so the compute starts at once; the
+                           # main stream joins it before layer 0's wait (5a/pdl) or only at the end (fused-like)
 
     def __init__(self, cfg, local_buf, pool_bytes, device="cuda", seed=7):
         super().__init__(cfg, device, local_buf)
@@ -244,6 +256,49 @@ class RemoteKV(LocalKV, P4):
         """Rows for a sampled data check of the current request (see setup)."""
         return self._samples[self.cur]
 
+    def _zc_setup(self):
+        self.nseg = int(self.tables[0].shape[0])
+        self.segs_all = torch.cat([t.to(self.dev) for t in self.tables]).contiguous()
+        self.var_host = torch.zeros(1, dtype=torch.int32).pin_memory()
+        self.var_np = self.var_host.numpy()
+
+    def _select(self, i):
+        """Per request (outside the graph): pick the user set; zero-copy = one store into pinned memory."""
+        self.cur = i % self.variants
+        if self.zc:
+            self.var_np[0] = self.cur
+        else:
+            self.segs.copy_(self.dev_tables[self.cur], non_blocking=True)
+
+    def _gdaki_start(self):
+        """start() of the GDAKI sources (raw, GIN): post every get, plus the fused-like poller."""
+        if self.slow_ns and not self.side_post:
+            self.E.spin(self.slow_ns)
+        if self.fused_like:
+            self.E.seq_inc(self.seq_dev)
+        if self.post_outside:
+            if self.fused_like:
+                self.p4_fork(self._poll)
+            return
+        if self.side_post:
+            def side():
+                if self.slow_ns:
+                    self.E.spin(self.slow_ns)   # a slow producer delays the post only; the compute runs ahead
+                self.post()
+                if self.fused_like:
+                    self._poll()
+                else:
+                    self._post_ev.record()
+            self.p4_fork(side)
+        else:
+            self.post()
+            if self.fused_like:
+                self.p4_fork(self._poll)
+
+    def _side_join(self, l):
+        if self.side_post and l == 0 and not self.fused_like and not self.post_outside:
+            torch.cuda.current_stream().wait_event(self._post_ev)   # tickets exist before the first wait reads them
+
     def bytes_moved(self):
         return sum(self.b.hist) * self.cfg.layers * self.cfg.kv_tok_bytes
 
@@ -263,6 +318,8 @@ class GinKVSource(RemoteKV):
     per-layer tickets; a 1-thread wait kernel before each layer's attention."""
     name = "gin"
 
+    adapt_ctx = False   # use only as many contexts as a layer has segments (no flush/wait on empty contexts)
+
     def __init__(self, cfg, gin, ext, peer, pool_bytes, n_ctx=2, device="cuda"):
         super().__init__(cfg, gin.local(), pool_bytes, device)
         self.g, self.E, self.peer, self.n_ctx = gin, ext, peer, n_ctx
@@ -273,26 +330,31 @@ class GinKVSource(RemoteKV):
         self.dev_tables = [t.to(self.dev) for t in self.tables]
         self.lp = self.layer_ptr_cpu.to(self.dev)
         self.tickets = torch.zeros(self.cfg.layers * self.n_ctx, 2, dtype=torch.int64, device=self.dev)
+        per_layer = int(self.layer_ptr_cpu[1] - self.layer_ptr_cpu[0])
+        self.nc = min(self.n_ctx, max(per_layer, 1)) if self.adapt_ctx else self.n_ctx
+        self._post_ev = torch.cuda.Event()
+        if self.zc:
+            self._zc_setup()
 
     def pre_replay(self, i):
-        self.cur = i % self.variants
-        self.segs.copy_(self.dev_tables[self.cur], non_blocking=True)
+        self._select(i)
 
     def start(self):
-        if self.slow_ns:
-            self.E.spin(self.slow_ns)
-        if self.fused_like:
-            self.E.seq_inc(self.seq_dev)
-        if not self.post_outside:
-            self.post()
-        if self.fused_like:
-            self.p4_fork(lambda: self.g.poll(self.tickets, self.cfg.layers, 0, self.n_ctx, self.seq_dev, self.ready))
+        self._gdaki_start()
+
+    def _poll(self):
+        self.g.poll(self.tickets, self.cfg.layers, 0, self.nc, self.seq_dev, self.ready)
 
     def post(self):
-        self.g.post_gets(self.segs, self.lp, self.tickets, self.peer, ctx0=0, n_ctx=self.n_ctx)
+        if self.zc:
+            self.g.post_gets(self.segs_all, self.lp, self.tickets, self.peer, ctx0=0, n_ctx=self.nc,
+                             var=self.var_host, var_stride=self.nseg)
+        else:
+            self.g.post_gets(self.segs, self.lp, self.tickets, self.peer, ctx0=0, n_ctx=self.nc)
 
     def before_attn(self, l):
-        self.g.wait_layer(self.tickets, l, 0, self.n_ctx)
+        self._side_join(l)
+        self.g.wait_layer(self.tickets, l, 0, self.nc)
 
     def end(self):
         self.p4_join()
@@ -313,9 +375,17 @@ class VerbsKVSource(RemoteKV):
 
     _engine_seq = {}   # id(engine) -> last seq posted: the worker's flags hold the last finished seq of ANY source
 
+    tile_rows = 0
+    max_tile_wrs = 2048   # per request: keeps the reads within the send queues and the completion queue
+
     def setup(self, b):
         super().setup(b)
         self.v.wait_idle()
+        if self.p4 == "tile":   # chunk rows: >= 128, sized so a request posts at most max_tile_wrs reads
+            L = max(b.hist)
+            rows = max(int(os.environ.get("HPOC_TILE_ROWS", 128)), -(-self.cfg.layers * 2 * b.B * L // self.max_tile_wrs))
+            self.tile_rows = -(-rows // 64) * 64
+            self.tile_bytes = self.tile_rows * self.cfg.hd * 2
         # continue the engine's sequence, so this source's waits (flags[l] >= seq) cannot pass on an earlier
         # source's larger flags (that let a new cell's first requests run before their data had landed)
         self.seq = VerbsKVSource._engine_seq.get(id(self.v), 0)
@@ -326,16 +396,26 @@ class VerbsKVSource(RemoteKV):
         self.seq += 1
         VerbsKVSource._engine_seq[id(self.v)] = self.seq
         if not self.post_after_launch:
-            self.v.post_reads(self.tables[self.cur], self.layer_ptr_cpu, self.seq)
+            self._post_now()
 
     post_after_launch = False   # slow-producer check: the caller launches the graph, then calls post_now()
 
     def post_now(self):
-        self.v.post_reads(self.tables[self.cur], self.layer_ptr_cpu, self.seq)
+        self._post_now()
+
+    def _post_now(self):
+        if self.p4 == "tile":
+            self.v.post_reads_tiled(self.tables[self.cur], self.layer_ptr_cpu, self.seq, self.tile_bytes)
+        else:
+            self.v.post_reads(self.tables[self.cur], self.layer_ptr_cpu, self.seq)
 
     def start(self):
         self.E.seq_inc(self.seq_dev)
-        if self.fused_like:
+        if self.p4 == "tile":
+            self.tsteps.zero_()
+            self.p4_fork(lambda: self.E.relay_tiles(self.v.progress_ptr(), self.flags, self.cfg.layers, self.seq_dev,
+                                                    self.tsteps))
+        elif self.fused_like:
             self.p4_fork(lambda: self.E.relay_flags(self.flags, self.cfg.layers, self.seq_dev, self.ready))
 
     def before_attn(self, l):
@@ -364,25 +444,27 @@ class RawGdakiSource(RemoteKV):
         self.segs = self.dev_tables[0].clone()
         self.lp = self.layer_ptr_cpu.to(self.dev)
         self.tickets = torch.zeros(self.cfg.layers * self.r.nqp(), dtype=torch.int64, device=self.dev)
+        self._post_ev = torch.cuda.Event()
+        if self.zc:
+            self._zc_setup()
 
     def pre_replay(self, i):
-        self.cur = i % self.variants
-        self.segs.copy_(self.dev_tables[self.cur], non_blocking=True)
+        self._select(i)
 
     def start(self):
-        if self.slow_ns:
-            self.E.spin(self.slow_ns)
-        if self.fused_like:
-            self.E.seq_inc(self.seq_dev)
-        if not self.post_outside:
-            self.post()
-        if self.fused_like:
-            self.p4_fork(lambda: self.r.poll(self.tickets, self.cfg.layers, self.seq_dev, self.ready))
+        self._gdaki_start()
+
+    def _poll(self):
+        self.r.poll(self.tickets, self.cfg.layers, self.seq_dev, self.ready)
 
     def post(self):
-        self.r.post_gets(self.segs, self.lp, self.tickets)
+        if self.zc:
+            self.r.post_gets(self.segs_all, self.lp, self.tickets, var=self.var_host, var_stride=self.nseg)
+        else:
+            self.r.post_gets(self.segs, self.lp, self.tickets)
 
     def before_attn(self, l):
+        self._side_join(l)
         self.r.wait_layer(self.tickets, l)
 
     def end(self):

@@ -41,6 +41,10 @@ void relay_flags_gpu(const volatile uint32_t* host_flags, int n_layers, const ui
 void set_flag_seq_gpu(volatile uint32_t* flags, int layer, const uint32_t* seq, cudaStream_t s);
 void wait_flags_seq_gpu(const volatile uint32_t* flags, int layer, const uint32_t* seq, uint64_t* stamp,
                         cudaStream_t s);
+// per-tile waits, CPU verbs: relay the worker's per-layer progress ((seq << 32) | steps, host-mapped) into device
+// words tsteps[l] = steps landed (0x7fffffff once the layer is complete), for the attention's per-tile spin
+void relay_tiles_gpu(const volatile unsigned long long* prog, const volatile uint32_t* host_flags, int n_layers,
+                     const uint32_t* seq, int32_t* tsteps, cudaStream_t s);
 
 // P6: an SM hog (every block's thread 0 spins for ns while the block stays resident) and green contexts.
 void hog_gpu(int64_t ns, int blocks, int threads, cudaStream_t s);

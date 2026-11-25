@@ -57,8 +57,15 @@ __device__ __forceinline__ uint64_t gtime() {
 // warp w posts on QP w the segments j of each layer with j % nqp == w; lane 0 stores the layer's last ticket + 1
 __global__ void raw_post_gets_kernel(doca_gpu_dev_verbs_qp** qps, int nqp, const Seg* segs, const int* lp,
                                      int n_layers, uint64_t rbase, uint32_t rkey_be, uint64_t lbase, uint32_t lkey_be,
-                                     unsigned long long* tickets, uint64_t* t_post) {
+                                     unsigned long long* tickets, uint64_t* t_post, const volatile int* var,
+                                     long long var_stride) {
   if (t_post && threadIdx.x == 0) t_post[0] = gtime();
+  // zero-copy request descriptor: the CPU writes the request's table index into pinned host memory, the kernel reads
+  // it once (no per-request copy of the segment table)
+  __shared__ long long s_off;
+  if (threadIdx.x == 0) s_off = var ? (long long)(*var) * var_stride : 0;
+  __syncthreads();
+  segs += s_off;
   const int w = threadIdx.x / 32, lane = threadIdx.x % 32;
   doca_gpu_dev_verbs_qp* qp = qps[w];
   for (int l = 0; l < n_layers; ++l) {
@@ -228,11 +235,11 @@ int64_t RawGdaki::bytes() const { return (int64_t)p_->bytes; }
 int RawGdaki::nqp() const { return (int)p_->qps.size(); }
 
 void RawGdaki::post_gets(const Seg* segs, const int* layer_ptr, int n_layers, uint64_t* tickets, uint64_t* t_post,
-                         cudaStream_t s) {
+                         cudaStream_t s, const int* var, int64_t var_stride) {
   const int nq = (int)p_->qps.size();
   raw_post_gets_kernel<<<1, 32 * nq, 0, s>>>(p_->d_qps, nq, segs, layer_ptr, n_layers, p_->raddr,
                                              htobe32(p_->rkey), (uint64_t)p_->buf, htobe32(p_->mr->lkey),
-                                             (unsigned long long*)tickets, t_post);
+                                             (unsigned long long*)tickets, t_post, var, (long long)var_stride);
   CUDA_OK2(cudaGetLastError());
 }
 

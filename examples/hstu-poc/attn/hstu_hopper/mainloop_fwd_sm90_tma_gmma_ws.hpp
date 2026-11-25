@@ -472,9 +472,30 @@ struct CollectiveMainloopFwd {
     } else if (mainloop_params.kv_wait_mode == 2) {
       asm volatile("griddepcontrol.wait;" ::: "memory");
     }
+    // POC per-tile waits (mode 3, chunk rows in bits 8+): before each K tile load, spin until the chunks covering
+    // this tile's history rows have landed. The history is transferred from its end backwards (the loop below
+    // consumes key blocks last-to-first): *kv_ready = number of chunks landed for this layer (every user),
+    // 0x7fffffff once the layer is complete. Blocks past the history (the candidates' own rows) need no wait.
+    const int kv_tile_mode = mainloop_params.kv_wait_mode & 0xff;
+    const int kv_tile_rows = mainloop_params.kv_wait_mode >> 8;
+    const int kv_hist_len = Is_target ? seqlen_traits_k.actual_seq_len_h : seqlen_traits_k.actual_seq_len;
+    auto tile_wait = [&](int nb) {
+      if (kv_tile_mode == 3) {
+        const int start = nb * static_cast<int>(get<1>(TileShape_MNK{}));
+        if (start < kv_hist_len) {
+          const int need = (kv_hist_len - start + kv_tile_rows - 1) / kv_tile_rows;
+          int got;
+          do {
+            asm volatile("ld.acquire.gpu.global.s32 %0, [%1];" : "=r"(got) : "l"(mainloop_params.kv_ready) : "memory");
+          } while (got < need);
+          asm volatile("fence.proxy.async.global;" ::: "memory");
+        }
+      }
+    };
     int lane_predicate = cute::elect_one_sync();
     if constexpr (IntraWGOverlap) {
       if (lane_predicate) {
+        tile_wait(n_block);
         pipeline_k.producer_acquire(smem_pipe_write_k);
         copy(
             mainloop_params.tma_load_K.with(
@@ -523,6 +544,7 @@ struct CollectiveMainloopFwd {
           int n_block_prev = !Is_arbitrary ? n_valid_block_prev : sValidBlockIds[n_valid_block];
           int n_block_next = !Is_arbitrary ? n_valid_block - 1  : sValidBlockIds[n_valid_block - 1];
           if (n_block_next >= n_block_min) {
+            tile_wait(n_block_next);
             pipeline_k.producer_acquire(smem_pipe_write_k);
             copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), mcast_mask_kv),
                   tKgK(_, n_block_next), tKsK(_, smem_pipe_write_k.index()));
@@ -554,6 +576,7 @@ struct CollectiveMainloopFwd {
       } else {
         auto load_step = [&](int n_valid_block, int masking_step) {
           int n_block = !Is_arbitrary ? n_valid_block : sValidBlockIds[n_valid_block];
+          tile_wait(n_block);
           pipeline_k.producer_acquire(smem_pipe_write_k);
           copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), mcast_mask_kv),
                 tKgK(_, n_block), tKsK(_, smem_pipe_write_k.index()));

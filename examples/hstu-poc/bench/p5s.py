@@ -68,6 +68,12 @@ def main():
     ap.add_argument("--min-requests", type=int, default=2000, help="run each load point for about this many "
                     "requests (5 s at least, --max-dur at most)")
     ap.add_argument("--max-dur", type=float, default=15.0)
+    ap.add_argument("--p4", default="5a", choices=["5a", "fused"], help="fetch: per-layer wait variant")
+    ap.add_argument("--tuned", action="store_true", help="CPU verbs: spinning worker and inline posting")
+    ap.add_argument("--stop", default="slo", choices=["slo", "sat"], help="slo: stop after two points failing the SLO; "
+                    "sat: keep going until two points are past saturation (achieved < 97%% of offered or p99 > "
+                    "--sat-p99-ms), for capacities at relaxed SLOs")
+    ap.add_argument("--sat-p99-ms", type=float, default=2000.0)
     ap.add_argument("--cotenant", default=None, help="P6: a co-located recompute job 'LxB' (history L, B users) kept "
                     "busy on its own stream while the fetch server runs")
     ap.add_argument("--green", type=int, default=0, help="P6: confine the co-tenant to a green context without N SMs "
@@ -99,6 +105,9 @@ def main():
                            WORKER_CORES[local])
             infos = hd.gather(tr.local_info())
             tr.connect(infos[peer])
+            if infer and a.tuned:
+                tr.set_spin(True)
+                tr.set_inline_post(True)
         if not infer:
             fill_pool(E, tr.local(), a.seed)
         hd.barrier()
@@ -121,7 +130,7 @@ def main():
                 if a.strategy == "fetch":
                     srv = FetchServer(model, cfg, a.L, a.C, a.transport, tr, E, tr.local(), pool, peer=peer,
                                       n_ctx=a.nctx, max_batch=a.max_batch, depth=a.depth, chunks=a.chunks,
-                                      seed=a.seed, fetch_stream=fstream)
+                                      seed=a.seed, fetch_stream=fstream, p4=a.p4)
                     if a.cotenant:
                         Lc, Bc = map(int, a.cotenant.split("x"))
                         cot = Cotenant(model, cfg, Lc, Bc,
@@ -154,6 +163,15 @@ def main():
                         else:
                             res = srv.run(q, dur, warmup_s=1.0, seed=int(q * 10) + 7, slo_ms=a.slo_ms)
                     lat = res.pop("lat")
+                    # relaxed SLOs: share of requests within each latency target, the tail, and drift (p99 of the
+                    # first vs the second half of the run: a growing queue = past saturation)
+                    half = max(len(lat) // 2, 1)
+                    res.update(succ_at={str(x): float((lat * 1e3 <= x).mean()) for x in (100, 200, 500, 1000, 2000)},
+                               p999_ms=float(np.percentile(lat, 99.9) * 1e3),
+                               p99_h1_ms=float(np.percentile(lat[:half], 99) * 1e3),
+                               p99_h2_ms=float(np.percentile(lat[half:], 99) * 1e3) if len(lat) > half else None,
+                               p4=a.p4 if a.strategy == "fetch" else None, tuned=a.tuned, stop=a.stop,
+                               slo_cap_ms=a.slo_ms)
                     rec = dict(tag=a.tag, config=a.config, strategy=label, kind=a.strategy, L=a.L, C=a.C,
                                depth=a.depth, chunks=a.chunks, frac=f, offered=q,
                                ceiling=srv.ceiling, nic_ceiling=srv.nic_ceiling, gpu_ceiling=srv.gpu_ceiling,
@@ -174,7 +192,10 @@ def main():
                           f"{rec['p99_ms']:7.2f} ms; within SLO {100 * rec['success']:5.1f}%; GPU {100 * rec['gpu_share']:4.1f}%;"
                           f" cores {rec['cores_other']:.2f}; checks {rec.get('checks', 0)} bad {rec.get('bad_words', 0)}",
                           flush=True)
-                    fail = rec["p99_ms"] > a.slo_ms or rec["success"] < 0.99 or rec["achieved"] < 0.9 * q   # Poisson: +-5% at 5 s
+                    if a.stop == "sat":
+                        fail = rec["achieved"] < 0.97 * q or rec["p99_ms"] > a.sat_p99_ms
+                    else:
+                        fail = rec["p99_ms"] > a.slo_ms or rec["success"] < 0.99 or rec["achieved"] < 0.9 * q   # Poisson: +-5% at 5 s
                     bad = bad + 1 if fail else 0
                     if bad >= 2:
                         break
