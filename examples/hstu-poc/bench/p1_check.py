@@ -1,6 +1,6 @@
 """P1 correctness: FBGEMM's C++ Hopper HSTU kernel with a cached history (queries shorter than keys, + targets),
 against a pure-PyTorch reference; then the model end to end: recompute vs the cached path fed with the K/V
-that recompute produced (must give the same candidate scores)."""
+that recompute produced (must give the same output)."""
 import argparse
 
 import torch
@@ -61,7 +61,7 @@ def model_check(cfg, dev):
         Kc[i][cached.q_dst] = 0
         Vc[i][cached.q_dst] = 0
     y_cached = model.forward_cached(x[full.cand_in_full], cached, lambda i: (Kc[i], Vc[i]))
-    return [("model: cached path vs recompute (candidate scores)", rel_err(y_cached, y_full)),
+    return [("model: cached path vs recompute (output)", rel_err(y_cached, y_full)),
             ("model: candidate K/V rows rebuilt", max(rel_err(Kc[i][cached.q_dst], Ks[i][cached.q_dst])
                                                      for i in range(cfg.layers)))]
 

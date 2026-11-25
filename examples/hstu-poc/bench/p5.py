@@ -2,7 +2,7 @@
 Strategies: 'fetch' over --transport (gin | raw | verbs; GIN backend by NCCL_GIN_TYPE), plus 'local' (KV already in
 GPU memory) and 'recompute' when listed in --strategies. Homogeneous requests: history L, C candidates.
 
-Per offered rate (open-loop Poisson arrivals): p50/p90/p99/mean of request latency (arrival -> scores ready), the
+Per offered rate (open-loop Poisson arrivals): p50/p90/p99/mean of request latency (arrival -> output ready), the
 achieved completion rate, mean batch size, and success = the fraction of requests that finished within the SLO
 (--slo-ms, default 100 ms) with no data error; goodput = successful requests per second. Fetched batches are
 data-checked by sampling (every --check-every-th batch). A sweep stops after two load points with p99 > 3 x SLO or an

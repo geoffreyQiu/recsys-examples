@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """P3b (workload W, regular grid) report: tables and a figure from results/p3b/.
     tools/p3_report.py results/p3b -o docs/figs/p3b-tail.png [--md]
-Per cell (config M, C = 256): scores = time until the candidate scores exist (the request's answer), with and without
-the writes; durable = time until the new tokens' K/V are confirmed in the remote store; tail = durable - scores."""
+Per cell (config M, C = 256): latency = request start -> the request's output is ready, with and without the writes;
+durable time = request start -> the new tokens' K/V are confirmed in the remote store; tail = durable time - latency.
+(The result rows keep the field names scores_* for the latency.)"""
 import argparse
 import glob
 import json
@@ -58,17 +59,17 @@ def main():
         ax.tick_params(colors=INK2, labelsize=7.5)
         for sp in ax.spines.values():
             sp.set_color(GRID)
-    axes[0][0].set_ylabel("durable − scores ready (ms)", color=INK2, fontsize=8.5)
+    axes[0][0].set_ylabel("durable time − latency (ms)", color=INK2, fontsize=8.5)
     h, l = axes[0][0].get_legend_handles_labels()
     fig.legend(h, l, loc="upper left", ncol=len(Ps), frameon=False, fontsize=8, labelcolor=INK, bbox_to_anchor=(0.01, 1.08))
-    fig.suptitle("Workload W, M, C = 256, GIN-GDAKI writes: how long the new K/V stay in flight after the scores are ready",
+    fig.suptitle("Workload W, M, C = 256, GIN-GDAKI writes: how long the new K/V stay in flight after the output is ready",
                  color=INK, fontsize=10, y=1.15, x=0.01, ha="left")
     fig.savefig(a.out, bbox_inches="tight", facecolor=SURFACE)
     print("wrote", a.out)
     if not a.md:
         return
     for B in Bs:
-        print(f"\n**B = {B}: scores ready without writes → with GIN-GDAKI writes / durable (mean ms)**\n")
+        print(f"\n**B = {B}: latency without writes → latency with GIN-GDAKI writes / durable time (means, ms)**\n")
         print("| P \\ S | " + " | ".join(f"{S / 1024:g}k" if S >= 1024 else str(S) for S in Ss) + " |")
         print("|---|" + "---|" * len(Ss))
         for P in Ps:
@@ -98,7 +99,7 @@ def main():
     worst = max((abs(c[m]["scores_mean"] / c["none"]["scores_mean"] - 1), k, m) for k, c in cell.items()
                 for m in modes if m in c and "none" in c)
     bad = sum(c[m].get("readback_bad_bytes", 0) for c in cell.values() for m in modes if m in c)
-    print(f"\nLargest change of scores-ready time from writes: {100 * worst[0]:.1f}% at (B, P, S) = {worst[1]} "
+    print(f"\nLargest change of latency from writes: {100 * worst[0]:.1f}% at (B, P, S) = {worst[1]} "
           f"({worst[2]}); read-back mismatches over all cells: {bad} bytes")
 
 

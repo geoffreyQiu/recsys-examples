@@ -89,7 +89,7 @@ faster NICs (see the sensitivity above).
 | Is p50 better than the mean? | Neither in general. The tables now use the mean: it is what capacity depends on. Over 1,288 P2c cells the two differ by 0.02% (median), 0.5% (95th pct.), 1.8% (max). Serving uses p99 against the SLO. | [Method](#method) |
 | B = 4 and L = 2k / 8k | In every grid now (P2c, P3b, P4b, P5b). | – |
 | P2: break-even line, recompute vs the best RDMA | L* ≈ 14k (M), 13–15k (S), 11–12k (D), flat in B. | [P2c](#p2c-break-even-fetch-vs-recompute) |
-| P3: B = 4, S = 1k/2k/8k, a regular grid; what is "score"? | Regular grid B × prefix P × new S. "Score" = the model's output per candidate item (the request's answer). | [P3b](#p3b-workload-w-on-a-regular-grid) |
+| P3: B = 4, S = 1k/2k/8k, a regular grid; what is "score"? | Regular grid B × prefix P × new S. The doc now uses two terms instead: **latency** (performance: request start → the request's output is ready) and **output** (correctness: what the request returns, one score per candidate item). | [Method](#method), [P3b](#p3b-workload-w-on-a-regular-grid) |
 | P4: what is PDL, which kernel? | Programmatic Dependent Launch; the attention kernel was launched with it, right after the wait kernel. | [P4b](#p4b-wait-variants-on-a-regular-grid) |
 | P5: drop local hit; x-axis folding; error/success rate; keep p99 in a reasonable range | Re-plotted against offered load (one point per x), p99 capped at 3 × SLO, success = share of requests within 100 ms without data errors, sampled data checks; local hit dropped from the plot. | [P5b](#p5b-serving-against-offered-load-slo-100-ms) |
 | P6: 101-style intro; what is "hog"? | Added: SMs and blocks, why GPU-initiated transfers can wait, the hog kernel, green contexts. | [P6](#p6-gpu-vs-cpu-balance) |
@@ -112,10 +112,13 @@ the median, 0.48% at the 95th percentile and 1.8% at most. Tables report the mea
 SLO (what a latency target is written against).
 
 **Terms.**
-- **Score**: the model's output for a candidate item. A request asks HSTU to rank C candidates (256 here) for one user
-  and gets one score per candidate (a probability per task, from the head MLP). "Scores ready" = the request is
-  answered.
-- **Durable** (workload W): the new tokens' K/V are confirmed in the remote store.
+- **Latency** (performance): request start → the request's output is ready. P2–P4 time it on the GPU for isolated
+  requests; in serving (P5b) it runs from the request's arrival, so it includes queueing and batching.
+- **Output** (correctness): what a request returns. HSTU ranks C candidate items (256 here) for one user; the output is
+  one score per candidate (a probability per task, from the head MLP). Correctness checks compare outputs, or the K/V
+  bytes that were moved, with a reference.
+- **Durable time** (workload W): request start → the new tokens' K/V are confirmed in the remote store. It can end after
+  the output is ready; durable time − latency is how long the writes stay in flight after it.
 - **Workload R**: the whole history is cached remotely; fetch it, compute the candidates. **W**: a prefix P is already
   local, S new history tokens are computed now and written to the store, plus the candidates.
 - **5′a / PDL / fused**: ways to wait for a layer's K/V before its attention (P4b).
@@ -195,8 +198,8 @@ host memory (0 mismatched words). Post kernel for 64 gets: 48–51 µs (GDAKI), 
 FBGEMM's Hopper kernel), KV sources, grid runner, transports (layout in its README).
 
 **Correctness ✅** (`bench/p1_check.py`, S/M/D): the non-paged Hopper kernel handles a cached history directly
-(queries shorter than keys, plus targets), relative error ≤ 7e-3 against a PyTorch reference of the repo's mask; the
-cached path fed with recompute's K/V gives bit-identical scores.
+(queries shorter than keys, plus targets), its output is within 7e-3 (relative error) of a PyTorch reference of the repo's mask;
+the cached path fed with recompute's K/V gives a bit-identical output.
 
 **Recompute efficiency η** (achieved ÷ 989 TFLOPS BF16, from the P2c grid, C = 256):
 
@@ -359,25 +362,24 @@ the rest of the request kept, never below the local-hit time:
 ## P3b: workload W on a regular grid
 
 Per layer, as soon as the layer's new K/V rows exist (they already sit contiguous in the local buffer), they are
-written to the user's slot in the store after the cached prefix. **Scores ready** = the candidates' scores exist (the
-request is answered); **durable** = a write-then-read fence on every QP has returned (an 8-byte read served after the
+written to the user's slot in the store after the cached prefix. **Latency** = request start → output ready;
+**durable time** = request start → a write-then-read fence on every QP has returned (an 8-byte read served after the
 earlier writes on that QP) and, for GIN, a strong signal. Both from GPU timestamps; after each cell the written ranges
 are read back from the store and compared. Grid: M, C = 256, B 1/2/4/8 × prefix P 0/1k/2k/4k/8k/16k × new tokens S
 256/1k/2k/4k/8k. `results/p3b/`, `tools/p3_report.py`.
 
 ![P3b tail](figs/p3b-tail.png)
 
-- **The writes add no latency to the answer.** End-to-end latency here = request start → candidates' scores ready
-  (what the caller waits for). It is the same with and without the writes: over 120 cells × 3 transports the
+- **The writes add no latency.** Latency is the same with and without the writes: over 120 cells × 3 transports the
   difference is −5.6% … +4.5% (median +0.45%; about as many cells got faster as slower, i.e. run-to-run noise). The
   writes run beside the compute (GPU-initiated puts on a side stream; CPU-verbs writes posted by the worker as the
-  GPU flags each layer), and the answer does not wait for them.
-- **The writes finish after the answer. How long after** (durable − scores ready, figure) **grows with the bytes
-  written (B × S × 32 KiB) and shrinks with the prefix:** a longer prefix means more attention work per new token,
+  GPU flags each layer), and the output does not wait for them.
+- **The writes finish after the output is ready. How long after** (durable time − latency, figure) **grows with the
+  bytes written (B × S × 32 KiB) and shrinks with the prefix:** a longer prefix means more attention work per new token,
   behind which the writes hide. Short updates (S = 256): ≤ 0.1 ms at every B and P. B = 1: ≤ 0.7 ms. B = 8, S = 1k:
   1.8 ms for a fresh sequence, 0.1 ms with a 16k prefix; B = 8, S = 8k: 10.8 ms fresh, 4.3 ms with a 16k prefix.
-  A design that must wait until the new K/V are durable before answering (for example so that the same user's next
-  request can read them at once) has the durable time as its latency, i.e. longer by this amount.
+  A design that must wait until the new K/V are durable before returning the output (for example so that the same
+  user's next request can read them at once) has the durable time as its latency, i.e. longer by this amount.
 - **Fresh sequences with large writes are NIC-bound:** durable = bytes ÷ NIC write rate (B = 8, S = 8k: 2 GiB
   durable in 46.2 ms = 46.5 GB/s with GIN-GDAKI, 47.1 GB/s with CPU verbs).
 - **Transports tie within ~3%** on durable time; CPU verbs is slightly ahead on the largest writes (−3% at B = 8,
@@ -387,8 +389,8 @@ are read back from the store and compared. Grid: M, C = 256, B 1/2/4/8 × prefix
 - **Read-back of every written range: 0 mismatched bytes** in all 480 runs.
 - Raw GDAKI has the read path only (writes would mirror GIN's put kernel; not needed to answer the transport question).
 
-**Scores-ready time without writes → with GIN-GDAKI writes / durable (mean ms), per batch size; rows = cached prefix P,
-columns = new tokens S:**
+**Latency without writes → latency with GIN-GDAKI writes / durable time (means, ms), per batch size; rows = cached
+prefix P, columns = new tokens S:**
 
 **B = 1:**
 
@@ -476,8 +478,8 @@ columns = new tokens S:**
   attention kernel's producer warp spins on its layer's word before the first K/V load.
 
 **Correctness ✅** (`bench/p4_check.py`): posting delayed by 2 ms and the local K/V rows zeroed before each request;
-5′a, the copied kernel, PDL and fused give bit-identical scores for raw GDAKI, GIN-GDAKI and CPU verbs; a no-wait
-control differs every time.
+5′a, the copied kernel, PDL and fused give bit-identical outputs for raw GDAKI, GIN-GDAKI and CPU verbs; a no-wait
+control's output differs every time.
 
 Grid: S and M × L 1k/2k/4k/8k/16k × B 1/2/4/8, C = 256. `results/p4b/`, `tools/p4_report.py`.
 
@@ -532,11 +534,12 @@ batch forms when a KV region is free and the GPU is idle, 32 requests wait, or t
 admission** into two ping-pong regions, so batch k+1's transfer overlaps batch k's compute; one CUDA graph per (batch
 size, region), each replayed once before serving. Config M.
 
-**What is measured per load point:** latency = arrival → scores ready (p50/p99/mean); achieved completion rate;
-**success** = share of requests that finished within the SLO (100 ms, about 10× the single-request latency at 16k)
-with no data error; **data checks**: every 8th batch, after it completes and before its region is reused, a kernel
-compares a sample of the fetched rows (the last layer of up to 8 users, 256 KiB each) with the store's pattern. A
-sweep stops after two load points with p99 > 300 ms or an achieved rate below 85% of the offered one.
+**What is measured per load point:** latency = arrival → output ready, queueing included (p50/p99/mean); achieved
+completion rate; **success** = share of requests whose latency is within the SLO (100 ms, about 10× the
+single-request latency at 16k) and whose batch showed no data error; **data checks**: every 8th batch, after it
+completes and before its region is reused, a kernel compares a sample of the fetched rows (the last layer of up to 8
+users, 256 KiB each) with the store's pattern. A sweep stops after two load points with p99 > 300 ms or an achieved
+rate below 85% of the offered one.
 
 ![P5 curves](figs/p5-curves.png)
 

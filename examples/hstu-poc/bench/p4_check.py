@@ -1,4 +1,4 @@
-"""P4 correctness under a slow producer (study doc §5.4): each wait variant must produce the same candidate scores as
+"""P4 correctness under a slow producer (study doc §5.4): each wait variant must produce the same output as
 the 5'a reference even when posting is delayed and the local KV rows are zeroed before the request (a variant that
 does not really wait computes on zeros). Negative control: 'nowait' (copied kernel, no wait at all) must differ.
 Runs on 2 nodes like p2.py:  scripts/srun2.sh -j J -n 1 -- python bench/p4_check.py --transport raw|gin|verbs"""
@@ -120,7 +120,7 @@ def main():
             diffs = [float((y - ref).abs().max()) for y in ys]
             expect_equal = v != "nowait"
             ok = all(d == 0.0 for d in diffs) if expect_equal else all(d > 0.0 for d in diffs)
-            print(f"  {v:7s} max |score - 5a| per trial: {', '.join(f'{d:.3g}' for d in diffs)}  ->  "
+            print(f"  {v:7s} max |output - 5a| per trial: {', '.join(f'{d:.3g}' for d in diffs)}  ->  "
                   f"{'PASS' if ok else 'FAIL'} ({'must equal' if expect_equal else 'must differ'})", flush=True)
     hd.barrier()
     tr.destroy()

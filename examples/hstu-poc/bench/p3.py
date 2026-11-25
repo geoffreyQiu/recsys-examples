@@ -2,7 +2,8 @@
 2 nodes (scripts/srun2.sh -n N -- python bench/p3.py --transport gin|verbs ...). Modes per cell:
   none      compute only (the same forward, no writes): the bar for "added latency"
   <label>   the same forward with per-layer writes of the new tokens' K/V (6') and a durability fence
-Per request: scores-ready latency (t1 - t0) and writes-durable latency (t2 - t0), from GPU timestamps.
+Per request: latency (t1 - t0: output ready) and durable time (t2 - t0: writes confirmed in the store), from GPU
+timestamps. Result fields scores_* hold the latency (names kept for compatibility).
 """
 import argparse
 import json
@@ -180,7 +181,7 @@ def main():
                     if "skipped" in rec:
                         print(f"[r{rank}] {c} {rec['mode']:6s} B={B:3d} P={P:5d} S={S:5d} C={C:4d}: SKIP {rec['skipped']}", flush=True)
                     else:
-                        print(f"[r{rank}] {c} {rec['mode']:6s} B={B:3d} P={P:5d} S={S:5d} C={C:4d}: scores mean "
+                        print(f"[r{rank}] {c} {rec['mode']:6s} B={B:3d} P={P:5d} S={S:5d} C={C:4d}: latency mean "
                               f"{rec['scores_mean']:8.3f} ms, durable mean {rec['durable_mean']:8.3f} p99 {rec['durable_p99']:8.3f}"
                               f" ms, write {rec['write_gbs']:5.1f} GB/s, cpu {rec['cpu_ms_per_req']:.3f} ms/req"
                               + (f", readback bad {rec['readback_bad_bytes']}" if "readback_bad_bytes" in rec else ""),

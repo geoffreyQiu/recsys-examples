@@ -3,7 +3,7 @@ after the layer's K/V exist (model.forward_cached(after_kv=...)); the K/V buffer
 so "pack" costs nothing beyond the index_copy the model already does. Completion is measured as durable:
 a write-then-read fence on every QP (an 8-byte read served after the earlier writes on that QP).
 
-Timing stamps (globaltimer, per request): t0 request start, t1 scores ready (main stream), t2 writes durable
+Timing stamps (globaltimer, per request): t0 request start, t1 output ready (latency) (main stream), t2 writes durable
 (side stream). Writers: NoWrite (compute only), GinWriter (GIN put from a kernel), VerbsWriter (CPU posts the
 writes when the GPU flags a layer as ready)."""
 import numpy as np
@@ -65,7 +65,7 @@ class WriterBase:
         pass
 
     def end(self, stamps):
-        """Called after the scores' stamp; must leave stamps[2] = durable time and rejoin the side stream."""
+        """Called after the output's stamp; must leave stamps[2] = durable time and rejoin the side stream."""
         torch.ops.aten.copy_(stamps[2:3], stamps[1:2])
 
     def readback(self, ext):
