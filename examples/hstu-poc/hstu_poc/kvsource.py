@@ -256,6 +256,17 @@ class RemoteKV(LocalKV, P4):
         """Rows for a sampled data check of the current request (see setup)."""
         return self._samples[self.cur]
 
+    tile_rows = 0
+    max_tile_wrs = 2048   # per request: keeps the reads within the send and completion queues
+
+    def _tile_setup(self, b):
+        """Per-tile waits: chunk rows (>= 128, sized so a request posts at most max_tile_wrs reads) and steps."""
+        L = max(b.hist)
+        rows = max(int(os.environ.get("HPOC_TILE_ROWS", 128)), -(-self.cfg.layers * 2 * b.B * L // self.max_tile_wrs))
+        self.tile_rows = -(-rows // 64) * 64
+        self.tile_bytes = self.tile_rows * self.cfg.hd * 2
+        self.tile_steps = -(-L // self.tile_rows)
+
     def _zc_setup(self):
         self.nseg = int(self.tables[0].shape[0])
         self.segs_all = torch.cat([t.to(self.dev) for t in self.tables]).contiguous()
@@ -271,16 +282,22 @@ class RemoteKV(LocalKV, P4):
             self.segs.copy_(self.dev_tables[self.cur], non_blocking=True)
 
     def _gdaki_start(self):
-        """start() of the GDAKI sources (raw, GIN): post every get, plus the fused-like poller."""
-        if self.slow_ns and not self.side_post:
+        """start() of the GDAKI sources (raw, GIN): post every get, plus the fused-like poller. Per-tile waits: the
+        post kernel itself publishes the chunks landed (it polls until the request has landed), so it always runs on
+        a side branch."""
+        side_post = self.side_post or self.p4 == "tile"
+        if self.slow_ns and not side_post:
             self.E.spin(self.slow_ns)
         if self.fused_like:
             self.E.seq_inc(self.seq_dev)
+        if self.p4 == "tile":
+            self.tsteps.zero_()          # chunks landed per layer, published by the post kernel
         if self.post_outside:
+            assert self.p4 != "tile", "per-tile waits are not supported with posting outside the graph (serving)"
             if self.fused_like:
                 self.p4_fork(self._poll)
             return
-        if self.side_post:
+        if side_post:
             def side():
                 if self.slow_ns:
                     self.E.spin(self.slow_ns)   # a slow producer delays the post only; the compute runs ahead
@@ -335,6 +352,10 @@ class GinKVSource(RemoteKV):
         self._post_ev = torch.cuda.Event()
         if self.zc:
             self._zc_setup()
+        if self.p4 == "tile":
+            self._tile_setup(b)
+            self.tickets_t = torch.zeros(self.cfg.layers * self.tile_steps * self.nc, 2, dtype=torch.int64,
+                                         device=self.dev)
 
     def pre_replay(self, i):
         self._select(i)
@@ -343,10 +364,15 @@ class GinKVSource(RemoteKV):
         self._gdaki_start()
 
     def _poll(self):
-        self.g.poll(self.tickets, self.cfg.layers, 0, self.nc, self.seq_dev, self.ready)
+        if self.p4 != "tile":   # tile: the post kernel itself publishes the progress
+            self.g.poll(self.tickets, self.cfg.layers, 0, self.nc, self.seq_dev, self.ready)
 
     def post(self):
-        if self.zc:
+        if self.p4 == "tile":
+            kw = dict(var=self.var_host, var_stride=self.nseg) if self.zc else {}
+            self.g.post_gets_tiled(self.segs_all if self.zc else self.segs, self.lp, self.tickets_t, self.peer, 0,
+                                   self.nc, self.tile_steps, self.tile_bytes, self.tsteps, **kw)
+        elif self.zc:
             self.g.post_gets(self.segs_all, self.lp, self.tickets, self.peer, ctx0=0, n_ctx=self.nc,
                              var=self.var_host, var_stride=self.nseg)
         else:
@@ -375,17 +401,11 @@ class VerbsKVSource(RemoteKV):
 
     _engine_seq = {}   # id(engine) -> last seq posted: the worker's flags hold the last finished seq of ANY source
 
-    tile_rows = 0
-    max_tile_wrs = 2048   # per request: keeps the reads within the send queues and the completion queue
-
     def setup(self, b):
         super().setup(b)
         self.v.wait_idle()
-        if self.p4 == "tile":   # chunk rows: >= 128, sized so a request posts at most max_tile_wrs reads
-            L = max(b.hist)
-            rows = max(int(os.environ.get("HPOC_TILE_ROWS", 128)), -(-self.cfg.layers * 2 * b.B * L // self.max_tile_wrs))
-            self.tile_rows = -(-rows // 64) * 64
-            self.tile_bytes = self.tile_rows * self.cfg.hd * 2
+        if self.p4 == "tile":
+            self._tile_setup(b)
         # continue the engine's sequence, so this source's waits (flags[l] >= seq) cannot pass on an earlier
         # source's larger flags (that let a new cell's first requests run before their data had landed)
         self.seq = VerbsKVSource._engine_seq.get(id(self.v), 0)
@@ -447,6 +467,10 @@ class RawGdakiSource(RemoteKV):
         self._post_ev = torch.cuda.Event()
         if self.zc:
             self._zc_setup()
+        if self.p4 == "tile":
+            self._tile_setup(b)
+            self.tickets_t = torch.zeros(self.cfg.layers * self.tile_steps * self.r.nqp(), dtype=torch.int64,
+                                         device=self.dev)
 
     def pre_replay(self, i):
         self._select(i)
@@ -455,10 +479,15 @@ class RawGdakiSource(RemoteKV):
         self._gdaki_start()
 
     def _poll(self):
-        self.r.poll(self.tickets, self.cfg.layers, self.seq_dev, self.ready)
+        if self.p4 != "tile":   # tile: the post kernel itself publishes the progress
+            self.r.poll(self.tickets, self.cfg.layers, self.seq_dev, self.ready)
 
     def post(self):
-        if self.zc:
+        if self.p4 == "tile":
+            kw = dict(var=self.var_host, var_stride=self.nseg) if self.zc else {}
+            self.r.post_gets_tiled(self.segs_all if self.zc else self.segs, self.lp, self.tickets_t, self.tile_steps,
+                                   self.tile_bytes, self.tsteps, **kw)
+        elif self.zc:
             self.r.post_gets(self.segs_all, self.lp, self.tickets, var=self.var_host, var_stride=self.nseg)
         else:
             self.r.post_gets(self.segs, self.lp, self.tickets)

@@ -5,17 +5,18 @@
 #   tools/p2t_grid.sh JOB small|full recompute                        (recompute + local on GPU 7 of node A)
 # mode = transport.level.variant: transport verbs|raw|gdaki|proxy; level b (basic), b2 (basic again: run-to-run
 # noise), t (--tuned: every option), zc (GDAKI zero-copy descriptor only), spin (verbs spinning worker only),
-# ac (GIN adaptive contexts only); variant 5a|pdl|pdl_early|fused|tile (P4 wait variants; tile = per-tile waits,
-# CPU verbs only). Builds: ext_v9 / attn_v2 (the per-tile code); the first P2t runs used ext_v8 / attn.
+# ac (GIN adaptive contexts only); variant 5a|pdl|pdl_early|fused|tile (P4 wait variants; tile = per-tile waits on
+# every mechanism). Builds: ext_v13 / attn_v2 (raw GDAKI per-tile); ext_v12 (GIN per-tile); earlier P2t runs used ext_v8 / attn
+# and ext_v9 / attn_v2 (CPU verbs per-tile).
 set -u
 J=$1; GRIDN=$2; MODES=$3
 D=/lustre/fsw/coreai_devtech_all/junyiq
 POC=$D/hstu-kv-rdma/repos/recsys-examples/examples/hstu-poc
-R=$D/hstu-kv-rdma/results/p2t
+R=${P2T_OUT:-$D/hstu-kv-rdma/results/p2t}   # P2T_OUT: e.g. results/p2t_ctl for same-allocation controls
 S=$POC/scripts/srun2.sh
 mkdir -p $R
 cd "$POC"
-export HPOC_BUILD_DIR=${HPOC_BUILD_DIR:-$POC/build/ext_v9}
+export HPOC_BUILD_DIR=${HPOC_BUILD_DIR:-$POC/build/ext_v13}
 AB=${HPOC_ATTN_BUILD_DIR:-$POC/build/attn_v2}
 case $GRIDN in
   small) CELLS=("--configs S,M,L --L 512,1024,1536,2048,3072,4096 --B 1,2,4,8 --budget-s 1.0 --min-iters 50 --max-iters 1000") ;;

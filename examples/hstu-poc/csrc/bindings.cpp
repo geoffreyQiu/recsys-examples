@@ -93,6 +93,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            [](GinKV& g, torch::Tensor tickets, int n_layers, int ctx0, int n_ctx, torch::Tensor seq, torch::Tensor ready) {
              g.poll(tickets.data_ptr(), n_layers, ctx0, n_ctx, (const uint32_t*)seq.data_ptr(), (uint32_t*)ready.data_ptr(), cur());
            })
+      .def("post_gets_tiled",
+           [](GinKV& g, torch::Tensor segs, torch::Tensor layer_ptr, torch::Tensor tickets, int peer, int ctx0, int n_ctx,
+              int max_steps, int64_t tile_bytes, torch::Tensor tsteps, std::optional<torch::Tensor> var,
+              int64_t var_stride) {
+             need_cuda(segs, "segs");
+             need_cuda(layer_ptr, "layer_ptr");
+             need_cuda(tickets, "tickets");
+             need_cuda(tsteps, "tsteps");
+             const int64_t nl = layer_ptr.numel() - 1;
+             TORCH_CHECK(tickets.numel() * tickets.element_size() >= 16 * n_ctx * nl * max_steps, "tickets too small");
+             TORCH_CHECK(n_ctx >= 1 && n_ctx <= 32 && max_steps >= 1 && tile_bytes > 0, "bad tiled arguments");
+             g.post_gets_tiled((const Seg*)segs.data_ptr(), layer_ptr.data_ptr<int>(), (int)nl, tickets.data_ptr(), peer,
+                               ctx0, n_ctx, max_steps, tile_bytes, (int*)tsteps.data_ptr(), cur(), host_index_ptr(var),
+                               var_stride);
+           },
+           py::arg("segs"), py::arg("layer_ptr"), py::arg("tickets"), py::arg("peer"), py::arg("ctx0"), py::arg("n_ctx"),
+           py::arg("max_steps"), py::arg("tile_bytes"), py::arg("tsteps"), py::arg("var") = py::none(),
+           py::arg("var_stride") = 0)
       .def("put_multi",
            [](GinKV& g, torch::Tensor segs, int peer, int ctx0, int n_ctx) {
              need_cuda(segs, "segs");
@@ -228,6 +246,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            [](RawGdaki& r, torch::Tensor tickets, int n_layers, torch::Tensor seq, torch::Tensor ready) {
              r.poll((const uint64_t*)tickets.data_ptr(), n_layers, (const uint32_t*)seq.data_ptr(), (uint32_t*)ready.data_ptr(), cur());
            })
+      .def("post_gets_tiled",
+           [](RawGdaki& r, torch::Tensor segs, torch::Tensor layer_ptr, torch::Tensor tickets, int max_steps,
+              int64_t tile_bytes, torch::Tensor tsteps, std::optional<torch::Tensor> var, int64_t var_stride) {
+             need_cuda(segs, "segs");
+             need_cuda(layer_ptr, "layer_ptr");
+             need_cuda(tickets, "tickets");
+             need_cuda(tsteps, "tsteps");
+             const int64_t nl = layer_ptr.numel() - 1;
+             TORCH_CHECK(tickets.numel() >= (int64_t)r.nqp() * nl * max_steps, "tickets too small");
+             TORCH_CHECK(max_steps >= 1 && tile_bytes > 0, "bad tiled arguments");
+             r.post_gets_tiled((const Seg*)segs.data_ptr(), layer_ptr.data_ptr<int>(), (int)nl, (uint64_t*)tickets.data_ptr(),
+                               max_steps, tile_bytes, (int*)tsteps.data_ptr(), cur(), host_index_ptr(var), var_stride);
+           },
+           py::arg("segs"), py::arg("layer_ptr"), py::arg("tickets"), py::arg("max_steps"), py::arg("tile_bytes"),
+           py::arg("tsteps"), py::arg("var") = py::none(), py::arg("var_stride") = 0)
       .def("destroy", &RawGdaki::destroy);
   m.def("seq_inc", [](torch::Tensor seq) { seq_inc_gpu((uint32_t*)seq.data_ptr(), cur()); });
   m.def("relay_tiles", [](int64_t prog, int64_t host_flags, int n_layers, torch::Tensor seq, torch::Tensor tsteps) {

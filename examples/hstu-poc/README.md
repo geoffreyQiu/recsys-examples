@@ -32,10 +32,12 @@
 hstu-poc/
   README.md
   csrc/          C++/CUDA extension (JIT-built by hstu_poc/ext.py into build/ext*)
-    gin_kv.*       GIN transport (NCCL 2.32.7 device API): split-phase gets over N contexts, puts, fence, pollers
+    gin_kv.*       GIN transport (NCCL 2.32.7 device API): split-phase gets over N contexts, puts, fence, pollers;
+                   chunked gets for per-tile waits (a flush ticket per chunk step; the post kernel publishes progress)
     verbs_kv.*     CPU verbs: RC QPs, worker thread (optionally spinning; optional inline posting), per-layer
                    host-mapped flags, tiled reads with per-layer chunk progress, gated writes, GPU-less store side
-    raw_gdaki.*    raw GDAKI: DOCA GPUNetIO (NCCL's bundled BSD-3 copy, build/doca/libhpoc_doca.so) GPU-side QPs
+    raw_gdaki.*    raw GDAKI: DOCA GPUNetIO (NCCL's bundled BSD-3 copy, build/doca/libhpoc_doca.so) GPU-side QPs;
+                   per-tile waits: batched WQE posting per layer and QP, the post kernel then publishes chunk progress
     kvutil.*       data pattern fill/check, spin/stamp/seq/flag kernels, SM hog, green-context streams
     bindings.cpp   pybind11 module hpoc_ext
   attn/          copy of FBGEMM's Hopper HSTU forward kernel with the P4 wait hook (op namespace hpoc_attn)
@@ -44,7 +46,7 @@ hstu-poc/
     kvsource.py    KV sources: local hit, host H2D, GIN, CPU verbs, raw GDAKI; latency options (GDAKI zero-copy
                    descriptor and side-branch posting, GIN adaptive contexts) and P4 wait variants (wait kernel, pdl,
                    pdl_early = trigger-and-exit + PDL attention spinning on a ready flag, fused, tile = per-tile waits
-                   for CPU verbs: chunked reads posted from the history's end, per-K-tile wait in the attention)
+                   on every transport: chunked reads posted from the history's end, per-K-tile wait in the attention)
     writers.py     workload W writers (GIN, CPU verbs) with a durability fence
     serving2.py    overlap-optimized servers (P5s/P6s): fetch posts each request into a ring of KV slots on arrival,
                    batches landed requests, one graph per batch size re-pointed at any run of slots; recompute with
@@ -67,7 +69,7 @@ hstu-poc/
     p6.py           transfer under SM contention / CPU contention
   scripts/srun2.sh  2-node launcher (inference ranks on node A, store ranks on node B)
   tools/           analysis and campaign scripts behind docs/results.md (plots need matplotlib): make_figs.sh
-                   (every figure), p2t_report.py, p2t_to_p2c.py, report_figs.py, p2c_breakeven.py, p5s_report.py,
+                   (every figure), p2t_report.py, p2t_ctl.py, p2t_to_p2c.py, report_figs.py, p2c_breakeven.py, p5s_report.py,
                    p5x_report.py, p6s_report.py, p3_report.py, p5_eight.py, campaigns (p2t_grid.sh, p5s_*.sh,
                    p5x_runs.sh, p6s_*.sh, ...), numa_check.cu
   docs/            results.md (final report), figs/, archive/ (earlier revisions)

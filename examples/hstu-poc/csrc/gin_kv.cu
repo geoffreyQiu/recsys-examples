@@ -106,6 +106,54 @@ __global__ void gin_poll_kernel(ncclDevComm dcomm, int ctx0, int n_ctx, ncclGinR
   }
 }
 
+// Per-tile waits (see raw_post_tiled_kernel): chunk k of segment j of a layer goes to context (j + k) % n_ctx; after
+// each step every warp takes a flush ticket for its context: tickets[(l * max_steps + k) * n_ctx + w].
+// The same kernel then waits for the flush tickets and publishes tsteps (resident from the request's start, see
+// raw_post_tiled_kernel).
+__global__ void gin_post_tiled_kernel(ncclDevComm dcomm, ncclWindow_t win, int ctx0, int n_ctx, int peer,
+                                      const Seg* segs, const int* layer_ptr, int n_layers, int max_steps, long long tb,
+                                      ncclGinRequest_t* tickets, const volatile int* var, long long var_stride,
+                                      int* tsteps) {
+  __shared__ long long s_off;
+  if (threadIdx.x == 0) s_off = var ? (long long)(*var) * var_stride : 0;
+  __syncthreads();
+  segs += s_off;
+  const int w = threadIdx.x / 32, lane = threadIdx.x % 32;
+  ncclGin gin(dcomm, ctx0 + w);
+  ncclTeam team = ncclTeamWorld(dcomm);
+  for (int l = 0; l < n_layers; ++l) {
+    const int s0 = layer_ptr[l], n = layer_ptr[l + 1] - s0;
+    for (int k = 0; k < max_steps; ++k) {
+      const long long done = (long long)k * tb;
+      for (int j = ((w - k) % n_ctx + n_ctx) % n_ctx + n_ctx * lane; j < n; j += n_ctx * 32) {
+        const Seg sg = segs[s0 + j];
+        if (sg.bytes <= done) continue;
+        const long long len = min(tb, (long long)sg.bytes - done);
+        const long long off = (long long)sg.bytes - done - len;
+        gin.get(team, peer, win, (size_t)(sg.remote + off), win, (size_t)(sg.local + off), (size_t)len,
+                ncclCoopThread{}, ncclGin_None{}, ncclGinOptFlagsDefault, ncclGin_SegmentMixed{});
+      }
+      __syncwarp();   // the warp's gets of step k are posted before its ticket is taken
+      if (lane == 0) gin.flushAsync(team, peer, &tickets[((long long)l * max_steps + k) * n_ctx + w]);
+      __syncwarp();
+    }
+  }
+  __syncthreads();   // every context's tickets are written
+  if (threadIdx.x != 0 || tsteps == nullptr) return;
+  for (int l = 0; l < n_layers; ++l) {
+    for (int k = 0; k < max_steps; ++k) {
+      for (int c = 0; c < n_ctx; ++c) {
+        ncclGin g(dcomm, ctx0 + c);
+        g.wait(tickets[((long long)l * max_steps + k) * n_ctx + c]);
+      }
+      __threadfence();
+      asm volatile("st.release.gpu.global.s32 [%0], %1;" ::"l"(tsteps + l), "r"(k + 1) : "memory");
+    }
+    __threadfence();
+    asm volatile("st.release.gpu.global.s32 [%0], %1;" ::"l"(tsteps + l), "r"(0x7fffffff) : "memory");
+  }
+}
+
 __global__ void gin_put_kernel(ncclDevComm dcomm, ncclWindow_t win, int ctx, int peer, const Seg* segs, int n,
                                ncclGinRequest_t* ticket) {
   ncclGin gin(dcomm, ctx);
@@ -333,6 +381,15 @@ void GinKV::wait_layer(void* tickets, int layer, int ctx0, int n_ctx, uint64_t* 
 void GinKV::poll(void* tickets, int n_layers, int ctx0, int n_ctx, const uint32_t* seq, uint32_t* ready,
                  cudaStream_t s) {
   gin_poll_kernel<<<1, 1, 0, s>>>(p_->dcomm, ctx0, n_ctx, (ncclGinRequest_t*)tickets, n_layers, seq, ready);
+  CUDA_OK(cudaGetLastError());
+}
+
+void GinKV::post_gets_tiled(const Seg* segs, const int* layer_ptr, int n_layers, void* tickets, int peer, int ctx0,
+                            int n_ctx, int max_steps, int64_t tile_bytes, int* tsteps, cudaStream_t s,
+                            const int* var, int64_t var_stride) {
+  gin_post_tiled_kernel<<<1, 32 * n_ctx, 0, s>>>(p_->dcomm, p_->win, ctx0, n_ctx, peer, segs, layer_ptr, n_layers,
+                                                 max_steps, (long long)tile_bytes, (ncclGinRequest_t*)tickets, var,
+                                                 (long long)var_stride, tsteps);
   CUDA_OK(cudaGetLastError());
 }
 

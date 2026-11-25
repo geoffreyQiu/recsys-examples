@@ -28,6 +28,12 @@ class RawGdaki {
                  cudaStream_t s, const int* var = nullptr, int64_t var_stride = 0);
   void wait_layer(const uint64_t* tickets, int layer, uint64_t* t_done, cudaStream_t s);
   void poll(const uint64_t* tickets, int n_layers, const uint32_t* seq, uint32_t* ready, cudaStream_t s);   // P4 fused
+  // per-tile waits: chunked gets posted from each segment's end; tickets [n_layers * max_steps * nqp]; the poller
+  // publishes tsteps[l] = steps landed (0x7fffffff when the layer is complete)
+  // (the post kernel also polls the completions and publishes tsteps, see raw_post_tiled_kernel)
+  void post_gets_tiled(const Seg* segs, const int* layer_ptr, int n_layers, uint64_t* tickets, int max_steps,
+                       int64_t tile_bytes, int* tsteps, cudaStream_t s, const int* var = nullptr,
+                       int64_t var_stride = 0);
   void destroy();
 
  private:

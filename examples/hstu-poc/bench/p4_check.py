@@ -79,7 +79,7 @@ def main():
         items = torch.randint(0, cfg.n_items, (b.total_q,), device="cuda", generator=torch.Generator("cuda").manual_seed(5))
         out = {}
         with torch.inference_mode():
-            for variant in ["5a", "copy", "pdl", "fused", "pdl_early"] + (["tile"] if a.transport == "verbs" else []) + ["nowait"]:
+            for variant in ["5a", "copy", "pdl", "fused", "pdl_early", "tile", "nowait"]:
                 slow = 0 if variant == "5a" else int(a.slow_ms * 1e6)
                 src = make(cfg).p4_init("copy" if variant == "nowait" else variant, slow_ns=slow)
                 if variant == "nowait":

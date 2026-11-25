@@ -9,12 +9,17 @@ The study asked whether an HSTU ranking request should fetch its user's cached h
 store over RDMA (one 400 Gb/s NIC per H100) or recompute them, and how fast the RDMA path can be made, for one
 request at a time (plain-run latency) and for a server under load (throughput).
 
-- **Fastest RDMA implementation measured: CPU verbs with a spinning worker, inline posting and per-tile waits.** The
-  history is posted in 128-row chunks from its end and the attention waits per K tile, so each layer computes while it
-  is still arriving. It is the fastest at nearly every grid point. Per-tile waits are built only for CPU verbs so far;
-  without a CPU core, the fastest implementation measured is raw GDAKI with the fused wait. Against basic CPU verbs
-  the fastest gains up to 11% (S), 4% (M) and 2.5% (L) per request, most for single users; above ~1 ms per request
-  every implementation of every mechanism transfers at line rate.
+- **Fastest RDMA implementation: per-tile waits, posted by CPU verbs with a spinning worker and inline posting, or
+  without a CPU core by raw GDAKI with batched, warp-parallel posting.** The history is posted in 128-row chunks from
+  its end and the attention waits per K tile, so each layer computes while it is still arriving. Per-tile waits were
+  built and measured on all four mechanisms.
+  - CPU verbs is the fastest or within noise of it at every grid point except the smallest requests (0.5k–1k
+    history, one or two users), where raw GDAKI is up to 3% faster.
+  - Raw GDAKI per-tile otherwise ties CPU verbs (at 140 of the 142 points beyond 4k history or 8 users) or trails it,
+    by up to 6% on small S requests and 2.3% on M and L.
+  - GIN pays a flush per chunk step and gains from per-tile waits only from four users per request.
+  - Against basic CPU verbs the fastest gains up to 11% (S), 4% (M) and 2.5% (L) per request, most for single users;
+    above ~1 ms per request every mechanism transfers at line rate.
 - **Per-request break-even: ~13–14k history tokens for M and ~9k for L** (S: 10–13k). It is lowest for single users
   (M 12.8k, L 8.5k, S 9.9k) and equals the throughput break-even from B ≈ 8 (M 14.4k, L 9.7k, S 12.8k). The
   optimizations lowered the single-user break-even by 0.5–5k tokens; it is now within 0.3k tokens of what a
@@ -29,10 +34,10 @@ request at a time (plain-run latency) and for a server under load (throughput).
   free of the other job (green context) keeps the fetch server's latency.
 - **What would move the break-even further is outside the rules**: more bandwidth per GPU (a 1.5× faster NIC: ~5k for
   M, estimate), fewer bytes per user (FP8 K/V), or a hybrid server that uses both the NIC and the GPU (P7).
-- **Not yet at its limit: the latency of small requests.** Below ~30 MB per request (e.g. M at 1k for one user, S up
-  to ~4k) the fastest implementation is still a median 13% above the ideal bound. Per-tile waits are not built yet for
-  the GDAKI mechanisms, which post faster than CPU verbs on the smallest requests, so the fastest small-request and
-  no-CPU implementations are not established.
+- **Small requests stay above the ideal bound.** Below ~30 MB per request (e.g. S up to ~4k for one user) the
+  fastest implementation is a median 13% above the ideal bound (perfect overlap of transfer and compute). That bound
+  ignores the compute that must wait for the first chunk or follow the last one. Per-tile waits on the GDAKI
+  mechanisms lowered this gap only on the smallest single-user requests.
 
 ## 1. Goal, rules and expectations
 
@@ -146,7 +151,8 @@ graph.
 | Waiting | PDL | the attention is launched with programmatic dependent launch behind the wait kernel, which triggers it on entry; the attention's launch and prologue overlap the wait | all |
 | Waiting | PDL, early release | the first kernel only triggers the dependent launch and exits (its CTA and SM are free at once); the PDL-launched attention takes over the data dependency and spins on the layer's ready word before its first K/V load | all |
 | Waiting | fused wait | no per-layer kernel: a 1-thread poller on a side branch publishes per-layer ready words and the attention kernel spins on its layer's word before its first K/V load | all |
-| Waiting | per-tile wait | the history is posted in chunks of 128 rows from its end backwards (the attention consumes key blocks last to first); the CPU worker publishes per layer how many chunks have landed, a 1-thread relay copies that to a device word, and the attention's load warp waits before each K tile only for the chunks that tile needs: a layer's attention runs while the layer is still arriving | CPU verbs |
+| Waiting | per-tile wait | the history is posted in chunks of 128 rows from its end backwards (the attention consumes key blocks last to first); per layer, the number of chunks landed is published to a device word, and the attention's load warp waits before each K tile only for the chunks that tile needs: a layer's attention runs while the layer is still arriving. CPU verbs: the worker counts completions, a 1-thread relay copies the count to the GPU. Raw GDAKI and GIN: a completion ticket per chunk step and queue pair (GIN: a flush per step and context); once everything is posted, the post kernel itself waits for the tickets in order and publishes the count | all |
+| Posting | batched, warp-parallel WQE posting | for per-tile waits on raw GDAKI: per layer and queue pair, the queue pair's warp reserves the slots of all the layer's chunk reads at once, writes the WQEs in parallel (one per lane), marks them ready and rings one doorbell, instead of one DOCA `get` (slot reservation, ready mark, doorbell) per chunk | raw GDAKI |
 | Serving | overlapped requests | a request's transfer is posted on arrival into a ring of per-request KV slots; batches are formed from landed requests; one graph per batch size, re-pointed per batch; two batches queued on the GPU | all |
 | Serving | fused wait, spinning worker | as above, inside every batch graph | all |
 
@@ -162,10 +168,10 @@ Considered and not pursued:
 - **Queue-pair and chunk tuning**: every mechanism already runs at line rate from ~1 ms per request; below that, the
   cost is posting and waiting, which the optimizations above address (per-tile chunks of 64 rows gave the same
   latency as 128).
-
-Not built yet: **per-tile waits for the GDAKI mechanisms** (raw GDAKI, GIN-GDAKI, GIN-Proxy). They need the post kernel
-to post the chunks with a completion ticket each and a GPU poller that publishes chunk progress; the attention side is
-shared with CPU verbs. See §9.
+- **Aggregating GIN's chunk reads** (`ncclGinOptFlagsAggregateRequests`, so that only each step's flush submits): the
+  flush does not submit aggregated reads (the request never completed), and with one user each step has a single read
+  per context to aggregate anyway. NCCL's GIN API has no completion counter for reads, so per-step progress on GIN
+  costs a flush per step.
 
 ## 4. Plain-run latency
 
@@ -213,22 +219,58 @@ fetch is faster. Dots: latency break-even per batch size. Dashed line: throughpu
 
 ![Fastest implementation](figs/best-impl.png)
 
-*For every grid point with history ≤ 4k and B ≤ 8, where all 25 implementations were measured, the fastest one and
-its gain over basic CPU verbs; '≈ basic' = within the run-to-run noise of a repeated basic run (0.95% at the 95th
-percentile). Beyond that range, the basic, fused-wait and per-tile implementations were measured.*
+*Per grid point, the fastest implementation (left) and the fastest that needs no CPU core (right: raw GDAKI or
+GIN-GDAKI), with its latency gain over basic CPU verbs; '≈ basic' = within the run-to-run noise of a repeated basic run
+(0.95% at the 95th percentile). Up to 4k history and B = 8 all 27 implementations were measured; elsewhere the basic,
+fused-wait and per-tile implementations of each mechanism. The modes were measured in several allocations (different
+GPU/NIC pairs); the table below compares the per-tile implementations on one pair.*
 
 ![Optimizations](figs/opt-ablation.png)
 
-*Every implementation on the smallest requests (0.5k history, one user), relative to basic CPU verbs.*
+*Every implementation on the smallest requests (0.5k history, one user), relative to basic CPU verbs. The per-tile
+rows come from other GPU/NIC pairs than the rest, which shifts them by up to ~3% on these requests; the table below
+compares them on one pair.*
 
-- **The fastest implementation is CPU verbs with every option and per-tile waits**: the fastest or within noise of it
-  at 68 of 72 grid points up to 4k and B ≤ 8, and at every longer single-user request. Raw GDAKI with every option and
-  the fused wait is the fastest at 0.5k for single users of S and M, and the fastest implementation that needs no CPU
-  core.
-- **Gain over basic CPU verbs**: up to 10.6% for S, 3.8% for M and 2.5% for L on single-user requests, shrinking with
-  the batch size (B = 8: up to 3% for S, within noise for M and L). Unlike the other options, per-tile waits keep their
-  gain at long histories: against the fused wait they cut 8–9% from every single-user S request up to 32k, 3.1% for M
-  and 1.6% for L.
+- **Per-tile waits are the fastest wait on CPU verbs and raw GDAKI.** CPU verbs per-tile is the fastest or within
+  noise of the fastest at 68 of 72 grid points up to 4k (B ≤ 8) and at all 142 points beyond (history ≥ 6k or
+  B ≥ 16). Its gain over basic CPU verbs is up to 10.6% for S, 4.0% for M and 2.5% for L on single-user requests,
+  falling with the batch size (B = 8: up to 2.8% for S, within noise for M and L; B ≥ 16: within noise). Unlike the
+  other options, per-tile waits keep their gain at long histories: against the fused wait they cut 8–9% from every
+  single-user S request up to 32k, 3.1% for M and 1.6% for L.
+- **Without a CPU core, raw GDAKI per-tile is the fastest**; from four users GIN-GDAKI per-tile is within noise of
+  it. On one GPU/NIC pair, raw GDAKI per-tile beats CPU verbs per-tile on the smallest S requests (0.5k: −3.2% with
+  one user, −1.4% with two). Elsewhere it ties (47 of 72 points up to 4k; 140 of 142 beyond) or trails, by up to 5.9%
+  for S (most with one user at 1–2k) and by at most 2.3% for M and L.
+- **GIN gains from per-tile waits only with several users per request.** NCCL's GIN API has no completion counter
+  for reads, so per-step progress costs a flush per step and context. With one or two users each step has one read
+  per context, and the request takes up to 2.3× its line-rate transfer time (GIN-GDAKI, S, one user, 4k). From four
+  users GIN-GDAKI per-tile ties CPU verbs per-tile. GIN-Proxy per-tile is worse still: its proxy thread handles every
+  read and every flush.
+
+| Same GPU/NIC pair; history 0.5k–4k, B = 1–8 (72 points) | Median | Range | First faster / tie / slower |
+|---|---|---|---|
+| raw GDAKI per-tile vs CPU verbs per-tile | +0.5% | −3.2% (S, 1 user, 0.5k) … +5.9% (S, 1 user, 1.5k) | 2 / 47 / 23 |
+| GIN-GDAKI per-tile vs CPU verbs per-tile | +0.6% | 0.0% … +107% (S, 1 user, 4k) | 0 / 43 / 29 |
+| GIN-Proxy per-tile vs CPU verbs per-tile | +17% | +0.1% … +214% (S, 1 user, 4k) | 0 / 11 / 61 |
+| raw GDAKI per-tile vs raw GDAKI fused wait | −1.3% | −7.7% (S, 1 user, 4k) … +0.4% (M, 1 user, 0.5k) | 42 / 30 / 0 |
+| GIN-GDAKI per-tile vs GIN-GDAKI fused wait | −0.5% | −2.7% (S, 4 users, 1.5k) … +85% (S, 1 user, 4k) | 24 / 28 / 20 |
+| GIN-Proxy per-tile vs GIN-Proxy fused wait | +15% | −1.2% (M, 4 users, 0.5k) … +173% (S, 1 user, 4k) | 1 / 19 / 52 |
+| raw GDAKI per-tile: batched posting vs one DOCA `get` per chunk | +0.2% | −16.6% (S, 1 user, 1.5k) … +1.6% (S, 2 users, 4k) | 12 / 46 / 14 |
+| raw GDAKI per-tile: warp-parallel vs one-thread batches (18 points, 2 runs each) | −0.1% | −1.0% (S, 1 user, 4k) … +0.7% (M, 1 user, 0.5k) | 1 / 17 / 0 |
+
+*Tie = within the run-to-run noise (0.95%). CPU verbs per-tile measured on two pairs differs by a median 0.1% (at
+most 3.3%).*
+
+- **Posting is on raw GDAKI's critical path**: the NIC starts on a layer only once its reads are written and the
+  doorbell rung. One slot reservation, ready mark and doorbell per layer and queue pair, instead of one DOCA `get` per
+  chunk, saves up to 17% (S, one user, 1.5k) and is neutral on larger requests. Writing each batch with the queue
+  pair's 32 lanes instead of one thread saves up to 1% more (S, one user, 4k; within noise elsewhere). Other changes to
+  raw GDAKI per-tile, same pair (S, M, L with 1 and 8 users, 0.5k–4k):
+  - a doorbell every 4 reads instead of one per layer: up to 2.5% faster in a variant with a slower posting loop
+    (S, 8 users); not measured with warp-parallel posting;
+  - a publisher that tests the step tickets without blocking and fences once per pass instead of once per ticket:
+    no gain (within ±1%);
+  - round-robin placement of the chunks over the queue pairs, as CPU verbs does: 0.2–4.2% slower.
 - **The options matter most for the mechanisms that were slow.** On single-user requests at 0.5k, basic GIN-Proxy is
   18–26% slower than basic CPU verbs and basic GIN-GDAKI 5–17%. With every option and the fused wait, GIN-Proxy is
   within 1.5% of basic CPU verbs and GIN-GDAKI up to 6% faster. For GIN, adaptive contexts and removing the per-layer
@@ -238,12 +280,12 @@ percentile). Beyond that range, the basic, fused-wait and per-tile implementatio
 | Mechanism | PDL | PDL, early release | Fused wait | Per-tile wait |
 |---|---|---|---|---|
 | CPU verbs | −1.0 … +0.6% | −2.7 … +1.4% | −4.8 … 0.0% | −9.3 … −0.3% (median −1.3%) |
-| raw GDAKI | −0.3 … +0.4% | −1.0 … +2.4% | −4.1 … +0.2% | – |
-| GIN-GDAKI | −0.1 … +0.6% | −5.4 … +0.3% | −7.7 … +1.2% | – |
-| GIN-Proxy | −0.8 … +0.9% | −15.1 … +0.4% | −16.9 … +0.8% | – |
+| raw GDAKI | −0.3 … +0.4% | −1.0 … +2.4% | −4.1 … +0.2% | −7.6 … −0.2% (median −1.2%) |
+| GIN-GDAKI | −0.1 … +0.6% | −5.4 … +0.3% | −7.7 … +1.2% | −2.5 … +86% (median −0.4%) |
+| GIN-Proxy | −0.8 … +0.9% | −15.1 … +0.4% | −16.9 … +0.8% | −1.6 … +175% (median +12.8%) |
 
   *History ≤ 4k, B ≤ 8, S/M/L. The medians of PDL, early release and the fused wait are 0.0 ± 0.1%: their gains are
-  on requests under ~1 ms.*
+  on requests under ~1 ms. The per-tile column compares runs from different allocations.*
 
   - **PDL changes nothing**: it overlaps the attention's launch with a wait kernel that does no work.
   - **Early release helps only where the wait itself is slow** (GIN): the trigger kernel exits at once and the
@@ -251,7 +293,7 @@ percentile). Beyond that range, the basic, fused-wait and per-tile implementatio
   - **The fused wait removes the per-layer kernels**, which pays on requests under ~1 ms.
   - **Per-tile waits change what can overlap**: a layer's attention runs while the layer is still arriving, so only
     the compute after the last tile remains exposed. This pays wherever a layer's compute is not negligible against
-    its transfer, at every history length.
+    its transfer, at every history length, as long as tracking the chunks costs little (not on GIN with few users).
 - **CUDA graphs are essential for small requests**: launching every kernel from the CPU adds up to 0.4 ms per request
   (+162% for raw GDAKI at 0.5k).
 
@@ -276,8 +318,8 @@ overlap of compute and transfer.*
   RDMA at line rate), the break-even would be 12.5k for M and 8.3k for L at B = 1 (measured 12.8k and 8.5k), and within
   0.3k of the measured one at every batch size for M and L and from B = 4 up for S. The exception is S with 1–2 users
   (7.3k and 11.4k ideal vs 9.9k and 12.1k measured), whose 3-layer, sub-millisecond requests are dominated by compute
-  that cannot overlap the transfer. For the break-even, the remaining limit is NIC bandwidth against GPU compute; for
-  the latency of small requests it is not (see above, and the GDAKI mechanisms without per-tile waits, §3).
+  that cannot overlap the transfer. For the break-even, the remaining limit is NIC bandwidth against GPU compute.
+  Small requests keep the gap above with the per-tile waits of every mechanism.
 
 ## 5. Serving throughput
 
@@ -379,7 +421,10 @@ Basic CPU verbs, CPU verbs with the spinning worker and the fused wait, and raw 
 same capacity at every target where all were measured (M, sustained: 1,456 / 1,457 / 1,464 users/s at 1k, 362 at
 4k, 90 at 16k; L: 728 / 731 at 1k, 184 at 4k, 46 at 16k). In serving the NIC is the bottleneck at short histories and
 the transfer dominates at long ones; the microseconds the optimizations save per request disappear in the NIC's
-queue. The choice of mechanism for serving is therefore one of CPU cost (§6), not speed.
+queue. The choice of mechanism for serving is therefore one of CPU cost (§6), not speed. Per-tile waits were not
+built into the serving ring (each request would need its own progress words). They shorten only the compute exposed
+after a request's last chunk lands, and the identical capacities of the basic and fused waits show that this is not
+what limits serving.
 
 ### 5.5 Sharing the GPU
 
@@ -428,11 +473,11 @@ same ~229 GB/s, and GIN windows in GPU memory reach line rate.
 
 | Target | Implementation |
 |---|---|
-| Lowest latency, a CPU core per GPU available | CPU verbs, spinning worker, inline posting, per-tile waits |
-| Lowest latency, no CPU core | raw GDAKI, zero-copy descriptor, side-branch posting, fused wait (per-tile waits are not built for the GDAKI mechanisms) |
+| Lowest latency, a CPU core per GPU available | CPU verbs, spinning worker, inline posting, per-tile waits (on the smallest requests of one or two users raw GDAKI is up to 3% faster) |
+| Lowest latency, no CPU core | raw GDAKI, zero-copy descriptor, side-branch posting, batched warp-parallel posting, per-tile waits; from four users per request GIN-GDAKI per-tile is equivalent |
 | Throughput | any mechanism (all NIC-bound and identical); raw GDAKI needs no CPU |
-| Integration with NCCL | GIN-GDAKI with adaptive contexts and the fused wait (`NCCL_RMA_DISABLE=1`); host-memory windows need correct NUMA placement at node scale |
-| – | GIN-Proxy only with the fused wait (otherwise up to 26% slower on small requests), and it keeps a core busy |
+| Integration with NCCL | GIN-GDAKI with adaptive contexts (`NCCL_RMA_DISABLE=1`): the fused wait for one or two users per request, per-tile waits from four; host-memory windows need correct NUMA placement at node scale |
+| – | GIN-Proxy only with the fused wait (otherwise up to 26% slower on small requests, per-tile waits more), and it keeps a core busy |
 
 ## 7. Writing new K/V back
 
@@ -457,11 +502,11 @@ written range was read back and compared (0 mismatched bytes).
 ## 8. Conclusions
 
 1. **Plain-run latency.** The fastest RDMA path is CPU verbs with the spinning worker, inline posting and per-tile
-   waits; without a CPU core, raw GDAKI with the zero-copy descriptor, side-branch posting and the fused wait. The
-   gains over basic CPU verbs are where per-request overhead or the per-layer pipeline matter: single users and small
-   batches (up to 11% for S, 4% for M, 2.5% for L). From ~30 MB per request the fastest implementation is a median
-   0.6% above the ideal bound (perfect overlap of transfer and compute); below that, what remains is compute that no
-   transfer can overlap.
+   waits; without a CPU core, raw GDAKI with the zero-copy descriptor, side-branch posting, batched posting and
+   per-tile waits, which is also the fastest of all on the smallest single-user requests. The gains over basic CPU
+   verbs are where per-request overhead or the per-layer pipeline matter: single users and small batches (up to 11% for
+   S, 4% for M, 2.5% for L). From ~30 MB per request the fastest implementation is a median 0.6% above the ideal bound
+   (perfect overlap of transfer and compute); below that it is a median 13% above.
 2. **Break-even.** Fetching beats recomputing above ~13–14k history tokens for M and ~9k for L (S: 10–13k); single
    users cross earliest. RDMA-side optimization lowered the single-user break-even by 0.5–5k tokens and left at most
    0.3k to an ideal RDMA (except S with 1–2 users). The batched break-even, equal to the throughput break-even, is fixed
@@ -475,21 +520,25 @@ written range was read back and compared (0 mismatched bytes).
    break-even is therefore a hybrid server that fetches as many users as the NIC carries and recomputes the rest, not
    fetching instead of recomputing.
 5. **Mechanism.** For lowest latency, CPU verbs with every option and per-tile waits if a CPU core per GPU is free;
-   otherwise raw GDAKI with every option and the fused wait. For throughput, any mechanism (choose by CPU cost).
-   GIN-GDAKI with adaptive contexts and the fused wait for NCCL integration; GIN-Proxy only with the fused wait.
+   otherwise raw GDAKI with every option and per-tile waits (within noise of CPU verbs at most points, up to 6% behind
+   on small S requests). For throughput, any mechanism (choose by CPU cost). For NCCL integration, GIN-GDAKI with
+   adaptive contexts: the fused wait for one or two users per request, per-tile waits from four (GIN's per-step
+   flushes cost more than the overlap gains with few users). GIN-Proxy only with the fused wait.
 6. **A GPU shared with other work needs SM isolation to keep the fetch server's latency** (a green context), whichever
    mechanism is used.
-7. **Within the rules of §1, the break-even and serving capacity are at their limits; the latency of small requests
-   is not.** The break-even is within 0.3k tokens of an ideal RDMA (except S with 1–2 users) and serving sits at the
-   NIC ceiling or the queueing limit; moving either needs more bandwidth per GPU, fewer bytes per user or the hybrid
-   server. Below ~30 MB per request the fastest implementation is still a median 13% above the ideal bound, and the
-   GDAKI mechanisms, which post faster on the smallest requests, do not have per-tile waits yet.
+7. **Within the rules of §1, the break-even and serving capacity are at their limits.** The break-even is within 0.3k
+   tokens of an ideal RDMA (except S with 1–2 users) and serving sits at the NIC ceiling or the queueing limit; moving
+   either needs more bandwidth per GPU, fewer bytes per user or the hybrid server. Small requests (below ~30 MB) stay
+   a median 13% above the ideal bound with the per-tile waits of every mechanism; how much of that gap is reachable is
+   open (§9).
 
 ## 9. Next steps
 
-- **Per-tile waits for the GDAKI mechanisms** (chunked posting from the history's end with a completion ticket per
-  chunk, and a GPU poller that publishes chunk progress to the attention's existing per-tile wait): the open in-scope
-  optimization. It decides the fastest no-CPU implementation, and possibly the fastest overall on small requests.
+- **Small requests, the open in-scope item:** a per-request timeline (time until the first chunk lands, compute left
+  after the last) to show how much of the remaining 13% above the ideal bound any RDMA schedule can recover, and why
+  raw GDAKI per-tile still trails CPU verbs per-tile by up to 6% on small S requests. Posting is on its critical path
+  (§4.2); a persistent post kernel that starts the transfer without waiting for the graph launch is one candidate. The
+  publisher and the chunk placement were ruled out.
 - **Hybrid server (P7):** one scheduler that sends each request, or each layer, to fetch or recompute by history
   length and load, to turn the additive capacity of §5.5 into a serving result; M and L with more layers.
 - **Fewer bytes per user:** FP8 or otherwise compressed K/V (half the bytes acts like a 2× faster NIC on transfer).
@@ -505,12 +554,23 @@ The POC is `examples/hstu-poc` in recsys-examples (branch `hstu-kv-rdma-poc`); i
   per-layer hook before each attention (the wait for fetched data), or hands the attention to the source (the fused,
   early-release and per-tile variants use a copy of FBGEMM's kernel with an in-kernel wait,
   `attn/hstu_hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp`).
-- **Per-tile waits** (CPU verbs): `post_reads_tiled` splits every K/V segment into chunks posted from the segment's end
-  backwards, all signaled; the worker counts completions per (layer, chunk step) and publishes per layer
-  (sequence << 32) | steps landed in host-mapped memory; a 1-thread relay kernel copies it to a device word zeroed at
-  the request's start; in the attention kernel's load warp, before each K tile, the elected thread waits until the
-  steps covering that tile's history rows have landed (acquire load, then a proxy fence before the TMA load). Chunk
-  rows: 128, or more when needed to keep a request at ≤ 2,048 reads.
+- **Per-tile waits** split every K/V segment into chunks posted from the segment's end backwards, step by step
+  (step k = the k-th chunk from the end of every segment), all signaled. Chunk rows: 128, or more when needed to keep a
+  request at ≤ 2,048 reads. Per layer, a device word zeroed at the request's start holds the number of steps landed;
+  in the attention kernel's load warp, before each K tile, the elected thread waits until the steps covering that
+  tile's history rows have landed (acquire load, then a proxy fence before the TMA load). Who publishes the steps:
+  - *CPU verbs* (`post_reads_tiled`): the worker counts completions per (layer, step) and publishes
+    (sequence << 32) | steps in host-mapped memory; a 1-thread relay kernel copies it to the device word.
+  - *Raw GDAKI* (`post_gets_tiled`, one warp per queue pair; chunk (segment j, step k) on queue pair (j + k) mod 4):
+    per layer, lane 0 reserves the slots of all the layer's chunk reads on its queue pair, the 32 lanes write the
+    WQEs in parallel (one per lane, in step order), and lane 0 marks them ready once and rings one doorbell. The WQE
+    index of each step's last read on a queue pair is that step's ticket.
+  - *GIN* (`post_gets_tiled`, one warp per context): the warp's lanes issue a step's chunk reads with one `get` each,
+    then lane 0 takes a flush ticket for the step.
+  - On both GDAKI paths the post kernel then waits for the tickets in step order and publishes the count. The
+    publisher has to be resident before the attention: as a separate kernel launched after the posts, it can be
+    starved of SMs by attention CTAs that spin on its progress once the attention fills the GPU (a deadlock seen at
+    B = 32).
 - **Transports** (`csrc/`): CPU verbs (RC queue pairs, a worker thread, per-layer host-mapped flags; optional
   spinning worker and inline posting); raw GDAKI (DOCA GPUNetIO from NCCL's bundled copy, GPU-side queue pairs,
   tickets per layer and queue pair; optional zero-copy descriptor); GIN-GDAKI and GIN-Proxy (NCCL 2.32.7 device API,
@@ -564,7 +624,8 @@ scripts are also in the POC's `tools/`.
 
 | What | Result rows | Campaign script | Figure / table script |
 |---|---|---|---|
-| Plain-run latency: every mechanism × option × wait variant, recompute, local hit (S, M, L) | `results/p2t/` (per-tile: `*_verbs.t.tile`) | `tools/p2t_grid.sh` | `tools/p2t_report.py`; `tools/p2t_to_p2c.py` + `tools/report_figs.py`, `tools/p2c_breakeven.py` |
+| Plain-run latency: every mechanism × option × wait variant, recompute, local hit (S, M, L) | `results/p2t/` (per-tile waits: `*.t.tile`) | `tools/p2t_grid.sh` | `tools/p2t_report.py`; `tools/p2t_to_p2c.py` + `tools/report_figs.py`, `tools/p2c_breakeven.py` |
+| Per-tile waits: controls on the same GPU/NIC pair | `results/p2t_ctl/A`, `results/p2t_ctl/B`; posting ablations: `results/p2t_tile_ext11/` vs `results/p2t_tile_v1/` (batched vs one `get` per chunk), `results/p2t_post/` (warp-parallel vs one thread) | `tools/p2t_grid.sh` (`P2T_OUT`) | `tools/p2t_ctl.py` |
 | Serving within 100 ms, each strategy alone | `results/p5s/` (`fine_*`: fine load grid at 12k+) | `tools/p5s_runs.sh`, `p5s_runs2.sh`, `p5s_fine.sh` | `tools/p5s_report.py` |
 | Serving at relaxed targets and up to saturation | `results/p5x/` | `tools/p5x_runs.sh` | `tools/p5x_report.py` |
 | Serving on a shared GPU | `results/p6s/` | `tools/p6s_runs.sh`, `p6s_prio.sh`, `p6s_green4k.sh` | `tools/p6s_report.py` |

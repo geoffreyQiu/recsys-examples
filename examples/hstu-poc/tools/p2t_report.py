@@ -3,7 +3,7 @@
     tools/p2t_report.py results/p2t --best docs/figs/best-impl.png --ablation docs/figs/opt-ablation.png \
         --bound docs/figs/rdma-vs-bound.png [--md]
 Modes: transport.level.variant (transport verbs|raw|gdaki|proxy; level b = basic implementation, t = every latency
-option, zc / spin / ac = one option alone, b2 = basic again for run-to-run noise; variant 5a|pdl|pdl_early|fused),
+option, zc / spin / ac = one option alone, b2 = basic again for run-to-run noise; variant 5a|pdl|pdl_early|fused|tile),
 plus recompute and local. Latency = host-clock mean (request issued -> output seen complete)."""
 import argparse
 import glob
@@ -67,41 +67,49 @@ def main():
             best[c] = min(cand)
     cfgs = [c for c in ("S", "M", "L") if any(x[0] == c for x in cells)]
 
-    # ---- figure 1: best implementation map (small grid: every mode measured) ----
-    small = [c for c in cells if sum(1 for m in modes if (m,) + c in lat) >= 10]
-    fig, axes = plt.subplots(1, len(cfgs), figsize=(5.6 * len(cfgs), 3.4), dpi=140, facecolor=SURFACE, squeeze=False)
-    for ax, cf in zip(axes[0], cfgs):
-        ax.set_facecolor(SURFACE)
-        Ls = sorted({c[2] for c in small if c[0] == cf})
-        Bs = sorted({c[1] for c in small if c[0] == cf})
-        M = np.full((len(Bs), len(Ls)), np.nan)
-        for i, B in enumerate(Bs):
-            for j, L in enumerate(Ls):
-                c = (cf, B, L)
-                if c in best and (BASE,) + c in lat:
-                    M[i, j] = 100 * (1 - best[c][0] / lat[(BASE,) + c])
-        ax.imshow(M, cmap="Greens", vmin=0, vmax=8, aspect="auto", origin="lower")
-        for i, B in enumerate(Bs):
-            for j, L in enumerate(Ls):
-                c = (cf, B, L)
-                if c not in best or np.isnan(M[i, j]):
-                    continue
-                t, lv, v = best[c][1].split(".")
-                txt = f"{TSHORT[t]}\n{VSHORT[v]}" if M[i, j] / 100 > noise else "≈ basic"
-                ax.text(j, i, f"{txt}\n{M[i, j]:+.0f}%" if M[i, j] / 100 > noise else txt, ha="center", va="center",
-                        fontsize=6.2, color=INK if M[i, j] < 5 else SURFACE)
-        ax.set_xticks(range(len(Ls)))
-        ax.set_xticklabels([f"{L / 1024:g}k" for L in Ls], fontsize=7.5, color=INK2)
-        ax.set_yticks(range(len(Bs)))
-        ax.set_yticklabels(Bs, fontsize=7.5, color=INK2)
+    # ---- figure 1: fastest implementation per request, overall and without a CPU core, over the whole grid ----
+    small = [c for c in cells if sum(1 for m in modes if (m,) + c in lat) >= 20]   # every implementation measured
+    nocpu = lambda m: m.split(".")[0] in ("raw", "gdaki")  # noqa: E731   (GIN-Proxy's proxy thread holds a core)
+
+    def best_of(c, sel):
+        cand = [(lat[(m,) + c], m) for m in modes if (m,) + c in lat and sel(m)]
+        return min(cand) if cand else None
+
+    panels = (("fastest", lambda m: True), ("fastest without a CPU core (raw GDAKI, GIN-GDAKI)", nocpu))
+    fig, axes = plt.subplots(len(cfgs), 2, figsize=(15, 2.75 * len(cfgs)), dpi=140, facecolor=SURFACE, squeeze=False)
+    for row, cf in zip(axes, cfgs):
+        Ls = sorted({c[2] for c in cells if c[0] == cf})
+        Bs = sorted({c[1] for c in cells if c[0] == cf})
+        for ax, (title, sel) in zip(row, panels):
+            ax.set_facecolor(SURFACE)
+            M = np.full((len(Bs), len(Ls)), np.nan)
+            for i, B in enumerate(Bs):
+                for j, L in enumerate(Ls):
+                    c = (cf, B, L)
+                    b = best_of(c, sel) if (BASE,) + c in lat else None
+                    if b is None:
+                        continue
+                    g = 1 - b[0] / lat[(BASE,) + c]
+                    M[i, j] = 100 * g
+                    t, lv, v = b[1].split(".")
+                    ax.text(j, i, f"{TSHORT[t]}\n{VSHORT[v]}\n{100 * g:+.1f}%" if abs(g) > noise else "≈\nbasic",
+                            ha="center", va="center", fontsize=5.6, color=INK if 100 * g < 6 else SURFACE)
+            ax.imshow(M, cmap="Greens", vmin=0, vmax=10, aspect="auto", origin="lower")
+            ax.set_xticks(range(len(Ls)))
+            ax.set_xticklabels([f"{L / 1024:g}k" for L in Ls], fontsize=7.5, color=INK2)
+            ax.set_yticks(range(len(Bs)))
+            ax.set_yticklabels(Bs, fontsize=7.5, color=INK2)
+            ax.set_title(f"config {cf}: {title}", color=INK, fontsize=9.5, loc="left")
+            for sp in ax.spines.values():
+                sp.set_color(GRID)
+        row[0].set_ylabel("batch size B (users)", color=INK2, fontsize=8.5)
+    for ax in axes[-1]:
         ax.set_xlabel("history length (tokens)", color=INK2, fontsize=8.5)
-        ax.set_title(f"config {cf}", color=INK, fontsize=10, loc="left")
-        for sp in ax.spines.values():
-            sp.set_color(GRID)
-    axes[0][0].set_ylabel("batch size B (users)", color=INK2, fontsize=8.5)
-    fig.suptitle(f"Fastest RDMA implementation per request (transport + wait variant, all latency options) and its gain "
-                 f"over basic CPU verbs; '≈ basic' = within run-to-run noise ({100 * noise:.1f}%)",
-                 color=INK, fontsize=9.5, y=1.04, x=0.01, ha="left")
+    fig.suptitle(f"Fastest RDMA implementation per request and its latency gain over basic CPU verbs ('≈ basic': within "
+                 f"run-to-run noise, {100 * noise:.2f}%)\nHistory ≤ 4k with B ≤ 8: all {len(modes)} implementations "
+                 f"measured; elsewhere the basic, fused-wait and per-tile implementations of every mechanism",
+                 color=INK, fontsize=9.5, y=1.0, x=0.01, ha="left")
+    fig.tight_layout(rect=(0, 0, 1, 0.975))
     fig.savefig(a.best, bbox_inches="tight", facecolor=SURFACE)
     print("wrote", a.best)
 
@@ -137,7 +145,7 @@ def main():
         for sp in ax.spines.values():
             sp.set_color(GRID)
         lo, hi = ax.get_xlim()
-        ax.set_xlim(min(lo, -9.5), hi + 3)
+        ax.set_xlim(min(lo, -9.5) - 2.5, hi + 3)
     axes[0][0].set_yticks(ys)
     axes[0][0].set_yticklabels([f"{TNAME[t]}: {oname[o]}" for t, o in rowsx], fontsize=7.5, color=INK)
     fig.suptitle("Latency options and wait variants on the smallest requests (0.5k history, one user); grey band = "
@@ -182,20 +190,37 @@ def main():
     print(f"\nData checks: {bad} mismatched words. Run-to-run noise (basic CPU verbs repeated): median "
           f"{100 * np.median(rep):.2f}%, 95th percentile {100 * noise:.2f}%, max {100 * max(rep):.2f}% over {len(rep)} cells")
     # gains of the best implementation over basic verbs, and of each transport's best over its basic
-    print("\n**Gain of the fastest implementation over basic CPU verbs (small grid; % of latency; '·' = within noise)**\n")
+    print("\n**Gain over basic CPU verbs: fastest implementation ; fastest without a CPU core ('·' = within noise)**\n")
     for cf in cfgs:
-        Ls = sorted({c[2] for c in small if c[0] == cf})
-        Bs = sorted({c[1] for c in small if c[0] == cf})
+        Ls = sorted({c[2] for c in cells if c[0] == cf})
+        Bs = sorted({c[1] for c in cells if c[0] == cf})
         print(f"\n{cf}: | B \\ L | " + " | ".join(f"{L / 1024:g}k" for L in Ls) + " |")
         print("|---|" + "---|" * len(Ls))
         for B in Bs:
             cellstr = []
             for L in Ls:
                 c = (cf, B, L)
-                g = 1 - best[c][0] / lat[(BASE,) + c]
-                t, lv, v = best[c][1].split(".")
-                cellstr.append(f"{100 * g:+.1f}% {TSHORT[t]}/{lv}/{VSHORT[v]}" if g > noise else "·")
+                if (BASE,) + c not in lat:
+                    cellstr.append("–")
+                    continue
+                out = []
+                for sel in (lambda m: True, nocpu):
+                    b = best_of(c, sel)
+                    g = 1 - b[0] / lat[(BASE,) + c]
+                    t, lv, v = b[1].split(".")
+                    out.append(f"{100 * g:+.1f}% {TSHORT[t]}/{VSHORT[v]}" if abs(g) > noise else "·")
+                cellstr.append(" ; ".join(out))
             print(f"| {B} | " + " | ".join(cellstr) + " |")
+    print("\n**How often each combination is the fastest or within noise of it, cells with only basic / fused / "
+          "per-tile measured (history ≥ 6k or B ≥ 16)**\n")
+    big_cells = [c for c in cells if c not in small and c in best]
+    score = defaultdict(int)
+    for c in big_cells:
+        for m in modes:
+            if (m,) + c in lat and lat[(m,) + c] <= best[c][0] * (1 + noise):
+                score[m] += 1
+    for m, n in sorted(score.items(), key=lambda x: -x[1])[:12]:
+        print(f"- {m}: {n} of {len(big_cells)}")
     print("\n**Per transport: tuned (best wait variant) vs its own basic implementation, small grid**\n")
     print("| Transport | median gain | max gain (where) | best variant most often |")
     print("|---|---|---|---|")
@@ -235,13 +260,37 @@ def main():
                 score[m] += 1
     for m, n in sorted(score.items(), key=lambda x: -x[1])[:12]:
         print(f"- {m}: {n} of {len(small)}")
+    # distance to the bounds: T = bytes ÷ line rate, local = local-hit latency (the compute alone), n = layers
+    ideal_lat = {}
+    dist_i, dist_l = [], []
+    for c in cells:
+        loc = lat.get(("local",) + c)
+        if loc is None or c not in best:
+            continue
+        cf, B, L = c
+        nb = B * L * KV[cf]
+        T = nb / bw * 1e3
+        ideal_lat[c] = max(loc, T)
+        dist_i.append((best[c][0] / ideal_lat[c] - 1, nb, c, best[c][1]))
+        per_layer = [lat[(m,) + c] for m in modes if (m,) + c in lat and not m.endswith(".tile")]
+        if per_layer:   # a wait per layer: layer l's compute starts only after all of layer l has landed
+            dist_l.append((min(per_layer) / max(T + loc / LAYERS[cf], T / LAYERS[cf] + loc) - 1, nb, c))
+    q = lambda xs: f"median {100 * np.median(xs):+.1f}%, min {100 * min(xs):+.1f}%, max {100 * max(xs):+.1f}%"  # noqa: E731
+    print("\n**Distance to the bounds** (line rate", f"{bw / 1e9:.2f} GB/s)\n")
+    print(f"- fastest per-layer implementation vs max(T + local/n, T/n + local): {q([x[0] for x in dist_l])} "
+          f"over {len(dist_l)} cells")
+    for lab, sel in (("≥ 30 MB", lambda x: x[1] >= 30e6), ("< 30 MB", lambda x: x[1] < 30e6)):
+        xs = sorted((x for x in dist_i if sel(x)), key=lambda x: -x[0])
+        print(f"- fastest implementation vs the ideal bound max(T, local), requests {lab}: "
+              f"{q([x[0] for x in xs])} over {len(xs)} cells; largest: " +
+              ", ".join(f"{x[2][0]} B={x[2][1]} {x[2][2] / 1024:g}k {100 * x[0]:+.1f}% ({x[3]})" for x in xs[:5]))
     # break-even with the best RDMA vs recompute, per config and B (every cell measured with both)
-    print("\n**Latency break-even vs recompute: basic CPU verbs / best RDMA**\n")
+    print("\n**Latency break-even vs recompute: basic CPU verbs / best RDMA / ideal RDMA (fetch = max(T, local))**\n")
     for cf in cfgs:
         for B in sorted({c[1] for c in cells if c[0] == cf}):
             Ls = sorted({c[2] for c in cells if c[0] == cf and c[1] == B})
             out = []
-            for fn in (lambda c: lat.get((BASE,) + c), lambda c: best.get(c, (None,))[0]):
+            for fn in (lambda c: lat.get((BASE,) + c), lambda c: best.get(c, (None,))[0], lambda c: ideal_lat.get(c)):
                 pts = [(L, lat[("recompute", cf, B, L)] / fn((cf, B, L))) for L in Ls
                        if ("recompute", cf, B, L) in lat and fn((cf, B, L))]
                 be = None
@@ -250,7 +299,7 @@ def main():
                         be = math.exp(math.log(l0) + (0 - math.log(r0)) * (math.log(l1) - math.log(l0)) /
                                       (math.log(r1) - math.log(r0)))
                 out.append(f"{be / 1024:.1f}k" if be else "–")
-            print(f"- {cf} B={B}: {out[0]} / {out[1]}")
+            print(f"- {cf} B={B}: {out[0]} / {out[1]} / {out[2]}")
 
 
 if __name__ == "__main__":

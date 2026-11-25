@@ -45,6 +45,12 @@ class GinKV {
   void wait_layer(void* tickets, int layer, int ctx0, int n_ctx, uint64_t* t_done, cudaStream_t s);
   // P4 fused: a 1-thread poller waits on every layer's tickets in order and stores ready[l] = *seq
   void poll(void* tickets, int n_layers, int ctx0, int n_ctx, const uint32_t* seq, uint32_t* ready, cudaStream_t s);
+  // per-tile waits: chunked gets from each segment's end, a flush ticket per (layer, step, context) in tickets
+  // [n_layers * max_steps * n_ctx]; the poller publishes tsteps[l] = steps landed (0x7fffffff when complete)
+  // (the post kernel also waits for the tickets and publishes tsteps)
+  void post_gets_tiled(const Seg* segs, const int* layer_ptr, int n_layers, void* tickets, int peer, int ctx0,
+                       int n_ctx, int max_steps, int64_t tile_bytes, int* tsteps, cudaStream_t s,
+                       const int* var = nullptr, int64_t var_stride = 0);
 
   // Write path (6'). put_segs: put each segment local -> remote (no actions), then flushAsync into
   // *ticket (local completion: sources reusable). commit: strong signal (settles every earlier put on this

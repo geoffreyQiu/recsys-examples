@@ -114,6 +114,103 @@ __global__ void raw_poll_kernel(doca_gpu_dev_verbs_qp** qps, int nqp, const unsi
   }
 }
 
+// Per-tile waits: every segment split into chunks of tb bytes posted from its END backwards (the attention consumes
+// key blocks last to first); step k of layer l = chunk k of every segment of the layer, the chunk of segment j going
+// to QP (j + k) % nqp; tickets[(l * max_steps + k) * nqp + w] = last WQE of step k on QP w + 1 (0 = none).
+// Batched posting, warp-parallel: per (layer, QP) the QP's warp counts the layer's chunk reads on that QP, lane 0
+// reserves their slots at once, the lanes write the WQEs in parallel (one per lane per round, in step order), and lane
+// 0 marks them ready and rings one doorbell (one reservation, one ready mark and one doorbell per layer and QP).
+// Chunk (segment j, step k) goes to QP (j + k) % nqp; a step's ticket = its last read's WQE index + 1 on each QP.
+// The same kernel then polls the completions and publishes tsteps[l] = steps landed (0x7fffffff once the layer is
+// complete): the publisher is resident from the request's start, before any attention CTA spins on its progress (a
+// separate poller launched after the posts can find every SM taken by spinning attention CTAs and never run).
+__global__ void raw_post_tiled_kernel(doca_gpu_dev_verbs_qp** qps, int nqp, const Seg* segs, const int* lp,
+                                      int n_layers, int max_steps, long long tb, uint64_t rbase, uint32_t rkey_be,
+                                      uint64_t lbase, uint32_t lkey_be, unsigned long long* tickets,
+                                      const volatile int* var, long long var_stride, int* tsteps) {
+  __shared__ long long s_off;
+  if (threadIdx.x == 0) s_off = var ? (long long)(*var) * var_stride : 0;
+  __syncthreads();
+  segs += s_off;
+  const int w = threadIdx.x / 32, lane = threadIdx.x % 32;
+  doca_gpu_dev_verbs_qp* qp = qps[w];
+  const enum doca_gpu_dev_verbs_wqe_ctrl_flags flags =
+      doca_gpu_dev_verbs_get_ctrl_flags<DOCA_GPUNETIO_VERBS_QP_SQ>(qp, DOCA_GPUNETIO_VERBS_GPU_CODE_OPT_DEFAULT);
+  for (int l = 0; l < n_layers; ++l) {
+    const int s0 = lp[l], n = lp[l + 1] - s0;
+    const int per = (n + nqp - 1) / nqp;   // candidate chunks of this QP per step
+    const int total = max_steps * per;     // candidate t = k * per + i: segment j = (w - k) mod nqp + nqp * i, step k
+    unsigned long long* tk = tickets + (long long)l * max_steps * nqp + w;
+    for (int k = lane; k < max_steps; k += 32) tk[(long long)k * nqp] = 0;
+    int cnt = 0;
+    for (int t = lane; t < total; t += 32) {
+      const int k = t / per, j = ((w - k) % nqp + nqp) % nqp + nqp * (t % per);
+      if (j < n && segs[s0 + j].bytes > (long long)k * tb) ++cnt;
+    }
+    for (int o = 16; o > 0; o >>= 1) cnt += __shfl_xor_sync(0xffffffffu, cnt, o);
+    if (cnt == 0) continue;
+    unsigned long long base = 0;
+    if (lane == 0)
+      base = doca_gpu_dev_verbs_reserve_wq_slots<DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU,
+                                                 DOCA_GPUNETIO_VERBS_QP_SQ>(qp, cnt,
+                                                                            DOCA_GPUNETIO_VERBS_GPU_CODE_OPT_DEFAULT);
+    base = __shfl_sync(0xffffffffu, base, 0);
+    __syncwarp();   // the zeroed tickets before the lanes' atomicMax below
+    unsigned long long idx = base;
+    for (int t0 = 0; t0 < total; t0 += 32) {
+      const int t = t0 + lane;
+      int k = 0;
+      bool has = false;
+      Seg sg{};
+      if (t < total) {
+        k = t / per;
+        const int j = ((w - k) % nqp + nqp) % nqp + nqp * (t % per);
+        if (j < n) {
+          sg = segs[s0 + j];
+          has = sg.bytes > (long long)k * tb;
+        }
+      }
+      const unsigned m = __ballot_sync(0xffffffffu, has);
+      if (has) {
+        const unsigned long long my = idx + __popc(m & ((1u << lane) - 1u));
+        const long long done = (long long)k * tb;
+        const long long len = min(tb, (long long)sg.bytes - done);
+        const long long off = (long long)sg.bytes - done - len;
+        struct doca_gpu_dev_verbs_wqe* wqe = doca_gpu_dev_verbs_get_wqe_ptr(qp, my);
+        doca_gpu_dev_verbs_wqe_prepare_read(qp, wqe, my, flags, rbase + (uint64_t)(sg.remote + off), rkey_be,
+                                            lbase + (uint64_t)(sg.local + off), lkey_be, (size_t)len);
+        atomicMax(&tk[(long long)k * nqp], my + 1);
+      }
+      idx += __popc(m);
+    }
+    __syncwarp();   // every lane's WQE is written; mark_wqes_ready's release fence covers them
+    if (lane == 0) {
+      doca_gpu_dev_verbs_mark_wqes_ready<DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(qp, base, idx - 1);
+      doca_gpu_dev_verbs_submit<DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU, DOCA_GPUNETIO_VERBS_SYNC_SCOPE_THREAD>(
+          qp, idx);
+    }
+  }
+  __syncthreads();   // every QP's tickets are written
+  if (threadIdx.x != 0 || tsteps == nullptr) return;
+  for (int l = 0; l < n_layers; ++l) {
+    for (int k = 0; k < max_steps; ++k) {
+      bool any = false;
+      for (int q = 0; q < nqp; ++q) {
+        const unsigned long long t = tickets[((long long)l * max_steps + k) * nqp + q];
+        if (t) {
+          any = true;
+          doca_gpu_dev_verbs_wait<DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(qps[q], (doca_gpu_dev_verbs_ticket_t)(t - 1));
+        }
+      }
+      if (!any) break;
+      __threadfence();
+      asm volatile("st.release.gpu.global.s32 [%0], %1;" ::"l"(tsteps + l), "r"(k + 1) : "memory");
+    }
+    __threadfence();
+    asm volatile("st.release.gpu.global.s32 [%0], %1;" ::"l"(tsteps + l), "r"(0x7fffffff) : "memory");
+  }
+}
+
 RawGdaki::RawGdaki(const std::string& dev, int64_t bytes, int nqp, int sq_depth) : p_(new RawImpl) {
   int n = 0;
   ibv_device** list = ibv_get_device_list(&n);
@@ -250,6 +347,16 @@ void RawGdaki::wait_layer(const uint64_t* tickets, int layer, uint64_t* t_done, 
 
 void RawGdaki::poll(const uint64_t* tickets, int n_layers, const uint32_t* seq, uint32_t* ready, cudaStream_t s) {
   raw_poll_kernel<<<1, 1, 0, s>>>(p_->d_qps, (int)p_->qps.size(), (const unsigned long long*)tickets, n_layers, seq, ready);
+  CUDA_OK2(cudaGetLastError());
+}
+
+void RawGdaki::post_gets_tiled(const Seg* segs, const int* layer_ptr, int n_layers, uint64_t* tickets, int max_steps,
+                               int64_t tile_bytes, int* tsteps, cudaStream_t s, const int* var, int64_t var_stride) {
+  const int nq = (int)p_->qps.size();
+  raw_post_tiled_kernel<<<1, 32 * nq, 0, s>>>(p_->d_qps, nq, segs, layer_ptr, n_layers, max_steps,
+                                              (long long)tile_bytes, p_->raddr, htobe32(p_->rkey), (uint64_t)p_->buf,
+                                              htobe32(p_->mr->lkey), (unsigned long long*)tickets, var,
+                                              (long long)var_stride, tsteps);
   CUDA_OK2(cudaGetLastError());
 }
 
