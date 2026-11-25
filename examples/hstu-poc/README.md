@@ -1,6 +1,6 @@
 # hstu-poc: HSTU inference with remote KV over RDMA (POC)
 
-**Status (2026-11-25):** P0–P6 built and measured on Eos. Results: `/lustre/fsw/coreai_devtech_all/junyiq/hstu-kv-rdma/docs/results.md`; plan in the study doc §10.
+**Status (2026-11-25):** P0–P6 built and measured on Eos; final report in `docs/results.md` (copy of `/lustre/fsw/coreai_devtech_all/junyiq/hstu-kv-rdma/docs/results.md`); plan in the study doc §10. P7 (hybrid fetch + recompute) not started.
 **Design and rationale:** `/lustre/fsw/coreai_devtech_all/junyiq/hstu-kv-rdma/docs/hstu-kv-rdma-study.md`
 
 **Goal:** the fastest achievable HSTU inference when user-history KV lives in remote memory, using plain kernels and calls with no KV-manager layer.
@@ -41,10 +41,13 @@ hstu-poc/
   hstu_poc/
     model.py       HSTU layers (repo math), forward_full (recompute) and forward_cached (R and W)
     kvsource.py    KV sources: local hit, host H2D, GIN, CPU verbs, raw GDAKI; P4 wait variants
+                   (wait kernel, pdl, pdl_early = trigger-and-exit + PDL attention spinning on a ready flag, fused)
     writers.py     workload W writers (GIN, CPU verbs) with a durability fence
-    serving.py     thin serving layer: Poisson load, dynamic batcher, fetch at admission, graphs per bucket,
-                   SLO success rate, sampled data checks, explicit close() (no reference cycles)
-    serving_v1.py  the first-pass loop, kept only to reproduce the serving crash (docs/results.md P5b)
+    serving2.py    overlap-optimized servers (P5s/P6s): fetch posts each request into a ring of KV slots on arrival,
+                   batches landed requests, one graph per batch size re-pointed at any run of slots; recompute with
+                   dynamic batching or one at a time; co-located recompute job (stream / green context)
+    serving.py     batch-at-a-time serving layer (two ping-pong regions; P5b and the 8-GPU runs)
+    serving_v1.py  the first-pass loop, kept only to reproduce the serving crash (Xid 31)
     attn_ext.py    build/launch of the copied attention kernel
     ext.py, dist.py
   bench/
@@ -53,14 +56,15 @@ hstu-poc/
     grid.py         baseline/transport grid runner (one CUDA graph per cell)
     p2.py p3.py     two-node drivers for workloads R and W (--transport gin|raw|verbs)
     p4_check.py     slow-producer correctness of the wait variants
-    p5.py           latency vs offered load of the serving layer (SLO, success, -n 8 = all GPUs at once)
+    p5s.py          serving capacity within the SLO per strategy (serving2; --cotenant/--green/--priority for P6s)
+    p5.py           latency vs offered load of the batch-at-a-time layer (-n 8 = all GPUs at once)
     p5_v1.py        first-pass driver (serving_v1), crash reproduction only
     p6.py           transfer under SM contention / CPU contention
   scripts/srun2.sh  2-node launcher (inference ranks on node A, store ranks on node B)
-  tools/           analysis behind docs/results.md: p2c_breakeven.py (break-even figure and tables), p2_table.py,
-                   p3_report.py, p4_report.py, plot_p5.py, p5_eight.py (take result-row paths; plots need matplotlib),
-                   numa_check.cu (where cuMemCreate HOST_NUMA pages land)
-  docs/            results.md (measured results, revision 2), figs/, archive/ (first pass)
+  tools/           analysis and campaign scripts behind docs/results.md (plots need matplotlib): make_figs.sh
+                   (every figure), report_figs.py, p2c_breakeven.py, p5s_report.py, p6s_report.py, p3_report.py,
+                   p5_eight.py, *_runs.sh / p5s_fine.sh / p6s_*.sh (campaigns), numa_check.cu
+  docs/            results.md (final report), figs/, archive/ (earlier revisions)
 ```
 
 ## Running (Eos; inside `pytorch-26.07.sqsh`)
@@ -75,7 +79,7 @@ Always set `NCCL_RMA_DISABLE=1` for GIN (otherwise NCCL's host-RMA progress thre
 **Objective of the comparison:** the highest throughput at a fixed p99 end-to-end latency, with per-request latency alongside. The baseline grid comes first; the GPU-SM vs CPU-core balance of transfer work is a later phase (P6).
 
 ## Design details (agreed; study doc §13–§14)
-- **Model configs:** S = 3 layers × 512 (4 × 128 heads), M = 8 × 1024 (4 × 256), D = 16 × 1024 (8 × 128). All BF16, head MLP [512, 8].
+- **Model configs:** S = 3 layers × 512 (4 × 128 heads), M = 8 × 1024 (4 × 256), L = 8 × 2048 (8 × 256); D = 16 × 1024 (8 × 128) is parked. All BF16, head MLP [512, 8].
 - **Embedding:** two GPU-memory tables (items, actions) + an input linear; a bypass option for transfer-only tests; host-memory tables later as a realism check.
 - **Pre/post:** interleave items and actions, contextual tokens, linear to hidden, bucketed position encoding, input layer norm. Cached tokens are skipped. Post: output layer norm → candidates → MLP → sigmoid.
 - **Inputs:** jagged tensors (values + per-user offsets); no `HSTUBatch`.

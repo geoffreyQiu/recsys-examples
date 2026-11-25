@@ -126,6 +126,10 @@ class P4:
       fused  no wait kernels: a 1-thread poller on a side stream publishes per-layer ready words (GIN/raw: waits on
              the tickets; CPU verbs: relays the CPU's host flags); the copied kernel's producer warp spins on its
              layer's word before the first K/V load (variant (i))
+      pdl_early  early CTA release: a 1-thread kernel triggers the dependent launch and exits at once (its CTA and SM
+             are free immediately); the copied kernel, launched with PDL, needs no griddepcontrol.wait (everything it
+             reads from earlier kernels completed before the trigger kernel started) and takes the data dependency
+             itself, spinning on its layer's ready word like fused
     slow_ns > 0 delays posting (a slow producer) to prove that the waits really wait."""
     p4 = "5a"
     slow_ns = 0
@@ -138,13 +142,24 @@ class P4:
             self.seq_dev = torch.zeros(1, dtype=torch.int32, device=self.dev)
         self.p4_side = torch.cuda.Stream(device=self.dev)
         self.attn_fn = None if mode == "5a" else self._p4_attn
+        if mode == "pdl_early":   # a flag word that is always set: the trigger kernel passes its check and exits
+            self._sat = torch.full((self.cfg.layers,), 2**31 - 1, dtype=torch.int32, device=self.dev)
+            self._sat_seq = torch.zeros(1, dtype=torch.int32, device=self.dev)
         return self
+
+    @property
+    def fused_like(self):
+        return self.p4 in ("fused", "pdl_early")
 
     def _p4_attn(self, l, q, K, V, b, model):
         from .attn_ext import hstu_fwd
         args = (q, K, V, b.cu_q, b.cu_k, b.max_q, b.max_k, model.cfg.max_len, b.num_targets, model.alpha)
         if self.p4 == "fused":
             return hstu_fwd(*args, kv_ready=self.ready.data_ptr() + 4 * l, kv_seq=self.seq_dev.data_ptr(), mode=1)
+        if self.p4 == "pdl_early":
+            self.E.wait_flags_seq(self._sat.data_ptr(), 0, self._sat_seq)    # trigger dependents, exit at once
+            return hstu_fwd(*args, kv_ready=self.ready.data_ptr() + 4 * l, kv_seq=self.seq_dev.data_ptr(), mode=1,
+                            pdl=True)
         self.before_attn(l)
         if self.p4 == "pdl":
             return hstu_fwd(*args, mode=2, pdl=True)
@@ -157,7 +172,7 @@ class P4:
             launch()
 
     def p4_join(self):
-        if self.p4 == "fused":
+        if self.fused_like:
             torch.cuda.current_stream().wait_stream(self.p4_side)
 
 
@@ -266,11 +281,11 @@ class GinKVSource(RemoteKV):
     def start(self):
         if self.slow_ns:
             self.E.spin(self.slow_ns)
-        if self.p4 == "fused":
+        if self.fused_like:
             self.E.seq_inc(self.seq_dev)
         if not self.post_outside:
             self.post()
-        if self.p4 == "fused":
+        if self.fused_like:
             self.p4_fork(lambda: self.g.poll(self.tickets, self.cfg.layers, 0, self.n_ctx, self.seq_dev, self.ready))
 
     def post(self):
@@ -320,7 +335,7 @@ class VerbsKVSource(RemoteKV):
 
     def start(self):
         self.E.seq_inc(self.seq_dev)
-        if self.p4 == "fused":
+        if self.fused_like:
             self.p4_fork(lambda: self.E.relay_flags(self.flags, self.cfg.layers, self.seq_dev, self.ready))
 
     def before_attn(self, l):
@@ -357,11 +372,11 @@ class RawGdakiSource(RemoteKV):
     def start(self):
         if self.slow_ns:
             self.E.spin(self.slow_ns)
-        if self.p4 == "fused":
+        if self.fused_like:
             self.E.seq_inc(self.seq_dev)
         if not self.post_outside:
             self.post()
-        if self.p4 == "fused":
+        if self.fused_like:
             self.p4_fork(lambda: self.r.poll(self.tickets, self.cfg.layers, self.seq_dev, self.ready))
 
     def post(self):

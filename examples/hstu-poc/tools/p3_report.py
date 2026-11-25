@@ -62,7 +62,7 @@ def main():
     axes[0][0].set_ylabel("durable time − latency (ms)", color=INK2, fontsize=8.5)
     h, l = axes[0][0].get_legend_handles_labels()
     fig.legend(h, l, loc="upper left", ncol=len(Ps), frameon=False, fontsize=8, labelcolor=INK, bbox_to_anchor=(0.01, 1.08))
-    fig.suptitle("Workload W, M, C = 256, GIN-GDAKI writes: how long the new K/V stay in flight after the output is ready",
+    fig.suptitle("Writing new K/V back (M, 256 candidates, GIN-GDAKI writes): how long the writes stay in flight after the output is ready",
                  color=INK, fontsize=10, y=1.15, x=0.01, ha="left")
     fig.savefig(a.out, bbox_inches="tight", facecolor=SURFACE)
     print("wrote", a.out)

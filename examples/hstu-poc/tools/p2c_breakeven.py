@@ -20,7 +20,7 @@ from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm  # noqa: E40
 
 TRANSPORTS = ["raw", "gdaki", "verbs", "proxy"]
 NAMES = {"raw": "raw GDAKI", "gdaki": "GIN-GDAKI", "verbs": "CPU verbs", "proxy": "GIN-Proxy"}
-KV_TOK = {"S": 3 * 2 * 512 * 2, "M": 8 * 2 * 1024 * 2, "D": 16 * 2 * 1024 * 2}   # KV bytes per token, all layers
+KV_TOK = {"S": 3 * 2 * 512 * 2, "M": 8 * 2 * 1024 * 2, "D": 16 * 2 * 1024 * 2, "L": 8 * 2 * 2048 * 2}   # KV bytes/token, all layers
 NIC_GBS = 49.4
 SURFACE, INK, INK2, MUTED, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#898781", "#e1e0d9"
 BLUE, RED = "#2a78d6", "#e34948"
@@ -64,9 +64,10 @@ def main():
     ap.add_argument("dir")
     ap.add_argument("-o", "--out", required=True)
     ap.add_argument("--md", action="store_true", help="print markdown tables")
+    ap.add_argument("--configs", default="S,M,L")
     a = ap.parse_args()
     lat = load(a.dir)
-    configs = [c for c in ("S", "M", "D") if any(k[0] == c for k in lat)]
+    configs = [c for c in a.configs.split(",") if any(k[0] == c for k in lat)]
     Bs = sorted({k[1] for k in lat})
     Ls = sorted({k[2] for k in lat})
     fig, axes = plt.subplots(1, len(configs), figsize=(4.6 * len(configs), 3.5), dpi=140, facecolor=SURFACE,
@@ -130,7 +131,7 @@ def main():
     cb.outline.set_visible(False)
     h, l = axes[0][0].get_legend_handles_labels()
     fig.legend(h, l, loc="upper left", ncol=2, frameon=False, fontsize=8.5, labelcolor=INK, bbox_to_anchor=(0.01, 1.07))
-    fig.suptitle("Workload R, 1 GPU, C = 256: recompute latency ÷ best remote-fetch latency (mean of isolated requests; blank = does not fit in memory)",
+    fig.suptitle("Recompute latency ÷ best remote-fetch latency (isolated requests, 1 GPU, 256 candidates; blank = does not fit in memory)",
                  color=INK, fontsize=10, y=1.13, x=0.01, ha="left")
     fig.savefig(a.out, bbox_inches="tight", facecolor=SURFACE)
     print("wrote", a.out)

@@ -44,7 +44,8 @@ class Config:
 CONFIGS = {
     "S": Config("S", layers=3, hidden=512, heads=4, head_dim=128),
     "M": Config("M", layers=8, hidden=1024, heads=4, head_dim=256),
-    "D": Config("D", layers=16, hidden=1024, heads=8, head_dim=128),
+    "D": Config("D", layers=16, hidden=1024, heads=8, head_dim=128),   # deep: parked for now
+    "L": Config("L", layers=8, hidden=2048, heads=8, head_dim=256),    # large: M at 2x width (4x dense, 2x KV)
 }
 
 

@@ -39,7 +39,7 @@ def main():
     ap.add_argument("--flush", type=int, default=0, help="verbs: 1 = cuFlushGPUDirectRDMAWrites per layer")
     ap.add_argument("--seed", type=int, default=99)
     ap.add_argument("--variants", type=int, default=8, help="user sets rotated over requests (distinct users)")
-    ap.add_argument("--p4", default="5a", choices=["5a", "copy", "pdl", "fused"], help="P4 wait variant")
+    ap.add_argument("--p4", default="5a", choices=["5a", "copy", "pdl", "fused", "pdl_early"], help="P4 wait variant")
     ap.add_argument("--store-gpu", action="store_true", help="GIN diagnostic: store window in the store node's GPU "
                     "memory instead of host memory (no data fill, so no data check)")
     ap.add_argument("--label", default=None, help="mode name of the transport in --modes and the results (default: --transport)")
