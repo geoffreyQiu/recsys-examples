@@ -367,13 +367,17 @@ are read back from the store and compared. Grid: M, C = 256, B 1/2/4/8 × prefix
 
 ![P3b tail](figs/p3b-tail.png)
 
-- **Writes never slow the scores.** Over 120 cells × 3 transports, scores-ready with writes is within −5.6% … +4.5% of
-  the same forward without writes (median +0.45%; as many cells faster as slower: run-to-run noise). GPU-initiated
-  puts run on a side stream; CPU-verbs writes are posted by the worker when the GPU flags each layer.
-- **How long the writes stay in flight after the answer** (durable − scores, figure) **grows with the bytes written
-  (B × S × 32 KiB) and shrinks with the prefix:** a longer prefix means more attention work per new token, behind
-  which the writes hide. Short updates (S = 256): ≤ 0.1 ms at every B and P. B = 1: ≤ 0.7 ms. B = 8, S = 1k: 1.8 ms
-  for a fresh sequence, 0.1 ms with a 16k prefix; B = 8, S = 8k: 10.8 ms fresh, 4.3 ms with a 16k prefix.
+- **The writes add no latency to the answer.** End-to-end latency here = request start → candidates' scores ready
+  (what the caller waits for). It is the same with and without the writes: over 120 cells × 3 transports the
+  difference is −5.6% … +4.5% (median +0.45%; about as many cells got faster as slower, i.e. run-to-run noise). The
+  writes run beside the compute (GPU-initiated puts on a side stream; CPU-verbs writes posted by the worker as the
+  GPU flags each layer), and the answer does not wait for them.
+- **The writes finish after the answer. How long after** (durable − scores ready, figure) **grows with the bytes
+  written (B × S × 32 KiB) and shrinks with the prefix:** a longer prefix means more attention work per new token,
+  behind which the writes hide. Short updates (S = 256): ≤ 0.1 ms at every B and P. B = 1: ≤ 0.7 ms. B = 8, S = 1k:
+  1.8 ms for a fresh sequence, 0.1 ms with a 16k prefix; B = 8, S = 8k: 10.8 ms fresh, 4.3 ms with a 16k prefix.
+  A design that must wait until the new K/V are durable before answering (for example so that the same user's next
+  request can read them at once) has the durable time as its latency, i.e. longer by this amount.
 - **Fresh sequences with large writes are NIC-bound:** durable = bytes ÷ NIC write rate (B = 8, S = 8k: 2 GiB
   durable in 46.2 ms = 46.5 GB/s with GIN-GDAKI, 47.1 GB/s with CPU verbs).
 - **Transports tie within ~3%** on durable time; CPU verbs is slightly ahead on the largest writes (−3% at B = 8,
