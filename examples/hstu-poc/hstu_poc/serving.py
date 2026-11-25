@@ -10,6 +10,8 @@
 - Per request: completion time - arrival time (host clock; completion = the batch's done event observed by a
   polling loop, ~10 us granularity).
 """
+import os
+import threading
 import time
 
 import numpy as np
@@ -19,6 +21,19 @@ from .kvsource import LocalKV, VerbsKVSource
 from .model import Batch
 
 _SEQ = {}   # CPU verbs: one sequence counter per engine (its flag array is shared by every region and batch size)
+
+
+def thread_cpu():
+    """CPU seconds per thread of this process (utime + stime from /proc)."""
+    out, hz = {}, os.sysconf("SC_CLK_TCK")
+    for t in os.listdir("/proc/self/task"):
+        try:
+            with open(f"/proc/self/task/{t}/stat") as f:
+                parts = f.read().rsplit(")", 1)[1].split()
+            out[int(t)] = (int(parts[11]) + int(parts[12])) / hz
+        except OSError:
+            pass
+    return out
 
 
 class Executor:
@@ -107,7 +122,9 @@ class Executor:
 
 class Server:
     def __init__(self, model, cfg, L, C, strategy, make_source=None, window=None, max_batch=32, max_wait_ms=2.0,
-                 regions=2):
+                 regions=2, fetch_stream=None, hog=None):
+        """fetch_stream: stream for fetch-at-admission posts (P6: a green-context stream); hog: (ext, ms, period_ms,
+        stream) = a co-located job that fills every SM slot for ms every period_ms (P6)."""
         self.model, self.cfg, self.L, self.C = model, cfg, L, C
         self.strategy, self.make_source, self.window = strategy, make_source, window
         self.max_batch, self.max_wait = max_batch, max_wait_ms / 1e3
@@ -117,7 +134,8 @@ class Server:
         self.region_bytes = (per_req * max_batch + (1 << 21)) // (1 << 21) * (1 << 21) if window is not None else 0
         if window is not None and regions * self.region_bytes > window.numel():
             raise torch.cuda.OutOfMemoryError("window too small for the regions")
-        self.fetch_stream = torch.cuda.Stream()
+        self.fetch_stream = fetch_stream or torch.cuda.Stream()
+        self.hog = hog
         self.pool = torch.cuda.graph_pool_handle()
         self.ex = {}
         for B in self.buckets:
@@ -136,9 +154,17 @@ class Server:
         rec = []                        # (arrival, latency)
         i = nb = 0
         sizes = []
+        c0 = thread_cpu()
         t0 = time.perf_counter()
+        next_hog = 0.0
+        n_sm = torch.cuda.get_device_properties(0).multi_processor_count
         while i < n or queue or inflight:
             now = time.perf_counter() - t0
+            if self.hog is not None and now >= next_hog:      # P6: co-located job, all SM slots for ms
+                E, hog_ms, period_ms, hog_stream = self.hog
+                with torch.cuda.stream(hog_stream):
+                    E.hog(int(hog_ms * 1e6), n_sm * 16, 128)
+                next_hog = now + period_ms / 1e3
             while i < n and arrivals[i] <= now:
                 queue.append(arrivals[i])
                 i += 1
@@ -161,6 +187,11 @@ class Server:
                 nb += 1
                 sizes.append(B)
                 inflight.append((ex, r, arr))
+        wall = time.perf_counter() - t0
+        c1 = thread_cpu()
+        me = threading.get_native_id()
+        self.cpu = dict(wall_s=wall, main_s=c1.get(me, 0) - c0.get(me, 0), requests=n,
+                        other_s=sum(v - c0.get(t, 0) for t, v in c1.items() if t != me))
         rec = np.array(rec)
         kept = rec[rec[:, 0] >= warmup_s]
         span = float((kept[:, 0] + kept[:, 1]).max() - warmup_s)

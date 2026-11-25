@@ -43,6 +43,10 @@ def main():
     ap.add_argument("--seed", type=int, default=99)
     ap.add_argument("--out", required=True)
     ap.add_argument("--tag", default="p5")
+    ap.add_argument("--hog-ms", type=float, default=0, help="P6: co-located job occupying every SM slot for this long")
+    ap.add_argument("--hog-period-ms", type=float, default=10)
+    ap.add_argument("--green-fetch", type=int, default=0, help="P6: posts on a green context with this many SMs "
+                    "(the hog then runs on the rest)")
     a = ap.parse_args()
     rank, world, local = hd.init()
     n = world // 2
@@ -82,9 +86,17 @@ def main():
                 for strat in a.strategies.split(","):
                     name = label if strat == "fetch" else strat
                     mb = a.max_batch if strat != "recompute" else min(a.max_batch, max(1, 65536 // L * 2))
+                    fstream, hog = None, None
+                    if a.green_fetch:
+                        g_small, g_rest, n_small, n_rest = E.green_streams(a.green_fetch)
+                        fstream = torch.cuda.ExternalStream(g_small)
+                    if a.hog_ms:
+                        hs = torch.cuda.ExternalStream(g_rest) if a.green_fetch else torch.cuda.Stream()
+                        hog = (E, a.hog_ms, a.hog_period_ms, hs)
                     try:
                         srv = Server(model, cfg, L, a.C, strat, make_source=make, window=tr.local(),
-                                     max_batch=mb, max_wait_ms=a.max_wait_ms, regions=2 if strat == "fetch" else 1)
+                                     max_batch=mb, max_wait_ms=a.max_wait_ms, regions=2 if strat == "fetch" else 1,
+                                     fetch_stream=fstream, hog=hog)
                     except torch.cuda.OutOfMemoryError as e:
                         print(f"[r{rank}] {name} L={L}: SKIP {str(e)[:80]}", flush=True)
                         continue
@@ -93,13 +105,18 @@ def main():
                         dur = float(min(12.0, max(3.0, 400.0 / q)))
                         lat, rate, mean_b = srv.run(q, dur, warmup_s=1.0, seed=int(q))
                         rec = dict(tag=a.tag, config=a.config, strategy=name, L=L, C=a.C, max_batch=mb,
+                                   hog_ms=a.hog_ms, hog_period_ms=a.hog_period_ms, green_fetch=a.green_fetch,
                                    max_wait_ms=a.max_wait_ms, offered=q, achieved=rate, n=len(lat), mean_batch=mean_b,
                                    p50_ms=float(np.percentile(lat, 50) * 1e3), p90_ms=float(np.percentile(lat, 90) * 1e3),
-                                   p99_ms=float(np.percentile(lat, 99) * 1e3), mean_ms=float(lat.mean() * 1e3))
+                                   p99_ms=float(np.percentile(lat, 99) * 1e3), mean_ms=float(lat.mean() * 1e3),
+                                   cores_other=srv.cpu["other_s"] / srv.cpu["wall_s"],
+                                   cores_main=srv.cpu["main_s"] / srv.cpu["wall_s"],
+                                   cpu_other_ms_per_req=srv.cpu["other_s"] / srv.cpu["requests"] * 1e3)
                         out.write(json.dumps(rec) + "\n")
                         out.flush()
                         print(f"[r{rank}] {name:9s} L={L:5d} offered {q:7.0f}/s achieved {rate:7.1f}/s batch {mean_b:5.1f} "
-                              f"p50 {rec['p50_ms']:8.2f} p90 {rec['p90_ms']:8.2f} p99 {rec['p99_ms']:8.2f} ms", flush=True)
+                              f"p50 {rec['p50_ms']:8.2f} p90 {rec['p90_ms']:8.2f} p99 {rec['p99_ms']:8.2f} ms; cores: transport/other "
+                              f"{rec['cores_other']:.2f}, serving loop {rec['cores_main']:.2f}", flush=True)
                         if rate < 0.85 * q or rec["p99_ms"] > 3000:
                             saturated += 1
                             if saturated >= 2:

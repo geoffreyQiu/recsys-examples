@@ -1,6 +1,6 @@
 # hstu-poc: HSTU inference with remote KV over RDMA (POC)
 
-**Status:** design only. No code yet; P0 and P1 run together later. See the plan in the study doc §10.
+**Status (2026-11-25):** P0–P6 built and measured on Eos. Results: `/lustre/fsw/coreai_devtech_all/junyiq/hstu-kv-rdma/docs/results.md`; plan in the study doc §10.
 **Design and rationale:** `/lustre/fsw/coreai_devtech_all/junyiq/hstu-kv-rdma/docs/hstu-kv-rdma-study.md`
 
 **Goal:** the fastest achievable HSTU inference when user-history KV lives in remote memory, using plain kernels and calls with no KV-manager layer.
@@ -27,24 +27,43 @@
   - **(ii)** wait right before each KV tile's TMA load
 - **Write timing (6′):** a pack kernel copies the new tokens' K/V out of the uvqk buffer and issues the put per layer; commit after the last layer.
 
-## Planned layout
+## Layout (as built)
 ```
 hstu-poc/
   README.md
-  model/      HSTU layer + block (trimmed copy of examples/hstu/modules/paged_hstu_infer_layer.py),
-              random weights, CUDA-graph capture per (batch, length) bucket
-  attn/       copy of FBGEMM's C++ Hopper HSTU forward kernel (for the fusion experiments)
-  kv/         local KV modes A/B (non-paged) then C (paged); ncclMemAlloc single-segment buffers;
-              remote host pool (cuMemCreate HOST_NUMA); static index + commit word
-  transport/  one interface; cpu_verbs (C++, ibverbs); gin (CUDA C++: post/wait kernels, pack+put),
-              GIN-Proxy / GIN-GDAKI via NCCL_GIN_TYPE; raw_gdaki (DOCA GPUNetIO, NCCL's bundled copy)
-  bench/      workloads R and W, baselines (recompute, local hit, local H2D), the grid sweeps
-              (L x C x B, uniform and skewed batches, 1 and 8 GPUs), data checks
-  serving/    thin serving layer (no Triton): open-loop load generator, request queue, dynamic batcher,
-              KV fetch at admission, CUDA-graph execution per bucket, per-request timestamps,
-              max QPS at a p99 target
-  scripts/    Eos launch: srun + pyxis container, env (pattern: hstu-kv-rdma/tools/eos-rdma-smoke.sh)
+  csrc/          C++/CUDA extension (JIT-built by hstu_poc/ext.py into build/ext*)
+    gin_kv.*       GIN transport (NCCL 2.32.7 device API): split-phase gets over N contexts, puts, fence, pollers
+    verbs_kv.*     CPU verbs: RC QPs, worker thread, per-layer host-mapped flags, gated writes, GPU-less store side
+    raw_gdaki.*    raw GDAKI: DOCA GPUNetIO (NCCL's bundled BSD-3 copy, build/doca/libhpoc_doca.so) GPU-side QPs
+    kvutil.*       data pattern fill/check, spin/stamp/seq/flag kernels, SM hog, green-context streams
+    bindings.cpp   pybind11 module hpoc_ext
+  attn/          copy of FBGEMM's Hopper HSTU forward kernel with the P4 wait hook (op namespace hpoc_attn)
+  hstu_poc/
+    model.py       HSTU layers (repo math), forward_full (recompute) and forward_cached (R and W)
+    kvsource.py    KV sources: local hit, host H2D, GIN, CPU verbs, raw GDAKI; P4 wait variants
+    writers.py     workload W writers (GIN, CPU verbs) with a durability fence
+    serving.py     thin serving layer: Poisson load, dynamic batcher, fetch at admission, graphs per bucket
+    attn_ext.py    build/launch of the copied attention kernel
+    ext.py, dist.py
+  bench/
+    p0f_tickets.py  P0-f split-phase across kernels (data checks, negative control, commit into host memory)
+    p1_check.py     P1 kernel/model correctness
+    grid.py         baseline/transport grid runner (one CUDA graph per cell)
+    p2.py p3.py     two-node drivers for workloads R and W (--transport gin|raw|verbs)
+    p4_check.py     slow-producer correctness of the wait variants
+    p5.py           latency-throughput curves of the serving layer
+    p6.py           transfer under SM contention / CPU contention
+  scripts/srun2.sh  2-node launcher (inference ranks on node A, store ranks on node B)
 ```
+
+## Running (Eos; inside `pytorch-26.07.sqsh`)
+```
+tools/build-hstu-attn.sh        # reduced FBGEMM HSTU build (task folder), ~2 min
+tools/build-doca.sh             # standalone DOCA GPUNetIO for raw GDAKI (task folder), ~1 min
+scripts/srun2.sh -j JOB -n 1 -e NCCL_GIN_TYPE=3 -e NCCL_RMA_DISABLE=1 -- python bench/p2.py --transport gin --label gdaki \
+    --modes gdaki,local,h2d --configs M --L 4096,16384 --B 1,8 --C 256 --isolated --out results/p2/x
+```
+Always set `NCCL_RMA_DISABLE=1` for GIN (otherwise NCCL's host-RMA progress thread spins a core).
 
 **Objective of the comparison:** the highest throughput at a fixed p99 end-to-end latency, with per-request latency alongside. The baseline grid comes first; the GPU-SM vs CPU-core balance of transfer work is a later phase (P6).
 

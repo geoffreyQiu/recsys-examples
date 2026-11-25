@@ -40,6 +40,8 @@ def main():
     ap.add_argument("--seed", type=int, default=99)
     ap.add_argument("--variants", type=int, default=8, help="user sets rotated over requests (distinct users)")
     ap.add_argument("--p4", default="5a", choices=["5a", "copy", "pdl", "fused"], help="P4 wait variant")
+    ap.add_argument("--store-gpu", action="store_true", help="GIN diagnostic: store window in the store node's GPU "
+                    "memory instead of host memory (no data fill, so no data check)")
     ap.add_argument("--label", default=None, help="mode name of the transport in --modes and the results (default: --transport)")
     a = ap.parse_args()
     rank, world, local = hd.init()
@@ -58,7 +60,7 @@ def main():
         # NCCL 2.32.7 ("elastic GIN") needs identical window sizes on all ranks: local window = store pool size
         nbytes = int(max(a.local_gb, a.pool_gb)) * 2**30
         pool = nbytes
-        tr = E.GinKV(uid, rank, world, nbytes, not infer, n_ctx=a.nctx + 2, queue_depth=2048, strong_signals=True,
+        tr = E.GinKV(uid, rank, world, nbytes, (not infer) and not a.store_gpu, n_ctx=a.nctx + 2, queue_depth=2048, strong_signals=True,
                      n_signals=4)
         make = lambda cfg: GinKVSource(cfg, tr, E, peer, pool, n_ctx=a.nctx).p4_init(a.p4)  # noqa: E731
     elif a.transport == "raw":
@@ -76,8 +78,10 @@ def main():
         infos = hd.gather(tr.local_info())
         tr.connect(infos[peer])
         make = lambda cfg: VerbsKVSource(cfg, tr, E, pool).p4_init(a.p4)  # noqa: E731
-    if not infer:
+    if not infer and not (a.transport == "gin" and a.store_gpu):
         fill_pool(E, tr.local(), a.seed)
+    if a.transport == "gin" and a.store_gpu:
+        a.ext = None          # no store pattern -> skip the data check
     hd.barrier()
     if rank == 0:
         extra = f" GDR writes ordering attr {tr.gdr_writes_ordering()}" if a.transport == "verbs" else ""

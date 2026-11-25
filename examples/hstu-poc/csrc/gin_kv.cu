@@ -5,6 +5,8 @@
 #include <nccl.h>
 #include <nccl_device.h>
 
+#include <cctype>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -177,15 +179,35 @@ static void host_numa_alloc(void** ptr, size_t* size) {
   int cudaDev = 0, numa = -1;
   CUDA_OK(cudaGetDevice(&cudaDev));
   CU_OK(cuDeviceGet(&dev, cudaDev));
-  CU_OK(cuDeviceGetAttribute(&numa, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, dev));
-  if (numa < 0) numa = 0;
+  // NUMA node of the GPU's PCI device from sysfs. CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID is not reported by driver 535
+  // (it returned < 0, and a fallback to node 0 put every store pool on one socket: ~230 GB/s per node instead of
+  // ~395 with 8 NICs, and half speed for GPUs on the other socket).
+  {
+    char bus[32] = {0};
+    if (cudaDeviceGetPCIBusId(bus, sizeof(bus), cudaDev) == cudaSuccess) {
+      for (char* c = bus; *c; ++c) *c = (char)tolower(*c);
+      std::string path = std::string("/sys/bus/pci/devices/") + bus + "/numa_node";
+      FILE* f = fopen(path.c_str(), "r");
+      if (f) {
+        if (fscanf(f, "%d", &numa) != 1) numa = -1;
+        fclose(f);
+      }
+    }
+    if (numa < 0) cuDeviceGetAttribute(&numa, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, dev);
+    if (numa < 0) numa = 0;
+    fprintf(stderr, "hpoc: GIN host pool on NUMA node %d (GPU %d, %s)\n", numa, cudaDev, bus);
+  }
   CUmemAllocationProp prop = {};
   prop.location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
   prop.location.id = numa;
   prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
   prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
-  size_t gran = 0;
-  CU_OK(cuMemGetAllocationGranularity(&gran, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+  size_t gran = 0, gmin = 0;
+  CU_OK(cuMemGetAllocationGranularity(&gmin, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+  CU_OK(cuMemGetAllocationGranularity(&gran, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+  if (const char* e = getenv("HPOC_HOST_GRAN_MB")) gran = (size_t)atol(e) << 20;   // P2 diagnostic
+  if (gran < gmin) gran = gmin;
+  fprintf(stderr, "hpoc: HOST_NUMA granularity min %zu, recommended/used %zu bytes\n", gmin, gran);
   *size = (*size + gran - 1) / gran * gran;
   CUmemGenericAllocationHandle h;
   CU_OK(cuMemCreate(&h, *size, &prop, 0));
