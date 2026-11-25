@@ -128,8 +128,9 @@ def run_cell(model, cfg, mode, hist, cand, args, extra_sources):
     moved = src.bytes_moved() if src is not None else 0
     bad = src.check(args.ext, args.seed) if (src is not None and hasattr(src, "check") and args.ext) else None
     res = dict(
-        n=n, p50_ms=float(np.percentile(ms, 50)), p99_ms=float(np.percentile(ms, 99)), mean_ms=float(ms.mean()),
-        min_ms=float(ms.min()), users_per_s=B / (ms.mean() / 1e3), hist_tok_per_s=sum(hist) / (ms.mean() / 1e3),
+        n=n, p50_ms=float(np.percentile(ms, 50)), p90_ms=float(np.percentile(ms, 90)),
+        p99_ms=float(np.percentile(ms, 99)), mean_ms=float(ms.mean()), std_ms=float(ms.std(ddof=1)) if n > 1 else 0.0,
+        min_ms=float(ms.min()), max_ms=float(ms.max()), users_per_s=B / (ms.mean() / 1e3), hist_tok_per_s=sum(hist) / (ms.mean() / 1e3),
         tflops=flops / (ms.mean() / 1e3) / 1e12, mem_gb=torch.cuda.max_memory_allocated() / 1e9,
         gbs=moved / (ms.mean() / 1e3) / 1e9, bytes=moved, cpu_ms_per_req=cpu_s / n * 1e3, isolated=bool(args.isolated),
     )
@@ -206,7 +207,8 @@ def run_grid(a, rank, world, extra, gpus=None):
             if "skipped" in rec:
                 print(f"[r{rank}] {c} {mode:9s} B={B:3d} L={L:>5} C={C:4d}: SKIP {rec['skipped']}", flush=True)
             else:
-                print(f"[r{rank}] {c} {mode:9s} B={B:3d} L={L:>5} C={C:4d}: p50 {rec['p50_ms']:8.3f} ms p99 "
+                print(f"[r{rank}] {c} {mode:9s} B={B:3d} L={L:>5} C={C:4d}: mean {rec['mean_ms']:8.3f} "
+                      f"(sd {rec['std_ms']:.3f}) p50 {rec['p50_ms']:8.3f} ms p99 "
                       f"{rec['p99_ms']:8.3f} users/s {rec['users_per_s']:9.1f} TFLOPS {rec['tflops']:6.1f} "
                       f"GB/s {rec['gbs']:6.1f} cpu {rec['cpu_ms_per_req']:.3f} ms/req n={rec['n']}"
                       + (f" check {rec['check_bad_words']}" if "check_bad_words" in rec else ""), flush=True)

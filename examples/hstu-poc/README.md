@@ -42,7 +42,9 @@ hstu-poc/
     model.py       HSTU layers (repo math), forward_full (recompute) and forward_cached (R and W)
     kvsource.py    KV sources: local hit, host H2D, GIN, CPU verbs, raw GDAKI; P4 wait variants
     writers.py     workload W writers (GIN, CPU verbs) with a durability fence
-    serving.py     thin serving layer: Poisson load, dynamic batcher, fetch at admission, graphs per bucket
+    serving.py     thin serving layer: Poisson load, dynamic batcher, fetch at admission, graphs per bucket,
+                   SLO success rate, sampled data checks, explicit close() (no reference cycles)
+    serving_v1.py  the first-pass loop, kept only to reproduce the serving crash (docs/results.md P5b)
     attn_ext.py    build/launch of the copied attention kernel
     ext.py, dist.py
   bench/
@@ -51,9 +53,14 @@ hstu-poc/
     grid.py         baseline/transport grid runner (one CUDA graph per cell)
     p2.py p3.py     two-node drivers for workloads R and W (--transport gin|raw|verbs)
     p4_check.py     slow-producer correctness of the wait variants
-    p5.py           latency-throughput curves of the serving layer
+    p5.py           latency vs offered load of the serving layer (SLO, success, -n 8 = all GPUs at once)
+    p5_v1.py        first-pass driver (serving_v1), crash reproduction only
     p6.py           transfer under SM contention / CPU contention
   scripts/srun2.sh  2-node launcher (inference ranks on node A, store ranks on node B)
+  tools/           analysis behind docs/results.md: p2c_breakeven.py (break-even figure and tables), p2_table.py,
+                   p3_report.py, p4_report.py, plot_p5.py, p5_eight.py (take result-row paths; plots need matplotlib),
+                   numa_check.cu (where cuMemCreate HOST_NUMA pages land)
+  docs/            results.md (measured results, revision 2), figs/, archive/ (first pass)
 ```
 
 ## Running (Eos; inside `pytorch-26.07.sqsh`)

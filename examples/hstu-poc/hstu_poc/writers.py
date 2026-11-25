@@ -146,11 +146,17 @@ class VerbsWriter(WriterBase):
     def setup(self, b, blk):
         super().setup(b, blk)
         self.v.wait_idle()
-        self.seq = int(self.seq_dev.item())
+        # continue the engine's sequence (shared with the read sources): the gate flags and the done flag hold the
+        # last finished seq of any earlier writer, so restarting at 0 would let a new cell's first writes pass early
+        from .kvsource import VerbsKVSource
+        self._eng = VerbsKVSource._engine_seq
+        self.seq = self._eng.get(id(self.v), 0)
+        self.seq_dev.fill_(self.seq)
 
     def pre_replay(self, i):
         super().pre_replay(i)
         self.seq += 1
+        self._eng[id(self.v)] = self.seq
         self.v.post_writes(self.tables[self.cur], self.layer_ptr_cpu, self.seq, 0, self.scratch)
 
     def start(self):
@@ -179,6 +185,7 @@ class VerbsWriter(WriterBase):
         if off > self.scratch:
             return None
         self.seq += 1
+        self._eng[id(self.v)] = self.seq
         self.v.post_reads(torch.tensor(back, dtype=torch.int64), torch.tensor([0, len(back)], dtype=torch.int32),
                           self.seq)
         self.v.wait_idle()

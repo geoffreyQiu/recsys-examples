@@ -48,3 +48,18 @@ def gather(obj):
     out = [None] * dist.get_world_size()
     dist.all_gather_object(out, obj)
     return out
+
+
+def _allreduce(x, op, group):
+    t = torch.tensor([float(x)])
+    if dist.is_initialized():
+        dist.all_reduce(t, op=op, group=group)
+    return float(t.item())
+
+
+def allreduce_min(x, group=None):
+    return _allreduce(x, dist.ReduceOp.MIN, group)
+
+
+def allreduce_max(x, group=None):
+    return _allreduce(x, dist.ReduceOp.MAX, group)

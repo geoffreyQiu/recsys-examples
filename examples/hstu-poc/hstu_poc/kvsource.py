@@ -214,6 +214,20 @@ class RemoteKV(LocalKV, P4):
             self.checks.append(torch.tensor(rows, dtype=torch.int64))
         self.layer_ptr_cpu = torch.tensor(lp, dtype=torch.int32)
         self.cur = 0
+        # P5 sampled data check: per variant, the last layer's rows (it lands last) of up to 8 of its segments,
+        # first 256 KiB of each
+        nl = lp[-1] - lp[-2]
+        self._samples = []
+        for rows in self.checks:
+            last = rows[len(rows) - nl:]
+            idx = torch.linspace(0, len(last) - 1, steps=min(8, len(last))).round().long()
+            t = last[idx].clone()
+            t[:, 1] = torch.clamp(t[:, 1], max=256 << 10)
+            self._samples.append(t.to(self.dev))
+
+    def sample_rows(self):
+        """Rows for a sampled data check of the current request (see setup)."""
+        return self._samples[self.cur]
 
     def bytes_moved(self):
         return sum(self.b.hist) * self.cfg.layers * self.cfg.kv_tok_bytes
@@ -282,14 +296,20 @@ class VerbsKVSource(RemoteKV):
         self.seq = 0
         self.flags = verbs.flags_ptr()
 
+    _engine_seq = {}   # id(engine) -> last seq posted: the worker's flags hold the last finished seq of ANY source
+
     def setup(self, b):
         super().setup(b)
         self.v.wait_idle()
-        self.seq = int(self.seq_dev.item())
+        # continue the engine's sequence, so this source's waits (flags[l] >= seq) cannot pass on an earlier
+        # source's larger flags (that let a new cell's first requests run before their data had landed)
+        self.seq = VerbsKVSource._engine_seq.get(id(self.v), 0)
+        self.seq_dev.fill_(self.seq)
 
     def pre_replay(self, i):
         self.cur = i % self.variants
         self.seq += 1
+        VerbsKVSource._engine_seq[id(self.v)] = self.seq
         if not self.post_after_launch:
             self.v.post_reads(self.tables[self.cur], self.layer_ptr_cpu, self.seq)
 

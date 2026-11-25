@@ -28,10 +28,10 @@ def cells(a):
     for c in a.configs.split(","):
         for B in map(int, a.B.split(",")):
             for C in map(int, a.C.split(",")):
-                for S in map(int, a.fresh.split(",")):            # fresh sequences: P = 0, S = L
+                for S in [int(x) for x in a.fresh.split(",") if x]:   # fresh sequences: P = 0, S = L
                     out.append((c, B, 0, S, C))
-                for P in map(int, a.P.split(",")):
-                    for S in map(int, a.S.split(",")):
+                for P in [int(x) for x in a.P.split(",") if x]:
+                    for S in [int(x) for x in a.S.split(",") if x]:
                         out.append((c, B, P, S, C))
     return out
 
@@ -93,8 +93,11 @@ def run_cell(model, cfg, writer, B, P, S, C, a, E, window):
     durable = (h[:, 2] - h[:, 0]) / 1e6
     bad = writer.readback(E)
     flops = cfg.layers * (linear_flops(b.total_q, cfg) + attn_flops(b, cfg, recompute=False))
+    sd = lambda x: float(x.std(ddof=1)) if len(x) > 1 else 0.0  # noqa: E731
     res = dict(n=n, scores_p50=float(np.percentile(scores, 50)), scores_p99=float(np.percentile(scores, 99)),
                durable_p50=float(np.percentile(durable, 50)), durable_p99=float(np.percentile(durable, 99)),
+               scores_mean=float(scores.mean()), scores_std=sd(scores), durable_mean=float(durable.mean()),
+               durable_std=sd(durable), tail_mean=float((durable - scores).mean()),
                bytes=writer.bytes, write_gbs=writer.bytes / (np.median(durable) / 1e3) / 1e9 if writer.bytes else 0.0,
                cpu_ms_per_req=cpu_s / n * 1e3, tflops=flops / (np.median(scores) / 1e3) / 1e12,
                mem_gb=torch.cuda.max_memory_allocated() / 1e9)
@@ -177,8 +180,8 @@ def main():
                     if "skipped" in rec:
                         print(f"[r{rank}] {c} {rec['mode']:6s} B={B:3d} P={P:5d} S={S:5d} C={C:4d}: SKIP {rec['skipped']}", flush=True)
                     else:
-                        print(f"[r{rank}] {c} {rec['mode']:6s} B={B:3d} P={P:5d} S={S:5d} C={C:4d}: scores p50 "
-                              f"{rec['scores_p50']:8.3f} ms, durable p50 {rec['durable_p50']:8.3f} p99 {rec['durable_p99']:8.3f}"
+                        print(f"[r{rank}] {c} {rec['mode']:6s} B={B:3d} P={P:5d} S={S:5d} C={C:4d}: scores mean "
+                              f"{rec['scores_mean']:8.3f} ms, durable mean {rec['durable_mean']:8.3f} p99 {rec['durable_p99']:8.3f}"
                               f" ms, write {rec['write_gbs']:5.1f} GB/s, cpu {rec['cpu_ms_per_req']:.3f} ms/req"
                               + (f", readback bad {rec['readback_bad_bytes']}" if "readback_bad_bytes" in rec else ""),
                               flush=True)

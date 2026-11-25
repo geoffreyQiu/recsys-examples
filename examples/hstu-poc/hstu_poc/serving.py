@@ -8,7 +8,13 @@
   fetch stream; CPU verbs: the worker thread posts. The compute graph (per batch size and region) waits per layer.
 - Strategies: fetch (a remote transport), local (KV already in GPU memory: the upper bound), recompute (no cache).
 - Per request: completion time - arrival time (host clock; completion = the batch's done event observed by a
-  polling loop, ~10 us granularity).
+  polling loop, ~10 us granularity). A request succeeds when it completes within the SLO and its batch had no error.
+- Data check (fetch): every check_every-th batch, after it completes and before its region is reused, a kernel on a
+  side stream compares a sample of the fetched rows (the last layer's K/V of up to 8 users, 256 KiB each: the last
+  layer lands last) with the store's seeded pattern. Mismatched words count as errors for that batch's requests.
+- Lifetime: an Executor keeps no reference to its Server. (It used to, and the cycle left a dropped Server to Python's
+  cycle collector, which freed it at a random time while the next Server was running: the serving crash, see
+  docs/results.md P5.) Server.close() frees everything explicitly with the GPU idle.
 """
 import os
 import threading
@@ -19,8 +25,6 @@ import torch
 
 from .kvsource import LocalKV, VerbsKVSource
 from .model import Batch
-
-_SEQ = {}   # CPU verbs: one sequence counter per engine (its flag array is shared by every region and batch size)
 
 
 def thread_cpu():
@@ -37,14 +41,15 @@ def thread_cpu():
 
 
 class Executor:
-    """One CUDA graph for (batch size, region)."""
+    """One CUDA graph for (batch size, region). Holds no reference to the Server (no reference cycle)."""
 
-    def __init__(self, server, B, region):
-        s = server
+    def __init__(self, s, B, region):
         cfg, model, L, C = s.cfg, s.model, s.L, s.C
-        self.B, self.region, self.server = B, region, s
+        self.B, self.region = B, region
+        self.strategy, self.fetch_stream = s.strategy, s.fetch_stream
         dev = torch.device("cuda")
         self.src = None
+        acts = None
         if s.strategy == "recompute":
             b = Batch([0] * B, [C] * B, new=[L] * B, device=dev)
             items = torch.randint(0, cfg.n_items, (b.total_k,), device=dev)
@@ -73,7 +78,7 @@ class Executor:
                 return y
         self.b = b
         # the graph captures these tensors' addresses: keep them alive as long as the executor
-        self._keep = (fwd, items, locals().get("acts"))
+        self._keep = (fwd, items, acts)
         self.done = torch.cuda.Event()
         self.posted = torch.cuda.Event()
         # warm-up (eager, after a real transfer), then capture the compute graph (the post stays outside)
@@ -93,21 +98,21 @@ class Executor:
     def _post(self, i):
         """Start this batch's KV transfer now (fetch at admission). Never waits for earlier batches' compute: the
         region is free (the CPU only reuses a region after its previous batch's done event)."""
-        src, s = self.src, self.server
+        src = self.src
         main = torch.cuda.current_stream()
-        if src is None or s.strategy == "local":
+        if src is None or self.strategy == "local":
             self.posted.record(main)
             return
         if isinstance(src, VerbsKVSource):
-            key = id(src.v)
-            _SEQ[key] = _SEQ.get(key, 0) + 1
-            src.seq = _SEQ[key]
+            key = id(src.v)                          # one sequence per engine, shared with every other source
+            src.seq = VerbsKVSource._engine_seq.get(key, 0) + 1
+            VerbsKVSource._engine_seq[key] = src.seq
             src.cur = i % src.variants
             src.seq_dev.fill_(src.seq)              # main stream: ordered before this batch's waits
             src.v.post_reads(src.tables[src.cur], src.layer_ptr_cpu, src.seq)
             self.posted.record(main)
         else:
-            fs = s.fetch_stream
+            fs = self.fetch_stream
             with torch.cuda.stream(fs):
                 src.pre_replay(i)                   # this request's users (D2D copy of the plan) + post kernel
                 src.post()
@@ -119,12 +124,19 @@ class Executor:
         self.graph.replay()
         self.done.record()
 
+    def close(self):
+        self.graph.reset()
+        if self.src is not None:
+            self.src.release()
+        self.src, self._keep, self.b = None, None, None
+
 
 class Server:
     def __init__(self, model, cfg, L, C, strategy, make_source=None, window=None, max_batch=32, max_wait_ms=2.0,
-                 regions=2, fetch_stream=None, hog=None):
+                 regions=2, fetch_stream=None, hog=None, check_every=0, ext=None, seed=0):
         """fetch_stream: stream for fetch-at-admission posts (P6: a green-context stream); hog: (ext, ms, period_ms,
-        stream) = a co-located job that fills every SM slot for ms every period_ms (P6)."""
+        stream) = a co-located job that fills every SM slot for ms every period_ms (P6). check_every: data check of
+        every n-th fetched batch (needs ext and the store's seed)."""
         self.model, self.cfg, self.L, self.C = model, cfg, L, C
         self.strategy, self.make_source, self.window = strategy, make_source, window
         self.max_batch, self.max_wait = max_batch, max_wait_ms / 1e3
@@ -136,29 +148,66 @@ class Server:
             raise torch.cuda.OutOfMemoryError("window too small for the regions")
         self.fetch_stream = fetch_stream or torch.cuda.Stream()
         self.hog = hog
+        self.check_every = check_every if (strategy == "fetch" and ext is not None) else 0
+        self.E, self.seed = ext, seed
+        self.check_stream = torch.cuda.Stream()
+        nslot = 2 * regions
+        self._bad_dev = torch.zeros(nslot, dtype=torch.int64, device="cuda")
+        self._bad_host = torch.zeros(nslot, dtype=torch.int64).pin_memory()
+        self._slot = 0
         self.pool = torch.cuda.graph_pool_handle()
         self.ex = {}
         for B in self.buckets:
             for r in range(regions):
                 self.ex[(B, r)] = Executor(self, B, r)
+        # Replay every graph once now, GPU otherwise idle (a real transfer for fetch). A graph's first launch uploads
+        # it; with the old loop, first launches under load in a process that had returned memory to the driver
+        # (PyTorch empties its cache before every capture) faulted (Xid 31, no kernel running; results.md P5).
+        for k, ex in enumerate(self.ex.values()):
+            ex.launch(k)
+            torch.cuda.synchronize()
 
-    def run(self, qps, duration_s, warmup_s=1.0, seed=0):
-        """Open-loop run. Returns latencies (s) of requests that arrived after the warm-up, the achieved completion
-        rate over the measured span, and the number of batches."""
+    def close(self):
+        """Free every graph and source now, with the GPU idle."""
+        torch.cuda.synchronize()
+        for ex in self.ex.values():
+            ex.close()
+        self.ex = {}
+        torch.cuda.synchronize()
+
+    def _check(self, ex):
+        """Queue a sampled data check of ex's last batch on the check stream; returns (event, slot)."""
+        k = self._slot % self._bad_dev.numel()
+        self._slot += 1
+        src = ex.src
+        with torch.cuda.stream(self.check_stream):
+            self.check_stream.wait_event(ex.done)
+            self._bad_dev[k:k + 1].zero_()
+            self.E.check_pattern_gpu(src.local_buf, src.sample_rows(), self.seed, self._bad_dev[k:k + 1])
+            self._bad_host[k:k + 1].copy_(self._bad_dev[k:k + 1], non_blocking=True)
+            ev = torch.cuda.Event()
+            ev.record(self.check_stream)
+        return ev, k
+
+    def run(self, qps, duration_s, warmup_s=1.0, seed=0, gc_at=None, slo_ms=100.0):
+        """Open-loop run. Returns a dict: latencies (s) of requests that arrived after the warm-up, the achieved
+        completion rate over the measured span, mean batch size, SLO success fraction, data-check counts."""
         rng = np.random.default_rng(seed)
         n = int(qps * (duration_s + warmup_s))
         arrivals = np.cumsum(rng.exponential(1.0 / qps, size=n))
         queue = []                      # arrival times of waiting requests
-        inflight = []                   # (executor, region, [arrival times])
+        inflight = []                   # (executor, region, [arrival times], batch index)
+        checking = []                   # (event, slot, region, [arrival times]): sampled data checks in flight
         free = list(range(self.regions))
-        rec = []                        # (arrival, latency)
+        rec = []                        # (arrival, latency, batch had a data error)
         i = nb = 0
         sizes = []
+        n_checks = bad_words = bad_batches = 0
         c0 = thread_cpu()
         t0 = time.perf_counter()
         next_hog = 0.0
         n_sm = torch.cuda.get_device_properties(0).multi_processor_count
-        while i < n or queue or inflight:
+        while i < n or queue or inflight or checking:
             now = time.perf_counter() - t0
             if self.hog is not None and now >= next_hog:      # P6: co-located job, all SM slots for ms
                 E, hog_ms, period_ms, hog_stream = self.hog
@@ -170,23 +219,43 @@ class Server:
                 i += 1
             if inflight:
                 still = []
-                for ex, r, arr in inflight:
+                for ex, r, arr, k in inflight:
                     if ex.done.query():
                         t = time.perf_counter() - t0
-                        rec.extend((a, t - a) for a in arr)
+                        if self.check_every and k % self.check_every == 0:
+                            ev, slot = self._check(ex)
+                            checking.append((ev, slot, r, [(a, t - a) for a in arr]))
+                        else:
+                            rec.extend((a, t - a, 0) for a in arr)
+                            free.append(r)
+                    else:
+                        still.append((ex, r, arr, k))
+                inflight = still
+            if checking:
+                left = []
+                for ev, slot, r, lat in checking:
+                    if ev.query():
+                        bad = int(self._bad_host[slot])
+                        n_checks += 1
+                        bad_words += bad
+                        bad_batches += bad > 0
+                        rec.extend((a, l, int(bad > 0)) for a, l in lat)
                         free.append(r)
                     else:
-                        still.append((ex, r, arr))
-                inflight = still
+                        left.append((ev, slot, r, lat))
+                checking = left
             if queue and free and (not inflight or len(queue) >= self.max_batch or now - queue[0] >= self.max_wait):
                 B = max(b for b in self.buckets if b <= len(queue))
                 r = free.pop(0)
                 ex = self.ex[(B, r)]
                 arr, queue = queue[:B], queue[B:]
                 ex.launch(nb)
+                inflight.append((ex, r, arr, nb))
                 nb += 1
                 sizes.append(B)
-                inflight.append((ex, r, arr))
+                if gc_at is not None and nb == gc_at:
+                    import gc
+                    print(f"gc.collect() at batch {nb}: {gc.collect()} objects", flush=True)
         wall = time.perf_counter() - t0
         c1 = thread_cpu()
         me = threading.get_native_id()
@@ -194,5 +263,10 @@ class Server:
                         other_s=sum(v - c0.get(t, 0) for t, v in c1.items() if t != me))
         rec = np.array(rec)
         kept = rec[rec[:, 0] >= warmup_s]
+        lat = kept[:, 1]
         span = float((kept[:, 0] + kept[:, 1]).max() - warmup_s)
-        return kept[:, 1], len(kept) / max(span, 1e-9), float(np.mean(sizes))
+        ok = (lat <= slo_ms / 1e3) & (kept[:, 2] == 0)
+        return dict(lat=lat, achieved=len(kept) / max(span, 1e-9), mean_batch=float(np.mean(sizes)), batches=nb,
+                    slo_ms=slo_ms, success=float(ok.mean()), goodput=float(ok.sum()) / max(span, 1e-9),
+                    checks=n_checks, bad_words=bad_words, bad_batches=bad_batches,
+                    err_requests=int(kept[:, 2].sum()))
