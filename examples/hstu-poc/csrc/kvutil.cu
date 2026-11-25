@@ -1,5 +1,6 @@
 #include "kvutil.h"
 
+#include <cuda.h>
 #include <omp.h>
 
 #include <stdexcept>
@@ -88,6 +89,7 @@ void wait_flag_gpu(const volatile uint32_t* flag, uint32_t value, uint64_t* stam
 
 __global__ void seq_inc_kernel(uint32_t* seq) { *seq += 1; }
 __global__ void wait_flags_seq_kernel(const volatile uint32_t* flags, int layer, const uint32_t* seq, uint64_t* stamp) {
+  asm volatile("griddepcontrol.launch_dependents;");   // P4 PDL
   const uint32_t want = *seq;
   while (flags[layer] < want) {
   }
@@ -95,6 +97,21 @@ __global__ void wait_flags_seq_kernel(const volatile uint32_t* flags, int layer,
   if (stamp) stamp[layer] = gtimer();
 }
 void seq_inc_gpu(uint32_t* seq, cudaStream_t s) { seq_inc_kernel<<<1, 1, 0, s>>>(seq); }
+// P4 fused, CPU verbs: relay the CPU's host-mapped per-layer flags into device ready words (one thread polls PCIe,
+// the attention CTAs spin on L2)
+__global__ void relay_flags_kernel(const volatile uint32_t* host_flags, int n_layers, const uint32_t* seq, uint32_t* ready) {
+  const uint32_t s = *seq;
+  for (int l = 0; l < n_layers; ++l) {
+    while (host_flags[l] < s) {
+    }
+    __threadfence_system();
+    asm volatile("st.release.gpu.global.u32 [%0], %1;" ::"l"(ready + l), "r"(s) : "memory");
+  }
+}
+void relay_flags_gpu(const volatile uint32_t* host_flags, int n_layers, const uint32_t* seq, uint32_t* ready,
+                     cudaStream_t s) {
+  relay_flags_kernel<<<1, 1, 0, s>>>(host_flags, n_layers, seq, ready);
+}
 __global__ void set_flag_seq_kernel(volatile uint32_t* flags, int layer, const uint32_t* seq) {
   __threadfence_system();
   flags[layer] = *seq;
@@ -105,6 +122,45 @@ void set_flag_seq_gpu(volatile uint32_t* flags, int layer, const uint32_t* seq, 
 void wait_flags_seq_gpu(const volatile uint32_t* flags, int layer, const uint32_t* seq, uint64_t* stamp,
                         cudaStream_t s) {
   wait_flags_seq_kernel<<<1, 1, 0, s>>>(flags, layer, seq, stamp);
+}
+
+__global__ void hog_kernel(int64_t ns) {
+  if (threadIdx.x == 0) {
+    uint64_t t0 = gtimer();
+    while ((int64_t)(gtimer() - t0) < ns) {
+    }
+  }
+  __syncthreads();
+}
+void hog_gpu(int64_t ns, int blocks, int threads, cudaStream_t s) { hog_kernel<<<blocks, threads, 0, s>>>(ns); }
+
+#define GC_OK(x)                                                                                \
+  do {                                                                                          \
+    CUresult r_ = (x);                                                                          \
+    if (r_ != CUDA_SUCCESS) throw std::runtime_error(std::string("green ctx: ") + #x + " = " + std::to_string((int)r_)); \
+  } while (0)
+void green_streams(int n_sms, uint64_t* stream_small, uint64_t* stream_rest, int* sms_small, int* sms_rest) {
+  int dev = 0;
+  cudaGetDevice(&dev);
+  CUdevice cd;
+  GC_OK(cuDeviceGet(&cd, dev));
+  CUdevResource sm{}, part{}, rem{};
+  GC_OK(cuDeviceGetDevResource(cd, &sm, CU_DEV_RESOURCE_TYPE_SM));
+  unsigned n = 1;
+  GC_OK(cuDevSmResourceSplitByCount(&part, &n, &sm, &rem, 0, (unsigned)n_sms));
+  CUdevResourceDesc d1, d2;
+  GC_OK(cuDevResourceGenerateDesc(&d1, &part, 1));
+  GC_OK(cuDevResourceGenerateDesc(&d2, &rem, 1));
+  CUgreenCtx g1, g2;
+  GC_OK(cuGreenCtxCreate(&g1, d1, cd, CU_GREEN_CTX_DEFAULT_STREAM));
+  GC_OK(cuGreenCtxCreate(&g2, d2, cd, CU_GREEN_CTX_DEFAULT_STREAM));
+  CUstream s1, s2;
+  GC_OK(cuGreenCtxStreamCreate(&s1, g1, CU_STREAM_NON_BLOCKING, 0));
+  GC_OK(cuGreenCtxStreamCreate(&s2, g2, CU_STREAM_NON_BLOCKING, 0));
+  *stream_small = (uint64_t)s1;
+  *stream_rest = (uint64_t)s2;
+  *sms_small = (int)part.sm.smCount;
+  *sms_rest = (int)rem.sm.smCount;
 }
 
 }  // namespace hpoc

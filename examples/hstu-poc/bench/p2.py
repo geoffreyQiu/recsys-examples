@@ -39,6 +39,7 @@ def main():
     ap.add_argument("--flush", type=int, default=0, help="verbs: 1 = cuFlushGPUDirectRDMAWrites per layer")
     ap.add_argument("--seed", type=int, default=99)
     ap.add_argument("--variants", type=int, default=8, help="user sets rotated over requests (distinct users)")
+    ap.add_argument("--p4", default="5a", choices=["5a", "copy", "pdl", "fused"], help="P4 wait variant")
     ap.add_argument("--label", default=None, help="mode name of the transport in --modes and the results (default: --transport)")
     a = ap.parse_args()
     rank, world, local = hd.init()
@@ -59,7 +60,7 @@ def main():
         pool = nbytes
         tr = E.GinKV(uid, rank, world, nbytes, not infer, n_ctx=a.nctx + 2, queue_depth=2048, strong_signals=True,
                      n_signals=4)
-        make = lambda cfg: GinKVSource(cfg, tr, E, peer, pool, n_ctx=a.nctx)  # noqa: E731
+        make = lambda cfg: GinKVSource(cfg, tr, E, peer, pool, n_ctx=a.nctx).p4_init(a.p4)  # noqa: E731
     elif a.transport == "raw":
         # raw GDAKI on the inference side; the store is the same GPU-less verbs pool as for CPU verbs
         if infer:
@@ -68,13 +69,13 @@ def main():
             tr = E.VerbsKV(NICS[local], pool, False, a.nqp, 64, 0, -1)
         infos = hd.gather(tr.local_info())
         tr.connect(infos[peer])
-        make = lambda cfg: RawGdakiSource(cfg, tr, pool)  # noqa: E731
+        make = lambda cfg: RawGdakiSource(cfg, tr, E, pool).p4_init(a.p4)  # noqa: E731
     else:
         nbytes = int(a.local_gb * 2**30) if infer else pool
         tr = E.VerbsKV(NICS[local], nbytes, infer, a.nqp, 64, a.flush, WORKER_CORES[local])
         infos = hd.gather(tr.local_info())
         tr.connect(infos[peer])
-        make = lambda cfg: VerbsKVSource(cfg, tr, E, pool)  # noqa: E731
+        make = lambda cfg: VerbsKVSource(cfg, tr, E, pool).p4_init(a.p4)  # noqa: E731
     if not infer:
         fill_pool(E, tr.local(), a.seed)
     hd.barrier()

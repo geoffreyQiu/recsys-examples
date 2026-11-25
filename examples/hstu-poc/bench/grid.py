@@ -74,7 +74,7 @@ def run_cell(model, cfg, mode, hist, cand, args, extra_sources):
         def fwd():
             src.start()
             x = model.embed(items, None, b.pos_q)
-            y = model.forward_cached(x, b, src.kv, before_attn=src.before_attn)
+            y = model.forward_cached(x, b, src.kv, before_attn=src.before_attn, attn_fn=getattr(src, "attn_fn", None))
             src.end()
             return y
 
@@ -87,9 +87,15 @@ def run_cell(model, cfg, mode, hist, cand, args, extra_sources):
             fwd()
     torch.cuda.current_stream().wait_stream(s)
     torch.cuda.synchronize()
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
-        fwd()
+    if getattr(args, "eager", False):     # P4: no CUDA graph, launch every kernel per request
+        class _Eager:
+            def replay(self):
+                fwd()
+        g = _Eager()
+    else:
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            fwd()
     torch.cuda.synchronize()
     # estimate, then measure
     t0 = time.perf_counter()
@@ -150,6 +156,7 @@ def add_args(ap):
     ap.add_argument("--out", required=True)
     ap.add_argument("--tag", default="")
     ap.add_argument("--isolated", action="store_true", help="sync before each request (no overlap between requests)")
+    ap.add_argument("--eager", action="store_true", help="no CUDA graph (P4 baseline)")
 
 
 def main():

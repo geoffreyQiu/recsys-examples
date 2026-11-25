@@ -26,6 +26,7 @@ class RawGdaki {
   void post_gets(const Seg* segs, const int* layer_ptr, int n_layers, uint64_t* tickets, uint64_t* t_post,
                  cudaStream_t s);
   void wait_layer(const uint64_t* tickets, int layer, uint64_t* t_done, cudaStream_t s);
+  void poll(const uint64_t* tickets, int n_layers, const uint32_t* seq, uint32_t* ready, cudaStream_t s);   // P4 fused
   void destroy();
 
  private:

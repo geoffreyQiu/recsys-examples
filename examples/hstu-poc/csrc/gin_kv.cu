@@ -72,12 +72,32 @@ __global__ void gin_post_gets_kernel(ncclDevComm dcomm, ncclWindow_t win, int ct
 
 __global__ void gin_wait_kernel(ncclDevComm dcomm, int ctx0, int n_ctx, ncclGinRequest_t* tickets, int layer,
                                 uint64_t* t_done) {
+  asm volatile("griddepcontrol.launch_dependents;");   // P4 PDL: let the next kernel's prologue start now
   for (int c = 0; c < n_ctx; ++c) {
     ncclGin gin(dcomm, ctx0 + c);
     ncclGinRequest_t r = tickets[layer * n_ctx + c];
     gin.wait(r);
   }
   if (t_done) t_done[layer] = globaltimer();
+}
+
+__device__ __forceinline__ void store_release(uint32_t* p, uint32_t v) {
+  asm volatile("st.release.gpu.global.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
+}
+
+// P4 fused: one thread waits on each layer's tickets in order and publishes ready[l] = seq for the attention kernel
+__global__ void gin_poll_kernel(ncclDevComm dcomm, int ctx0, int n_ctx, ncclGinRequest_t* tickets, int n_layers,
+                                const uint32_t* seq, uint32_t* ready) {
+  const uint32_t s = *seq;
+  for (int l = 0; l < n_layers; ++l) {
+    for (int c = 0; c < n_ctx; ++c) {
+      ncclGin gin(dcomm, ctx0 + c);
+      ncclGinRequest_t r = tickets[l * n_ctx + c];
+      gin.wait(r);
+    }
+    __threadfence();
+    store_release(ready + l, s);
+  }
 }
 
 __global__ void gin_put_kernel(ncclDevComm dcomm, ncclWindow_t win, int ctx, int peer, const Seg* segs, int n,
@@ -281,6 +301,12 @@ void GinKV::post_gets(const Seg* segs, const int* layer_ptr, int n_layers, void*
 
 void GinKV::wait_layer(void* tickets, int layer, int ctx0, int n_ctx, uint64_t* t_done, cudaStream_t s) {
   gin_wait_kernel<<<1, 1, 0, s>>>(p_->dcomm, ctx0, n_ctx, (ncclGinRequest_t*)tickets, layer, t_done);
+  CUDA_OK(cudaGetLastError());
+}
+
+void GinKV::poll(void* tickets, int n_layers, int ctx0, int n_ctx, const uint32_t* seq, uint32_t* ready,
+                 cudaStream_t s) {
+  gin_poll_kernel<<<1, 1, 0, s>>>(p_->dcomm, ctx0, n_ctx, (ncclGinRequest_t*)tickets, n_layers, seq, ready);
   CUDA_OK(cudaGetLastError());
 }
 

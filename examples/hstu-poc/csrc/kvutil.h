@@ -35,9 +35,17 @@ void wait_flag_gpu(const volatile uint32_t* flag, uint32_t value, uint64_t* stam
 // Request sequence numbers for CPU-posted transports inside CUDA graphs: the graph's first kernel does
 // (*seq)++, and the per-layer wait spins until flags[layer] >= *seq (the CPU stores seq into flags[layer]).
 void seq_inc_gpu(uint32_t* seq, cudaStream_t s);
+void relay_flags_gpu(const volatile uint32_t* host_flags, int n_layers, const uint32_t* seq, uint32_t* ready,
+                     cudaStream_t s);   // P4 fused, CPU verbs
 // flags[layer] = *seq, after a system-scope fence (host-mapped flags read by a CPU thread)
 void set_flag_seq_gpu(volatile uint32_t* flags, int layer, const uint32_t* seq, cudaStream_t s);
 void wait_flags_seq_gpu(const volatile uint32_t* flags, int layer, const uint32_t* seq, uint64_t* stamp,
                         cudaStream_t s);
+
+// P6: an SM hog (every block's thread 0 spins for ns while the block stays resident) and green contexts.
+void hog_gpu(int64_t ns, int blocks, int threads, cudaStream_t s);
+// Split the device's SMs: a green context with n_sms (for transfer kernels) and one with the rest. Returns the two
+// streams (CUstream handles usable as cudaStream_t) and the actual SM counts.
+void green_streams(int n_sms, uint64_t* stream_small, uint64_t* stream_rest, int* sms_small, int* sms_rest);
 
 }  // namespace hpoc

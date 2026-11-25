@@ -186,7 +186,7 @@ class HSTU(torch.nn.Module):
         return self.head(x[b.cand_in_full])
 
     # ------------------------------------------------------------------ cached history (R, W)
-    def forward_cached(self, xq, b: Batch, kv, before_attn=None, after_kv=None):
+    def forward_cached(self, xq, b: Batch, kv, before_attn=None, after_kv=None, attn_fn=None):
         """xq: [total_q, hidden] embedded tokens computed now (W's new tokens + candidates).
         kv(layer) -> (K, V) buffers [>= total_k, H, D] whose rows [k_off[u], k_off[u] + L_u) hold user u's
         cached history; this function writes the new tokens' K/V after it, then runs one attention call
@@ -201,9 +201,12 @@ class HSTU(torch.nn.Module):
             V.index_copy_(0, b.q_dst, v)
             if after_kv is not None:
                 after_kv(i, k, v)
-            if before_attn is not None:
-                before_attn(i)
-            a = self.attention(q, K, V, b.cu_q, b.cu_k, b.max_q, b.max_k, b.num_targets)
+            if attn_fn is not None:       # P4 variants: the source owns the wait and the attention launch
+                a = attn_fn(i, q, K, V, b, self)
+            else:
+                if before_attn is not None:
+                    before_attn(i)
+                a = self.attention(q, K, V, b.cu_q, b.cu_k, b.max_q, b.max_k, b.num_targets)
             x = self.finish(i, a, u, x)
         return self.head(x[b.cand_in_q])
 

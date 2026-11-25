@@ -117,16 +117,68 @@ class H2DKV(LocalKV):
         self.host, self.plan = None, None
 
 
-class RemoteKV(LocalKV):
+class P4:
+    """P4 wait variants for the remote sources (study doc §5.4):
+      5a     stock FBGEMM kernel; a 1-thread wait kernel before each layer's attention (the default)
+      copy   the copied kernel (attn/hstu_hopper) with the same 5'a waits: shows the copy itself costs nothing
+      pdl    copied kernel launched with programmatic dependent launch right after the wait kernel, which triggers
+             it on entry: the attention prologue overlaps the wait; griddepcontrol.wait before the first K/V load
+      fused  no wait kernels: a 1-thread poller on a side stream publishes per-layer ready words (GIN/raw: waits on
+             the tickets; CPU verbs: relays the CPU's host flags); the copied kernel's producer warp spins on its
+             layer's word before the first K/V load (variant (i))
+    slow_ns > 0 delays posting (a slow producer) to prove that the waits really wait."""
+    p4 = "5a"
+    slow_ns = 0
+    attn_fn = None
+
+    def p4_init(self, mode="5a", slow_ns=0):
+        self.p4, self.slow_ns = mode, slow_ns
+        self.ready = torch.zeros(self.cfg.layers, dtype=torch.int32, device=self.dev)
+        if not hasattr(self, "seq_dev"):
+            self.seq_dev = torch.zeros(1, dtype=torch.int32, device=self.dev)
+        self.p4_side = torch.cuda.Stream(device=self.dev)
+        self.attn_fn = None if mode == "5a" else self._p4_attn
+        return self
+
+    def _p4_attn(self, l, q, K, V, b, model):
+        from .attn_ext import hstu_fwd
+        args = (q, K, V, b.cu_q, b.cu_k, b.max_q, b.max_k, model.cfg.max_len, b.num_targets, model.alpha)
+        if self.p4 == "fused":
+            return hstu_fwd(*args, kv_ready=self.ready.data_ptr() + 4 * l, kv_seq=self.seq_dev.data_ptr(), mode=1)
+        self.before_attn(l)
+        if self.p4 == "pdl":
+            return hstu_fwd(*args, mode=2, pdl=True)
+        return hstu_fwd(*args)
+
+    def p4_fork(self, launch):
+        main = torch.cuda.current_stream()
+        self.p4_side.wait_stream(main)
+        with torch.cuda.stream(self.p4_side):
+            launch()
+
+    def p4_join(self):
+        if self.p4 == "fused":
+            torch.cuda.current_stream().wait_stream(self.p4_side)
+
+
+class RemoteKV(LocalKV, P4):
     """History in a remote store's memory (one slot per user: [layer][K|V][slot_len][heads][head_dim]).
     Subclasses move it with a transport; this class builds the transfer plan. Users are distinct per request
     and rotate over `variants` user sets between requests (production-like scattered reads)."""
     variants = 8
 
+    base = 0               # byte offset of this source's buffers inside the transport window (P5 regions)
+    post_outside = False   # P5: the transfer is posted by post() outside the compute graph (fetch at admission)
+
     def __init__(self, cfg, local_buf, pool_bytes, device="cuda", seed=7):
         super().__init__(cfg, device, local_buf)
         self.pool_bytes = pool_bytes
         self.rng = __import__("numpy").random.default_rng(seed)
+
+    def alloc(self, nbytes):
+        if self.base + nbytes > self.local_buf.numel():
+            raise torch.cuda.OutOfMemoryError(f"local window {self.local_buf.numel() / 1e9:.1f} GB < {(self.base + nbytes) / 1e9:.1f} GB")
+        return self.local_buf[self.base:self.base + nbytes]
 
     def setup(self, b: Batch):
         cfg = self.cfg
@@ -154,7 +206,7 @@ class RemoteKV(LocalKV):
                         continue
                     for kv in range(2):
                         remote = int(users[u]) * slot + (2 * l + kv) * slot_len * tok
-                        local = (2 * l + kv) * self.blk + b.k_off[u] * tok
+                        local = self.base + (2 * l + kv) * self.blk + b.k_off[u] * tok
                         segs.append([remote, local, L * tok, int(users[u])])
                         rows.append([local, L * tok, 0, remote // 8])     # store pattern is by word offset
                 lp.append(len(segs))
@@ -198,10 +250,23 @@ class GinKVSource(RemoteKV):
         self.segs.copy_(self.dev_tables[self.cur], non_blocking=True)
 
     def start(self):
+        if self.slow_ns:
+            self.E.spin(self.slow_ns)
+        if self.p4 == "fused":
+            self.E.seq_inc(self.seq_dev)
+        if not self.post_outside:
+            self.post()
+        if self.p4 == "fused":
+            self.p4_fork(lambda: self.g.poll(self.tickets, self.cfg.layers, 0, self.n_ctx, self.seq_dev, self.ready))
+
+    def post(self):
         self.g.post_gets(self.segs, self.lp, self.tickets, self.peer, ctx0=0, n_ctx=self.n_ctx)
 
     def before_attn(self, l):
         self.g.wait_layer(self.tickets, l, 0, self.n_ctx)
+
+    def end(self):
+        self.p4_join()
 
 
 class VerbsKVSource(RemoteKV):
@@ -225,13 +290,24 @@ class VerbsKVSource(RemoteKV):
     def pre_replay(self, i):
         self.cur = i % self.variants
         self.seq += 1
+        if not self.post_after_launch:
+            self.v.post_reads(self.tables[self.cur], self.layer_ptr_cpu, self.seq)
+
+    post_after_launch = False   # slow-producer check: the caller launches the graph, then calls post_now()
+
+    def post_now(self):
         self.v.post_reads(self.tables[self.cur], self.layer_ptr_cpu, self.seq)
 
     def start(self):
         self.E.seq_inc(self.seq_dev)
+        if self.p4 == "fused":
+            self.p4_fork(lambda: self.E.relay_flags(self.flags, self.cfg.layers, self.seq_dev, self.ready))
 
     def before_attn(self, l):
         self.E.wait_flags_seq(self.flags, l, self.seq_dev)
+
+    def end(self):
+        self.p4_join()
 
     def release(self):
         self.v.wait_idle()
@@ -243,9 +319,9 @@ class RawGdakiSource(RemoteKV):
     keeps one ticket per (layer, QP); a 1-thread wait kernel per layer. The store is a GPU-less verbs pool."""
     name = "raw"
 
-    def __init__(self, cfg, raw, pool_bytes, device="cuda"):
+    def __init__(self, cfg, raw, ext, pool_bytes, device="cuda"):
         super().__init__(cfg, raw.local(), pool_bytes, device)
-        self.r = raw
+        self.r, self.E = raw, ext
 
     def setup(self, b):
         super().setup(b)
@@ -259,7 +335,20 @@ class RawGdakiSource(RemoteKV):
         self.segs.copy_(self.dev_tables[self.cur], non_blocking=True)
 
     def start(self):
+        if self.slow_ns:
+            self.E.spin(self.slow_ns)
+        if self.p4 == "fused":
+            self.E.seq_inc(self.seq_dev)
+        if not self.post_outside:
+            self.post()
+        if self.p4 == "fused":
+            self.p4_fork(lambda: self.r.poll(self.tickets, self.cfg.layers, self.seq_dev, self.ready))
+
+    def post(self):
         self.r.post_gets(self.segs, self.lp, self.tickets)
 
     def before_attn(self, l):
         self.r.wait_layer(self.tickets, l)
+
+    def end(self):
+        self.p4_join()

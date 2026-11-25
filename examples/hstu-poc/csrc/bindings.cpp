@@ -76,6 +76,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                         cur());
            },
            py::arg("segs"), py::arg("ticket"), py::arg("peer"), py::arg("ctx") = 1, py::arg("threads") = 32)
+      .def("poll",
+           [](GinKV& g, torch::Tensor tickets, int n_layers, int ctx0, int n_ctx, torch::Tensor seq, torch::Tensor ready) {
+             g.poll(tickets.data_ptr(), n_layers, ctx0, n_ctx, (const uint32_t*)seq.data_ptr(), (uint32_t*)ready.data_ptr(), cur());
+           })
       .def("put_multi",
            [](GinKV& g, torch::Tensor segs, int peer, int ctx0, int n_ctx) {
              need_cuda(segs, "segs");
@@ -194,8 +198,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              r.wait_layer((const uint64_t*)tickets.data_ptr(), layer, ptr_or_null<uint64_t>(t_done), cur());
            },
            py::arg("tickets"), py::arg("layer"), py::arg("t_done") = py::none())
+      .def("poll",
+           [](RawGdaki& r, torch::Tensor tickets, int n_layers, torch::Tensor seq, torch::Tensor ready) {
+             r.poll((const uint64_t*)tickets.data_ptr(), n_layers, (const uint32_t*)seq.data_ptr(), (uint32_t*)ready.data_ptr(), cur());
+           })
       .def("destroy", &RawGdaki::destroy);
   m.def("seq_inc", [](torch::Tensor seq) { seq_inc_gpu((uint32_t*)seq.data_ptr(), cur()); });
+  m.def("relay_flags", [](int64_t host_flags, int n_layers, torch::Tensor seq, torch::Tensor ready) {
+    relay_flags_gpu((const volatile uint32_t*)host_flags, n_layers, (const uint32_t*)seq.data_ptr(), (uint32_t*)ready.data_ptr(), cur());
+  });
   m.def("set_flag_seq", [](int64_t flags_addr, int layer, torch::Tensor seq) {
     set_flag_seq_gpu((volatile uint32_t*)flags_addr, layer, (const uint32_t*)seq.data_ptr(), cur());
   });
@@ -206,6 +217,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         },
         py::arg("flags_addr"), py::arg("layer"), py::arg("seq"), py::arg("stamp") = py::none());
   m.def("spin", [](int64_t ns) { spin_gpu(ns, cur()); });
+  m.def("hog", [](int64_t ns, int blocks, int threads) { hog_gpu(ns, blocks, threads, cur()); },
+        py::arg("ns"), py::arg("blocks"), py::arg("threads") = 128);
+  m.def("green_streams", [](int n_sms) {
+    uint64_t a = 0, b = 0;
+    int na = 0, nb = 0;
+    green_streams(n_sms, &a, &b, &na, &nb);
+    return py::make_tuple(a, b, na, nb);
+  });
   m.def("stamp", [](torch::Tensor dst) { stamp_gpu((uint64_t*)dst.data_ptr(), cur()); });
   m.def("wait_flag",
         [](int64_t flag_addr, uint32_t value, std::optional<torch::Tensor> stamp) {

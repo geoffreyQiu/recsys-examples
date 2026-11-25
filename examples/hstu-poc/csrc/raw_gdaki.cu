@@ -86,11 +86,25 @@ __global__ void raw_post_gets_kernel(doca_gpu_dev_verbs_qp** qps, int nqp, const
 
 __global__ void raw_wait_kernel(doca_gpu_dev_verbs_qp** qps, int nqp, const unsigned long long* tickets, int layer,
                                 uint64_t* t_done) {
+  asm volatile("griddepcontrol.launch_dependents;");   // P4 PDL
   for (int q = 0; q < nqp; ++q) {
     unsigned long long t = tickets[layer * nqp + q];
     if (t) doca_gpu_dev_verbs_wait<DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(qps[q], (doca_gpu_dev_verbs_ticket_t)(t - 1));
   }
   if (t_done) t_done[layer] = gtime();
+}
+
+__global__ void raw_poll_kernel(doca_gpu_dev_verbs_qp** qps, int nqp, const unsigned long long* tickets, int n_layers,
+                                const uint32_t* seq, uint32_t* ready) {
+  const uint32_t s = *seq;
+  for (int l = 0; l < n_layers; ++l) {
+    for (int q = 0; q < nqp; ++q) {
+      unsigned long long t = tickets[l * nqp + q];
+      if (t) doca_gpu_dev_verbs_wait<DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(qps[q], (doca_gpu_dev_verbs_ticket_t)(t - 1));
+    }
+    __threadfence();
+    asm volatile("st.release.gpu.global.u32 [%0], %1;" ::"l"(ready + l), "r"(s) : "memory");
+  }
 }
 
 RawGdaki::RawGdaki(const std::string& dev, int64_t bytes, int nqp, int sq_depth) : p_(new RawImpl) {
@@ -224,6 +238,11 @@ void RawGdaki::post_gets(const Seg* segs, const int* layer_ptr, int n_layers, ui
 
 void RawGdaki::wait_layer(const uint64_t* tickets, int layer, uint64_t* t_done, cudaStream_t s) {
   raw_wait_kernel<<<1, 1, 0, s>>>(p_->d_qps, (int)p_->qps.size(), (const unsigned long long*)tickets, layer, t_done);
+  CUDA_OK2(cudaGetLastError());
+}
+
+void RawGdaki::poll(const uint64_t* tickets, int n_layers, const uint32_t* seq, uint32_t* ready, cudaStream_t s) {
+  raw_poll_kernel<<<1, 1, 0, s>>>(p_->d_qps, (int)p_->qps.size(), (const unsigned long long*)tickets, n_layers, seq, ready);
   CUDA_OK2(cudaGetLastError());
 }
 

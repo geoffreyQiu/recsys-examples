@@ -43,6 +43,8 @@ class GinKV {
                  int n_ctx, uint64_t* t_post, cudaStream_t s);
   // wait_layer: one thread waits on layer's tickets (every read context); optional timestamp (globaltimer ns).
   void wait_layer(void* tickets, int layer, int ctx0, int n_ctx, uint64_t* t_done, cudaStream_t s);
+  // P4 fused: a 1-thread poller waits on every layer's tickets in order and stores ready[l] = *seq
+  void poll(void* tickets, int n_layers, int ctx0, int n_ctx, const uint32_t* seq, uint32_t* ready, cudaStream_t s);
 
   // Write path (6'). put_segs: put each segment local -> remote (no actions), then flushAsync into
   // *ticket (local completion: sources reusable). commit: strong signal (settles every earlier put on this

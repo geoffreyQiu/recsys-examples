@@ -20,7 +20,7 @@ def ext(verbose=False):
     global _mod
     if _mod is None:
         os.makedirs(BUILD, exist_ok=True)
-        os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "9.0a")
+        os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"   # H100 only (griddepcontrol needs sm_90)
         cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda")
         _mod = load(
             name="hpoc_ext",
