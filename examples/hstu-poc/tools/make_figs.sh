@@ -4,8 +4,10 @@
 set -eu
 cd "$(dirname "$0")/.."
 F=docs/figs
-# explanatory diagrams (schematic): wait variants over time, who posts and reports progress; the model
+# explanatory diagrams (schematic): wait variants over time, who posts and reports progress; one request's per-tile
+# fetch as sequence diagrams (CPU verbs v2, raw GDAKI v3; line numbers looked up in the POC source); the model
 python tools/fetch_diagrams.py $F
+python tools/per_tile_diagrams.py $F
 python tools/model_diagram.py $F
 # speed of light (docs/sol.md): request timelines, latency / SoL, time split against SoL
 python tools/sol_figs.py $F

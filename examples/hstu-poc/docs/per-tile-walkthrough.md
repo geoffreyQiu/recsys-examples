@@ -24,16 +24,19 @@ sequenceDiagram
     H->>H: launch the request's CUDA graph
     H->>N: post layers 1..n-1 (CPU verbs, split posting)
     N-->>W: completion per chunk (CPU verbs)
-    W-->>R: progress[l] = seq<<32 | steps (host memory)
+    W-->>R: prog_host[l] = seq<<32 | steps (host memory)
     N-->>R: completions (raw GDAKI: GPU-side CQ)
     R-->>A: tsteps[l] = steps landed (device memory)
     A->>A: before K tile: wait until tsteps[l] >= steps needed
 ```
 
+Rendered sequence diagrams of one request, at the level of kernels and calls with file:line references:
+[CPU verbs v2](figs/per-tile-verbs.png) (§4) and [raw GDAKI v3](figs/per-tile-raw.png) (§5).
+
 ## 2. The plan: segments, chunks and steps
 
 - [`RemoteKV.setup`](../hstu_poc/kvsource.py#L249) builds, per request variant, the **segment table**: per layer, per
-  user, one K and one V segment `[remote offset, local offset, bytes, user]` ([line 273](../hstu_poc/kvsource.py#L276)).
+  user, one K and one V segment `[remote offset, local offset, bytes, user]` ([line 276](../hstu_poc/kvsource.py#L276)).
   User u's history of layer l is two contiguous byte ranges, locally rows `[k_off[u], k_off[u] + L_u)` of the layer's
   K and V buffers, remotely the user's slot in the store.
 - [`RemoteKV._tile_setup`](../hstu_poc/kvsource.py#L301) picks the chunk size: `tile_rows` = max(128, enough rows that
@@ -67,6 +70,11 @@ sequenceDiagram
 
 ## 4. CPU verbs
 
+![CPU verbs v2, one request: request thread, NIC, worker thread, relay kernel and main stream, in step order](figs/per-tile-verbs.png)
+
+*One request with CPU verbs v2 (split posting, relay v2): who runs what, in order, each step with its file:line; the
+bottom box is the attention's per-tile wait (§3). Schematic, not to scale.*
+
 **Posting** (request thread, before and right after the graph launch):
 - [`VerbsKVSource.pre_replay`](../hstu_poc/kvsource.py#L453) bumps the request's sequence number and calls
   [`_post_now`](../hstu_poc/kvsource.py#L480) →
@@ -86,7 +94,7 @@ sequenceDiagram
 **Completion** (the worker thread, spinning on its own core):
 - [`poll_tiled`](../csrc/verbs_kv.cpp#L234) polls the CQ (64 completions per call), counts completions per
   (layer, step), and whenever the contiguous prefix of complete steps of a layer grows, stores
-  `progress[l] = seq << 32 | steps` into pinned, GPU-mapped host memory; a complete layer is stored as 0x7fffffff
+  `prog_host[l] = seq << 32 | steps` into pinned, GPU-mapped host memory; a complete layer is stored as 0x7fffffff
   ([line 246](../csrc/verbs_kv.cpp#L246)) and its basic flag `flags[l] = seq` is set as well
   ([line 252](../csrc/verbs_kv.cpp#L252)).
 
@@ -133,6 +141,11 @@ memory (zero-copy descriptor), so no per-request copy precedes it.
   pinned memory and publishes sequence-tagged 64-bit progress words (`raw_publish` with `prog`) that the request graph
   never resets; the attention waits on them with
   [mode 5](../attn/hstu_hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp#L510). Result: sol.md §7.
+
+![Raw GDAKI v3, one request: request thread, NIC, the post kernel's QP warps and publisher warp, and the main stream, in step order](figs/per-tile-raw.png)
+
+*One request with raw GDAKI v3: the v2 post kernel in its own graph, launched right before the request graph and
+publishing sequence-tagged progress (attention mode 5). Schematic, not to scale.*
 
 ## 6. GIN (NCCL device API), briefly
 

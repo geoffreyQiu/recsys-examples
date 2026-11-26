@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Resolve code anchors in a markdown file: [text](../path#L{{pattern}}) or [text](../path#L{{after-pattern>>pattern}})
 becomes [text](../path#L<line>), the first line containing `pattern` (after the first line containing `after-pattern`).
+A link whose text is `line #` also gets the number in its text: [line #](../path#L{{...}}) -> [line 42](../path#L42).
     tools/doc_anchors.py SRC.md OUT.md POC_DIR"""
 import re
 import sys
+
+ANCHOR = r"\(\.\./([^)#]+)#L\{\{(.+?)\}\}\)"
 
 
 def main(src, out, root):
@@ -15,18 +18,25 @@ def main(src, out, root):
             cache[path] = open(f"{root}/{path}").read().splitlines()
         return cache[path]
 
-    def resolve(m):
-        path, spec = m.group(1), m.group(2)
+    def find(path, spec):
         after, pat = spec.split(">>", 1) if ">>" in spec else (None, spec)
         ls = lines(path)
         i0 = 0
         if after is not None:
-            i0 = next(i for i, l in enumerate(ls) if after in l)
+            i0 = next((i for i, l in enumerate(ls) if after in l), None)
+            if i0 is None:
+                raise SystemExit(f"anchor not found: {path}: {after}")
         for i in range(i0, len(ls)):
             if pat in ls[i]:
-                return f"](../{path}#L{i + 1})"
+                return i + 1
         raise SystemExit(f"anchor not found: {path}: {spec}")
-    text = re.sub(r"\]\(\.\./([^)#]+)#L\{\{(.+?)\}\}\)", resolve, text)
+
+    def numbered(m):
+        n = find(m.group(1), m.group(2))
+        return f"[line {n}](../{m.group(1)}#L{n})"
+
+    text = re.sub(r"\[line #\]" + ANCHOR, numbered, text)
+    text = re.sub(r"\]" + ANCHOR, lambda m: f"](../{m.group(1)}#L{find(m.group(1), m.group(2))})", text)
     open(out, "w").write(text)
 
 
