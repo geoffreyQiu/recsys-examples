@@ -92,7 +92,8 @@ def main():
                     g = 1 - b[0] / lat[(BASE,) + c]
                     M[i, j] = 100 * g
                     t, lv, v = b[1].split(".")
-                    ax.text(j, i, f"{TSHORT[t]}\n{VSHORT[v]}\n{100 * g:+.1f}%" if abs(g) > noise else "≈\nbasic",
+                    chg = f"{-100 * g:+.1f}%".replace("-", "\u2212")   # latency change: negative = faster
+                    ax.text(j, i, f"{TSHORT[t]}\n{VSHORT[v]}\n{chg}" if abs(g) > noise else "≈\nbasic",
                             ha="center", va="center", fontsize=5.6, color=INK if 100 * g < 6 else SURFACE)
             ax.imshow(M, cmap="Greens", vmin=0, vmax=10, aspect="auto", origin="lower")
             ax.set_xticks(range(len(Ls)))
@@ -105,8 +106,8 @@ def main():
         row[0].set_ylabel("batch size B (users)", color=INK2, fontsize=8.5)
     for ax in axes[-1]:
         ax.set_xlabel("history length (tokens)", color=INK2, fontsize=8.5)
-    fig.suptitle(f"Fastest RDMA implementation per request and its latency gain over basic CPU verbs ('≈ basic': within "
-                 f"run-to-run noise, {100 * noise:.2f}%)\nHistory ≤ 4k with B ≤ 8: all {len(modes)} implementations "
+    fig.suptitle(f"Fastest RDMA implementation per request and its latency vs basic CPU verbs (negative = faster; "
+                 f"'≈ basic': within run-to-run noise, {100 * noise:.2f}%)\nHistory ≤ 4k with B ≤ 8: all {len(modes)} implementations "
                  f"measured; elsewhere the basic, fused-wait and per-tile implementations of every mechanism",
                  color=INK, fontsize=9.5, y=1.0, x=0.01, ha="left")
     fig.tight_layout(rect=(0, 0, 1, 0.975))
@@ -134,12 +135,13 @@ def main():
                 continue
             v = 100 * (lat[(m,) + c] / base - 1)
             ax.barh(y, v, height=0.72, color=TCOL[t], alpha=0.45 if o == "b.5a" else 1.0, zorder=3)
-            ax.text(v + (0.4 if v >= 0 else -0.4), y, f"{v:+.1f}", va="center", ha="left" if v >= 0 else "right",
+            ax.text(v + (0.4 if v >= 0 else -0.4), y, f"{v:+.1f}".replace("-", "\u2212"), va="center",
+                    ha="left" if v >= 0 else "right",
                     fontsize=6.5, color=INK2)
         ax.axvline(0, color=INK2, lw=0.8)
         ax.axvspan(-100 * noise, 100 * noise, color=GRID, alpha=0.7, zorder=1)
         ax.set_title(f"config {c[0]}  (basic verbs {base * 1e3:.0f} µs)", color=INK, fontsize=9, loc="left")
-        ax.set_xlabel("latency vs basic CPU verbs (%)", color=INK2, fontsize=8)
+        ax.set_xlabel("latency vs basic CPU verbs (%), negative = faster", color=INK2, fontsize=8)
         ax.grid(True, axis="x", color=GRID, lw=0.6, zorder=0)
         ax.tick_params(colors=INK2, labelsize=7.5)
         for sp in ax.spines.values():
@@ -148,8 +150,8 @@ def main():
         ax.set_xlim(min(lo, -9.5) - 2.5, hi + 3)
     axes[0][0].set_yticks(ys)
     axes[0][0].set_yticklabels([f"{TNAME[t]}: {oname[o]}" for t, o in rowsx], fontsize=7.5, color=INK)
-    fig.suptitle("Latency options and wait variants on the smallest requests (0.5k history, one user); grey band = "
-                 "run-to-run noise", color=INK, fontsize=9.5, y=1.0, x=0.01, ha="left")
+    fig.suptitle("Latency options and wait variants on the smallest requests (0.5k history, one user): latency vs "
+                 "basic CPU verbs, negative = faster; grey band = run-to-run noise", color=INK, fontsize=9.5, y=1.0, x=0.01, ha="left")
     fig.savefig(a.ablation, bbox_inches="tight", facecolor=SURFACE)
     print("wrote", a.ablation)
 

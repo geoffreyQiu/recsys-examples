@@ -69,9 +69,9 @@ hstu-poc/
     p6.py           transfer under SM contention / CPU contention
   scripts/srun2.sh  2-node launcher (inference ranks on node A, store ranks on node B)
   tools/           analysis and campaign scripts behind docs/results.md (plots need matplotlib): make_figs.sh
-                   (every figure), p2t_report.py, p2t_ctl.py, p2t_to_p2c.py, report_figs.py, p2c_breakeven.py, p5s_report.py,
-                   p5x_report.py, p6s_report.py, p3_report.py, p5_eight.py, campaigns (p2t_grid.sh, p5s_*.sh,
-                   p5x_runs.sh, p6s_*.sh, ...), numa_check.cu
+                   (every figure), fetch_diagrams.py, p2t_report.py, p2t_ctl.py, p2t_to_p2c.py, report_figs.py,
+                   p2c_breakeven.py, p5s_report.py, p5x_report.py, p6s_report.py, p3_report.py, p5_eight.py,
+                   campaigns (p2t_grid.sh, p5s_*.sh, p5x_runs.sh, p6s_*.sh, ...), numa_check.cu
   docs/            results.md (final report), figs/, archive/ (earlier revisions)
 ```
 
