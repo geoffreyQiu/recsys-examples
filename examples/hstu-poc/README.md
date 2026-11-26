@@ -1,6 +1,6 @@
 # hstu-poc: HSTU inference with remote KV over RDMA (POC)
 
-**Status (2026-11-25):** P0–P6 built and measured on Eos; final report in `docs/results.md` (copy of `/lustre/fsw/coreai_devtech_all/junyiq/hstu-kv-rdma/docs/results.md`); plan in the study doc §10. P7 (hybrid fetch + recompute) not started.
+**Status (2026-11-25):** P0–P6 built and measured on Eos; final report in `docs/results.md` (copy of `/lustre/fsw/coreai_devtech_all/junyiq/hstu-kv-rdma/docs/results.md`), speed-of-light analysis and request timelines in `docs/sol.md`, code walkthrough of the per-tile waits in `docs/per-tile-walkthrough.md`; plan in the study doc §10. P7 (hybrid fetch + recompute) not started.
 **Design and rationale:** `/lustre/fsw/coreai_devtech_all/junyiq/hstu-kv-rdma/docs/hstu-kv-rdma-study.md`
 
 **Goal:** the fastest achievable HSTU inference when user-history KV lives in remote memory, using plain kernels and calls with no KV-manager layer.
@@ -71,8 +71,11 @@ hstu-poc/
   tools/           analysis and campaign scripts behind docs/results.md (plots need matplotlib): make_figs.sh
                    (every figure), fetch_diagrams.py, p2t_report.py, p2t_ctl.py, p2t_to_p2c.py, report_figs.py,
                    p2c_breakeven.py, p5s_report.py, p5x_report.py, p6s_report.py, p3_report.py, p5_eight.py,
-                   campaigns (p2t_grid.sh, p5s_*.sh, p5x_runs.sh, p6s_*.sh, ...), numa_check.cu
-  docs/            results.md (final report), figs/, archive/ (earlier revisions)
+                   speed of light and timelines (sol.py, sol_figs.py, tl_grid.sh, tl_report.py, tl_compare.py,
+                   model_diagram.py, pcie_pingpong.cu), campaigns (p2t_grid.sh, p5s_*.sh, p5x_runs.sh,
+                   p6s_*.sh, ...), numa_check.cu
+  docs/            results.md (final report), sol.md (speed of light, request timelines), per-tile-walkthrough.md
+                   (code guide of the per-tile waits), figs/, archive/ (earlier revisions)
 ```
 
 ## Running (Eos; inside `pytorch-26.07.sqsh`)
@@ -84,12 +87,18 @@ scripts/srun2.sh -j JOB -n 1 -e NCCL_GIN_TYPE=3 -e NCCL_RMA_DISABLE=1 -- python 
 ```
 Always set `NCCL_RMA_DISABLE=1` for GIN (otherwise NCCL's host-RMA progress thread spins a core).
 
+Per-tile wait options (environment, `--p4 tile --tuned`): `HPOC_SPLIT_POST=1 HPOC_RELAY=2` (CPU verbs v2: split
+posting, one-read relay), `HPOC_RAW_POST=2` (raw GDAKI v2: exclusive queue pairs, publisher warp),
+`HPOC_RAW_PRELAUNCH=1` (raw GDAKI v3: the v2 post kernel launched before the graph, sequence-tagged progress),
+`HPOC_TILE_ROWS` (chunk rows, default 128). `bench/grid.py --timeline N` traces N more requests per grid point
+(`docs/sol.md` §6); `tools/tl_grid.sh` and `tools/p2t_grid.sh` take the levels `t2` and `pl` for these options.
+
 **Objective of the comparison:** the highest throughput at a fixed p99 end-to-end latency, with per-request latency alongside. The baseline grid comes first; the GPU-SM vs CPU-core balance of transfer work is a later phase (P6).
 
 ## Design details (agreed; study doc §13–§14)
 - **Model configs:** S = 3 layers × 512 (4 × 128 heads), M = 8 × 1024 (4 × 256), L = 8 × 2048 (8 × 256); D = 16 × 1024 (8 × 128) is parked. All BF16, head MLP [512, 8].
 - **Embedding:** two GPU-memory tables (items, actions) + an input linear; a bypass option for transfer-only tests; host-memory tables later as a realism check.
-- **Pre/post:** interleave items and actions, contextual tokens, linear to hidden, bucketed position encoding, input layer norm. Cached tokens are skipped. Post: output layer norm → candidates → MLP → sigmoid.
+- **Pre/post (as built, `hstu_poc/model.py`; diagram in `docs/figs/hstu-model.png`):** item and action embeddings summed per history token (candidates: item only), linear to hidden, bucketed position encoding, layer norm; cached tokens are skipped. Post: candidates → layer norm → MLP → sigmoid. Not built from the original plan: interleaved item/action tokens and contextual tokens.
 - **Inputs:** jagged tensors (values + per-user offsets); no `HSTUBatch`.
 - **Cache bookkeeping:** naive and always-hit, but distinct per user. N warm users, each with a seeded slot in the remote pool (with checksums); distinct user IDs per batch from a uniform or Zipf distribution; W appends into the user's slot.
 - **Load generator:** homogeneous streams first (fixed L and C per run), then mixed (Zipf α = 1.5, lognormal). Results are latency–throughput curves (p50/p99 vs offered QPS).

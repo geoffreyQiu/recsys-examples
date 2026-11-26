@@ -15,6 +15,14 @@ import torch
 from .model import Batch, Config
 
 
+def side_stream(device=None):
+    """A stream for a graph's side branch. PyTorch hands out streams round-robin from a pool of 32 per priority, and
+    torch.cuda.graph captures on one stream of the default-priority pool: a side stream from that pool can be the
+    capturing stream itself after enough allocations, which captures the side branch inline (a spinning publisher then
+    runs before the compute instead of beside it). The high-priority pool never holds the capturing stream."""
+    return torch.cuda.Stream(device=device, priority=-1)
+
+
 class LocalKV:
     """Local GPU-memory hit: the history is already in GPU memory (moves nothing)."""
     name = "local"
@@ -77,7 +85,7 @@ class H2DKV(LocalKV):
         self.slot = [cfg.layers * 2 * L * tok for L in b.hist]
         self.host = torch.empty(sum(self.slot), dtype=torch.uint8, pin_memory=True)
         self.host.view(cfg.dtype)[: min(self.host.numel() // 2, 1 << 24)].normal_(0, 0.5)
-        self.copy_stream = torch.cuda.Stream(device=self.dev)
+        self.copy_stream = side_stream(self.dev)
         self.events = [torch.cuda.Event() for _ in range(cfg.layers)]
         self.plan = []                     # per layer: list of (dst view, src view)
         base = 0
@@ -142,7 +150,7 @@ class P4:
         self.ready = torch.zeros(self.cfg.layers, dtype=torch.int32, device=self.dev)
         if not hasattr(self, "seq_dev"):
             self.seq_dev = torch.zeros(1, dtype=torch.int32, device=self.dev)
-        self.p4_side = torch.cuda.Stream(device=self.dev)
+        self.p4_side = side_stream(self.dev)
         self.attn_fn = None if mode == "5a" else self._p4_attn
         if mode == "tile":        # per-tile waits: chunks landed per layer, zeroed at each request's start
             self.tsteps = torch.zeros(self.cfg.layers, dtype=torch.int32, device=self.dev)
@@ -158,22 +166,53 @@ class P4:
     def _p4_attn(self, l, q, K, V, b, model):
         from .attn_ext import hstu_fwd
         args = (q, K, V, b.cu_q, b.cu_k, b.max_q, b.max_k, model.cfg.max_len, b.num_targets, model.alpha)
+        tr = model.attn_trace.data_ptr() + 32 * l if model.attn_trace is not None else 0
         if self.p4 == "fused":
-            return hstu_fwd(*args, kv_ready=self.ready.data_ptr() + 4 * l, kv_seq=self.seq_dev.data_ptr(), mode=1)
+            return hstu_fwd(*args, kv_ready=self.ready.data_ptr() + 4 * l, kv_seq=self.seq_dev.data_ptr(), mode=1, trace=tr)
         if self.p4 == "tile":
+            # HPOC_TILE_RELOAD=1: reload the progress word before every K tile (before attn_v4: no cached progress)
+            reload = 0x80 if os.environ.get("HPOC_TILE_RELOAD", "0") == "1" else 0
+            if getattr(self, "pre_launch", 0):      # raw GDAKI v3: sequence-tagged progress in device memory
+                return hstu_fwd(*args, kv_ready=self.prog.data_ptr() + 8 * l, kv_seq=self.seq_dev.data_ptr(),
+                                mode=5 | reload | (self.tile_rows << 8), trace=tr)
+            if getattr(self, "direct", 0):          # CPU verbs v3: the worker's host-mapped progress word
+                return hstu_fwd(*args, kv_ready=self.v.progress_ptr() + 8 * l, kv_seq=self.seq_dev.data_ptr(),
+                                mode=4 | reload | (self.tile_rows << 8), trace=tr)
             return hstu_fwd(*args, kv_ready=self.tsteps.data_ptr() + 4 * l, kv_seq=self.seq_dev.data_ptr(),
-                            mode=3 | (self.tile_rows << 8))
+                            mode=3 | reload | (self.tile_rows << 8), trace=tr)
         if self.p4 == "pdl_early":
             self.E.wait_flags_seq(self._sat.data_ptr(), 0, self._sat_seq)    # trigger dependents, exit at once
             return hstu_fwd(*args, kv_ready=self.ready.data_ptr() + 4 * l, kv_seq=self.seq_dev.data_ptr(), mode=1,
-                            pdl=True)
+                            pdl=True, trace=tr)
         self.before_attn(l)
         if self.p4 == "pdl":
-            return hstu_fwd(*args, mode=2, pdl=True)
-        return hstu_fwd(*args)
+            return hstu_fwd(*args, mode=2, pdl=True, trace=tr)
+        return hstu_fwd(*args, trace=tr)
+
+    # timeline (optional, bench/grid.py --timeline): publisher trace (kvutil.h layout) and per-layer wait-kernel stamps
+    trace = False
+    tr_pub = None
+    tr_wait = None
+
+    def trace_on(self, E):
+        self.trace = True
+        self.tr_pub = torch.zeros(int(E.trace_words()), dtype=torch.int64, device=self.dev)
+        self.tr_wait = torch.zeros(self.cfg.layers, dtype=torch.int64, device=self.dev)
+
+    def trace_reset(self):
+        if self.trace and not getattr(self, "_pre", False):   # a pre-launched post kernel resets its own header
+            self.tr_pub[:130].zero_()
+            self.tr_wait.zero_()
+
+    def _tr(self):
+        return self.tr_pub if self.trace else None
+
+    def _tw(self):
+        return self.tr_wait if self.trace else None
 
     def p4_fork(self, launch):
         main = torch.cuda.current_stream()
+        assert self.p4_side != main, "side branch on the capturing stream: it would run inline"
         self.p4_side.wait_stream(main)
         with torch.cuda.stream(self.p4_side):
             launch()
@@ -419,30 +458,50 @@ class VerbsKVSource(RemoteKV):
             self._post_now()
 
     post_after_launch = False   # slow-producer check: the caller launches the graph, then calls post_now()
+    # per-tile options (HPOC_SPLIT_POST=n: post the first n layers before the graph launch, the rest right after it
+    # (post_replay); HPOC_RELAY=2: relay kernel v2, one PCIe read per poll)
+    split_post = int(os.environ.get("HPOC_SPLIT_POST", 0))
+    relay_v = int(os.environ.get("HPOC_RELAY", 1))
+    # HPOC_DIRECT=1 (per-tile v3): the attention reads the worker's progress word (host-mapped, seq-tagged) directly:
+    # no relay kernel, no side branch, no per-request reset of the device progress words (attention wait mode 4)
+    direct = int(os.environ.get("HPOC_DIRECT", 0))
+    # split posting only for graph replays: an eager forward can block the host inside (a host sync before a later
+    # layer's launch) before post_replay() posts that layer, so eager runs (warm-up) post everything up front. The
+    # caller sets eager = False once the request's graph is captured.
+    eager = True
+
+    def post_replay(self, i):
+        if self.p4 == "tile" and self.split_post:
+            self.v.post_rest()
 
     def post_now(self):
         self._post_now()
 
     def _post_now(self):
         if self.p4 == "tile":
-            self.v.post_reads_tiled(self.tables[self.cur], self.layer_ptr_cpu, self.seq, self.tile_bytes)
+            self.v.post_reads_tiled(self.tables[self.cur], self.layer_ptr_cpu, self.seq, self.tile_bytes,
+                                    first_layers=0 if self.eager else self.split_post)
         else:
             self.v.post_reads(self.tables[self.cur], self.layer_ptr_cpu, self.seq)
 
     def start(self):
         self.E.seq_inc(self.seq_dev)
+        if self.p4 == "tile" and self.direct:
+            return
         if self.p4 == "tile":
             self.tsteps.zero_()
             self.p4_fork(lambda: self.E.relay_tiles(self.v.progress_ptr(), self.flags, self.cfg.layers, self.seq_dev,
-                                                    self.tsteps))
+                                                    self.tsteps, trace=self._tr(), version=self.relay_v))
         elif self.fused_like:
-            self.p4_fork(lambda: self.E.relay_flags(self.flags, self.cfg.layers, self.seq_dev, self.ready))
+            self.p4_fork(lambda: self.E.relay_flags(self.flags, self.cfg.layers, self.seq_dev, self.ready,
+                                                    trace=self._tr()))
 
     def before_attn(self, l):
-        self.E.wait_flags_seq(self.flags, l, self.seq_dev)
+        self.E.wait_flags_seq(self.flags, l, self.seq_dev, stamp=self._tw())
 
     def end(self):
-        self.p4_join()
+        if not (self.p4 == "tile" and self.direct):
+            self.p4_join()
 
     def release(self):
         self.v.wait_idle()
@@ -450,6 +509,14 @@ class VerbsKVSource(RemoteKV):
 
 
 class RawGdakiSource(RemoteKV):
+    # per-tile post kernel version (HPOC_RAW_POST=2: exclusive QP ownership + publisher warp, raw_post_tiled2_kernel)
+    raw_post_v = int(os.environ.get("HPOC_RAW_POST", 1))
+    # per-tile v3 (HPOC_RAW_PRELAUNCH=1): the v2 post kernel is launched by the host right before the graph launch, on
+    # its own stream (no graph launch before the first doorbell), and publishes sequence-tagged 64-bit progress words
+    # that the graph never resets (attention wait mode 5)
+    pre_launch = int(os.environ.get("HPOC_RAW_PRELAUNCH", 0))
+    post_after_launch = False     # slow-producer check: launch the graph first, then post_now()
+
     """Raw GDAKI (DOCA GPUNetIO, no NCCL), 5'a like GIN: a post kernel issues every get (spread over the QPs) and
     keeps one ticket per (layer, QP); a 1-thread wait kernel per layer. The store is a GPU-less verbs pool."""
     name = "raw"
@@ -471,22 +538,69 @@ class RawGdakiSource(RemoteKV):
             self._tile_setup(b)
             self.tickets_t = torch.zeros(self.cfg.layers * self.tile_steps * self.r.nqp(), dtype=torch.int64,
                                          device=self.dev)
+            if self.pre_launch:
+                if not self.zc:
+                    self._zc_setup()
+                self.prog = torch.zeros(self.cfg.layers, dtype=torch.int64, device=self.dev)
+                self.pseq = int(self.seq_dev.item())
+                self.pseq_dev = self.seq_dev.clone()          # the post graph's own request counter
+                self.pstream = side_stream(self.dev)
+                self.pgraph = None
+
+    @property
+    def _pre(self):
+        return self.pre_launch and self.p4 == "tile"
 
     def pre_replay(self, i):
         self._select(i)
+        if self._pre:
+            self.pseq += 1
+            if not self.post_after_launch:
+                self.post_now()
+
+    def post_now(self):
+        """v3: start this request's post kernel (outside the request graph): replay its own 2-node graph (bump the
+        post counter, post), which reads the table index from pinned memory (zero-copy) and its sequence number from
+        the counter. Eager runs (warm-up) launch the same two kernels directly."""
+        if self.pgraph is not None:              # launched from C++ on the posting stream (no Python stream context;
+            self.E.graph_launch(self.pexec, self.pstream_ptr)   # never behind the request graph, which waits for it)
+            return
+        with torch.cuda.stream(self.pstream):
+            self._post_kernels()
+
+    def _post_kernels(self):
+        self.E.seq_inc(self.pseq_dev)
+        self.r.post_gets_tiled(self.segs_all, self.lp, self.tickets_t, self.tile_steps, self.tile_bytes, self.tsteps,
+                               var=self.var_host, var_stride=self.nseg, trace=self._tr(), version=2, prog=self.prog,
+                               seq_dev=self.pseq_dev)
+
+    def capture_post(self):
+        """Capture the post kernels into their own graph (call after the warm-up, before timing)."""
+        if not self._pre or self.pgraph is not None:
+            return
+        self.pstream.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=self.pstream):
+            self._post_kernels()
+        self.pgraph = g
+        self.pexec = int(g.raw_cuda_graph_exec())
+        self.pstream_ptr = int(self.pstream.cuda_stream)
 
     def start(self):
+        if self._pre:
+            self.E.seq_inc(self.seq_dev)            # = pseq: the attention waits for this request's tag
+            return
         self._gdaki_start()
 
     def _poll(self):
         if self.p4 != "tile":   # tile: the post kernel itself publishes the progress
-            self.r.poll(self.tickets, self.cfg.layers, self.seq_dev, self.ready)
+            self.r.poll(self.tickets, self.cfg.layers, self.seq_dev, self.ready, trace=self._tr())
 
     def post(self):
         if self.p4 == "tile":
             kw = dict(var=self.var_host, var_stride=self.nseg) if self.zc else {}
             self.r.post_gets_tiled(self.segs_all if self.zc else self.segs, self.lp, self.tickets_t, self.tile_steps,
-                                   self.tile_bytes, self.tsteps, **kw)
+                                   self.tile_bytes, self.tsteps, trace=self._tr(), version=self.raw_post_v, **kw)
         elif self.zc:
             self.r.post_gets(self.segs_all, self.lp, self.tickets, var=self.var_host, var_stride=self.nseg)
         else:
@@ -494,7 +608,14 @@ class RawGdakiSource(RemoteKV):
 
     def before_attn(self, l):
         self._side_join(l)
-        self.r.wait_layer(self.tickets, l)
+        self.r.wait_layer(self.tickets, l, t_done=self._tw())
 
     def end(self):
-        self.p4_join()
+        if not self._pre:
+            self.p4_join()
+
+    def release(self):
+        if getattr(self, "pstream", None) is not None:
+            self.pstream.synchronize()
+            self.pgraph = None
+        super().release()

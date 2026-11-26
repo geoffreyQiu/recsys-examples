@@ -13,6 +13,7 @@
 #include "doca_gpunetio_device.h"
 #include "doca_gpunetio_high_level.h"
 #include "doca_verbs.h"
+#include "kvutil.h"
 
 namespace hpoc {
 
@@ -52,6 +53,16 @@ __device__ __forceinline__ uint64_t gtime() {
   uint64_t t;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
   return t;
+}
+// timeline trace event (see kvutil.h for the layout)
+__device__ __forceinline__ void rtrace_event(unsigned long long* tr, int& n, int l, long long v) {
+  if (tr && n < TRACE_CAP) {
+    unsigned long long* e = tr + TRACE_EV + 3 * n;
+    e[0] = (unsigned long long)l;
+    e[1] = (unsigned long long)v;
+    e[2] = gtime();
+    ++n;
+  }
 }
 
 // warp w posts on QP w the segments j of each layer with j % nqp == w; lane 0 stores the layer's last ticket + 1
@@ -102,7 +113,9 @@ __global__ void raw_wait_kernel(doca_gpu_dev_verbs_qp** qps, int nqp, const unsi
 }
 
 __global__ void raw_poll_kernel(doca_gpu_dev_verbs_qp** qps, int nqp, const unsigned long long* tickets, int n_layers,
-                                const uint32_t* seq, uint32_t* ready) {
+                                const uint32_t* seq, uint32_t* ready, unsigned long long* tr) {
+  if (tr) tr[1] = gtime();
+  int ne = 0;
   const uint32_t s = *seq;
   for (int l = 0; l < n_layers; ++l) {
     for (int q = 0; q < nqp; ++q) {
@@ -111,7 +124,9 @@ __global__ void raw_poll_kernel(doca_gpu_dev_verbs_qp** qps, int nqp, const unsi
     }
     __threadfence();
     asm volatile("st.release.gpu.global.u32 [%0], %1;" ::"l"(ready + l), "r"(s) : "memory");
+    rtrace_event(tr, ne, l, 0x7fffffff);
   }
+  if (tr) tr[0] = ne;
 }
 
 // Per-tile waits: every segment split into chunks of tb bytes posted from its END backwards (the attention consumes
@@ -127,7 +142,9 @@ __global__ void raw_poll_kernel(doca_gpu_dev_verbs_qp** qps, int nqp, const unsi
 __global__ void raw_post_tiled_kernel(doca_gpu_dev_verbs_qp** qps, int nqp, const Seg* segs, const int* lp,
                                       int n_layers, int max_steps, long long tb, uint64_t rbase, uint32_t rkey_be,
                                       uint64_t lbase, uint32_t lkey_be, unsigned long long* tickets,
-                                      const volatile int* var, long long var_stride, int* tsteps) {
+                                      const volatile int* var, long long var_stride, int* tsteps,
+                                      unsigned long long* tr) {
+  if (tr && threadIdx.x == 0) tr[1] = gtime();
   __shared__ long long s_off;
   if (threadIdx.x == 0) s_off = var ? (long long)(*var) * var_stride : 0;
   __syncthreads();
@@ -188,10 +205,12 @@ __global__ void raw_post_tiled_kernel(doca_gpu_dev_verbs_qp** qps, int nqp, cons
       doca_gpu_dev_verbs_mark_wqes_ready<DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(qp, base, idx - 1);
       doca_gpu_dev_verbs_submit<DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU, DOCA_GPUNETIO_VERBS_SYNC_SCOPE_THREAD>(
           qp, idx);
+      if (tr && l < 16 && w < 8) tr[TRACE_DB + 8 * l + w] = gtime();
     }
   }
   __syncthreads();   // every QP's tickets are written
   if (threadIdx.x != 0 || tsteps == nullptr) return;
+  int ne = 0;
   for (int l = 0; l < n_layers; ++l) {
     for (int k = 0; k < max_steps; ++k) {
       bool any = false;
@@ -205,10 +224,157 @@ __global__ void raw_post_tiled_kernel(doca_gpu_dev_verbs_qp** qps, int nqp, cons
       if (!any) break;
       __threadfence();
       asm volatile("st.release.gpu.global.s32 [%0], %1;" ::"l"(tsteps + l), "r"(k + 1) : "memory");
+      rtrace_event(tr, ne, l, k + 1);
     }
     __threadfence();
     asm volatile("st.release.gpu.global.s32 [%0], %1;" ::"l"(tsteps + l), "r"(0x7fffffff) : "memory");
+    rtrace_event(tr, ne, l, 0x7fffffff);
   }
+  if (tr) tr[0] = ne;
+}
+
+// Per-tile waits, v2. Same chunk layout and tickets as raw_post_tiled_kernel, three changes:
+// - each queue pair is owned by one warp for the whole request, so DOCA's EXCLUSIVE sharing mode applies (plain loads
+//   and stores instead of the lock, CAS and atomics of GPU mode in reserve / mark-ready / submit), and the slot
+//   availability check is skipped (the previous request's reads completed and were polled before this one was posted;
+//   a request posts at most 2048 reads on 4 queues of 4096 slots);
+// - a separate publisher warp (warp nqp, lane 0) polls the completions and publishes tsteps[l] as soon as every QP warp
+//   has posted layer l (a per-layer counter in shared memory), instead of after the whole request is posted;
+// - the step tickets are the per-step maximum over the warp (one store per step and QP, no global atomics).
+constexpr auto RAW_EXCL = DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_EXCLUSIVE;
+// progress of a tiled request: int32 steps (graph-launched post kernel; reset by the graph) or a sequence-tagged
+// 64-bit word seq << 32 | steps (post kernel launched outside the request graph; the graph resets nothing)
+__device__ __forceinline__ void raw_publish(int* tsteps, unsigned long long* prog, unsigned long long seq, int l, int v) {
+  if (prog)
+    asm volatile("st.release.gpu.global.u64 [%0], %1;" ::"l"(prog + l), "l"((seq << 32) | (unsigned)v) : "memory");
+  else
+    asm volatile("st.release.gpu.global.s32 [%0], %1;" ::"l"(tsteps + l), "r"(v) : "memory");
+}
+
+// One tiled request, v2 (see raw_post_tiled2_kernel): warps 0..nqp-1 post, warp nqp publishes. s_posted: shared,
+// zeroed by the caller before a __syncthreads.
+__device__ __forceinline__ void raw_tiled_request(doca_gpu_dev_verbs_qp** qps, int nqp, const Seg* segs, const int* lp,
+                                                  int n_layers, int max_steps, long long tb, uint64_t rbase,
+                                                  uint32_t rkey_be, uint64_t lbase, uint32_t lkey_be,
+                                                  unsigned long long* tickets, int* s_posted, int* tsteps,
+                                                  unsigned long long* prog, unsigned long long seq,
+                                                  unsigned long long* tr) {
+  const int w = threadIdx.x / 32, lane = threadIdx.x % 32;
+  if (w < nqp) {
+    doca_gpu_dev_verbs_qp* qp = qps[w];
+    const enum doca_gpu_dev_verbs_wqe_ctrl_flags flags =
+        doca_gpu_dev_verbs_get_ctrl_flags<DOCA_GPUNETIO_VERBS_QP_SQ>(qp, DOCA_GPUNETIO_VERBS_GPU_CODE_OPT_DEFAULT);
+    const uint32_t opt = DOCA_GPUNETIO_VERBS_GPU_CODE_OPT_SKIP_AVAILABILITY_CHECK;
+    for (int l = 0; l < n_layers; ++l) {
+      const int s0 = lp[l], n = lp[l + 1] - s0;
+      const int per = (n + nqp - 1) / nqp;
+      const int total = max_steps * per;
+      unsigned long long* tk = tickets + (long long)l * max_steps * nqp + w;
+      for (int k = lane; k < max_steps; k += 32) tk[(long long)k * nqp] = 0;   // steps without a chunk on this QP
+      int cnt = 0;
+      for (int t = lane; t < total; t += 32) {
+        const int k = t / per, j = ((w - k) % nqp + nqp) % nqp + nqp * (t % per);
+        if (j < n && segs[s0 + j].bytes > (long long)k * tb) ++cnt;
+      }
+      for (int o = 16; o > 0; o >>= 1) cnt += __shfl_xor_sync(0xffffffffu, cnt, o);
+      __syncwarp();                                     // zeroed tickets before the step tickets below
+      if (cnt > 0) {
+        unsigned long long base = 0;
+        if (lane == 0)
+          base = doca_gpu_dev_verbs_reserve_wq_slots<RAW_EXCL, DOCA_GPUNETIO_VERBS_QP_SQ>(qp, cnt, opt);
+        base = __shfl_sync(0xffffffffu, base, 0);
+        unsigned long long idx = base;
+        for (int t0 = 0; t0 < total; t0 += 32) {
+          const int t = t0 + lane;
+          int k = 0;
+          bool has = false;
+          Seg sg{};
+          if (t < total) {
+            k = t / per;
+            const int j = ((w - k) % nqp + nqp) % nqp + nqp * (t % per);
+            if (j < n) {
+              sg = segs[s0 + j];
+              has = sg.bytes > (long long)k * tb;
+            }
+          }
+          const unsigned m = __ballot_sync(0xffffffffu, has);
+          const unsigned long long my = idx + __popc(m & ((1u << lane) - 1u));
+          if (has) {
+            const long long done = (long long)k * tb;
+            const long long len = min(tb, (long long)sg.bytes - done);
+            const long long off = (long long)sg.bytes - done - len;
+            struct doca_gpu_dev_verbs_wqe* wqe = doca_gpu_dev_verbs_get_wqe_ptr(qp, my);
+            doca_gpu_dev_verbs_wqe_prepare_read(qp, wqe, my, flags, rbase + (uint64_t)(sg.remote + off), rkey_be,
+                                                lbase + (uint64_t)(sg.local + off), lkey_be, (size_t)len);
+          }
+          // the step's ticket = its last WQE on this QP + 1: lanes hold chunks in step order, so a valid lane is the
+          // last of its step in this round when the next valid lane has another step (a step spanning two rounds is
+          // overwritten by the later round)
+          const unsigned higher = (lane == 31) ? 0u : (m & (0xffffffffu << (lane + 1)));
+          const int knext = __shfl_sync(0xffffffffu, k, higher ? (__ffs(higher) - 1) : lane);
+          if (has && (higher == 0 || knext != k)) tk[(long long)k * nqp] = my + 1;
+          idx += __popc(m);
+        }
+        __syncwarp();
+        if (lane == 0) {
+          doca_gpu_dev_verbs_mark_wqes_ready<RAW_EXCL>(qp, base, idx - 1);
+          doca_gpu_dev_verbs_submit<RAW_EXCL, DOCA_GPUNETIO_VERBS_SYNC_SCOPE_THREAD>(qp, idx);
+        }
+      }
+      __syncwarp();
+      if (lane == 0) {
+        if (tr && l < 16 && w < 8) tr[TRACE_DB + 8 * l + w] = gtime();
+        __threadfence_block();                           // tickets (global) before the shared-memory flag
+        atomicAdd(&s_posted[l], 1);
+      }
+    }
+    return;
+  }
+  if (w != nqp || lane != 0 || (tsteps == nullptr && prog == nullptr)) return;
+  int ne = 0;
+  for (int l = 0; l < n_layers; ++l) {
+    while (*(volatile int*)&s_posted[l] < nqp) {
+    }
+    __threadfence_block();
+    for (int k = 0; k < max_steps; ++k) {
+      bool any = false;
+      for (int q = 0; q < nqp; ++q) {
+        const unsigned long long t = tickets[((long long)l * max_steps + k) * nqp + q];
+        if (t) {
+          any = true;
+          doca_gpu_dev_verbs_wait<RAW_EXCL>(qps[q], (doca_gpu_dev_verbs_ticket_t)(t - 1));
+        }
+      }
+      if (!any) break;
+      __threadfence();
+      raw_publish(tsteps, prog, seq, l, k + 1);
+      rtrace_event(tr, ne, l, k + 1);
+    }
+    __threadfence();
+    raw_publish(tsteps, prog, seq, l, 0x7fffffff);
+    rtrace_event(tr, ne, l, 0x7fffffff);
+  }
+  if (tr) tr[0] = ne;
+}
+
+__global__ void raw_post_tiled2_kernel(doca_gpu_dev_verbs_qp** qps, int nqp, const Seg* segs, const int* lp,
+                                       int n_layers, int max_steps, long long tb, uint64_t rbase, uint32_t rkey_be,
+                                       uint64_t lbase, uint32_t lkey_be, unsigned long long* tickets,
+                                       const volatile int* var, long long var_stride, int* tsteps,
+                                       unsigned long long* tr, unsigned long long* prog, unsigned long long seq,
+                                       const uint32_t* seq_ptr) {
+  __shared__ long long s_off;
+  __shared__ unsigned long long s_seq;
+  __shared__ int s_posted[64];
+  if (tr && threadIdx.x == 0) tr[1] = gtime();
+  if (threadIdx.x < 64) s_posted[threadIdx.x] = 0;
+  if (threadIdx.x == 0) {
+    s_off = var ? (long long)(*var) * var_stride : 0;
+    s_seq = seq_ptr ? (unsigned long long)*seq_ptr : seq;   // seq_ptr: the request counter of the post graph
+  }
+  __syncthreads();
+  raw_tiled_request(qps, nqp, segs + s_off, lp, n_layers, max_steps, tb, rbase, rkey_be, lbase, lkey_be, tickets,
+                    s_posted, tsteps, prog, s_seq, tr);
 }
 
 RawGdaki::RawGdaki(const std::string& dev, int64_t bytes, int nqp, int sq_depth) : p_(new RawImpl) {
@@ -345,18 +511,32 @@ void RawGdaki::wait_layer(const uint64_t* tickets, int layer, uint64_t* t_done, 
   CUDA_OK2(cudaGetLastError());
 }
 
-void RawGdaki::poll(const uint64_t* tickets, int n_layers, const uint32_t* seq, uint32_t* ready, cudaStream_t s) {
-  raw_poll_kernel<<<1, 1, 0, s>>>(p_->d_qps, (int)p_->qps.size(), (const unsigned long long*)tickets, n_layers, seq, ready);
+void RawGdaki::poll(const uint64_t* tickets, int n_layers, const uint32_t* seq, uint32_t* ready, cudaStream_t s,
+                    unsigned long long* trace) {
+  raw_poll_kernel<<<1, 1, 0, s>>>(p_->d_qps, (int)p_->qps.size(), (const unsigned long long*)tickets, n_layers, seq, ready,
+                                  trace);
   CUDA_OK2(cudaGetLastError());
 }
 
 void RawGdaki::post_gets_tiled(const Seg* segs, const int* layer_ptr, int n_layers, uint64_t* tickets, int max_steps,
-                               int64_t tile_bytes, int* tsteps, cudaStream_t s, const int* var, int64_t var_stride) {
+                               int64_t tile_bytes, int* tsteps, cudaStream_t s, const int* var, int64_t var_stride,
+                               unsigned long long* trace, int version, uint64_t* prog, uint64_t seq,
+                               const uint32_t* seq_ptr) {
   const int nq = (int)p_->qps.size();
+  if (version == 2) {   // + one publisher warp; prog: sequence-tagged progress instead of tsteps
+    raw_post_tiled2_kernel<<<1, 32 * (nq + 1), 0, s>>>(p_->d_qps, nq, segs, layer_ptr, n_layers, max_steps,
+                                                       (long long)tile_bytes, p_->raddr, htobe32(p_->rkey),
+                                                       (uint64_t)p_->buf, htobe32(p_->mr->lkey),
+                                                       (unsigned long long*)tickets, var, (long long)var_stride, tsteps,
+                                                       trace, (unsigned long long*)prog, (unsigned long long)seq,
+                                                       seq_ptr);
+    CUDA_OK2(cudaGetLastError());
+    return;
+  }
   raw_post_tiled_kernel<<<1, 32 * nq, 0, s>>>(p_->d_qps, nq, segs, layer_ptr, n_layers, max_steps,
                                               (long long)tile_bytes, p_->raddr, htobe32(p_->rkey), (uint64_t)p_->buf,
                                               htobe32(p_->mr->lkey), (unsigned long long*)tickets, var,
-                                              (long long)var_stride, tsteps);
+                                              (long long)var_stride, tsteps, trace);
   CUDA_OK2(cudaGetLastError());
 }
 

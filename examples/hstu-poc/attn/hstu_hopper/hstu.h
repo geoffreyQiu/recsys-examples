@@ -122,6 +122,9 @@ struct Hstu_fwd_params : public Qkv_params {
   const uint32_t* kv_seq = nullptr;
   int kv_wait_mode = 0;
   bool pdl = false;
+  // POC timeline (optional): per layer [0] earliest CTA entry (atomicMin), [1] latest CTA exit (atomicMax),
+  // [2] latest end of a data wait that had to spin, [3] number of such waits (globaltimer ns)
+  unsigned long long* kv_trace = nullptr;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -53,6 +53,8 @@ __global__ void __launch_bounds__(
   static constexpr int NumCopyThreads = cutlass::NumThreadsPerWarpGroup;
   static constexpr int kBlockM = Ktraits::kBlockM;
   static constexpr int kBlockN = Ktraits::kBlockN;
+  // POC timeline: earliest CTA entry of this launch (see Hstu_fwd_params::kv_trace)
+  if (mainloop_params.kv_trace != nullptr && threadIdx.x == 0) atomicMin(mainloop_params.kv_trace, hpoc_gtimer());
 
   static constexpr bool Is_causal = Ktraits::Is_causal;
   static constexpr bool Is_target = Ktraits::Is_target;
@@ -467,6 +469,9 @@ __global__ void __launch_bounds__(
       ++work_idx;
     }
     collective_epilogue.store_tail();
+    // POC timeline: latest CTA exit of this launch (first thread of each consumer warpgroup)
+    if (mainloop_params.kv_trace != nullptr && threadIdx.x % cutlass::NumThreadsPerWarpGroup == 0)
+      atomicMax(mainloop_params.kv_trace + 1, hpoc_gtimer());
   }
 }
 

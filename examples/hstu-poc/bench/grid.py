@@ -50,10 +50,126 @@ def mem_estimate_gb(cfg, mode, hist, cand):
     return (toks * tok_kv + q * cfg.hidden * 2 * 14) / 1e9 + 2
 
 
+class _Tracer:
+    """Timeline of single requests (--timeline N): graph start/end stamps, per layer the attention's earliest CTA
+    entry, latest exit and last data wait that had to spin, the transfer's progress as published (GPU publisher
+    kernel or CPU verbs worker) and host stamps. GPU times are mapped to the host clock (CLOCK_MONOTONIC) by a
+    calibration (offset = min(gpu - host) over 200 samples: GPU events read up to ~1 us early)."""
+
+    def __init__(self, E, cfg, dev):
+        self.E = E
+        self.g = torch.zeros(2, dtype=torch.int64, device=dev)
+        self.attn = torch.zeros(cfg.layers, 4, dtype=torch.int64, device=dev)
+        self.attn0 = torch.zeros(cfg.layers, 4, dtype=torch.int64, device=dev)
+        self.attn0[:, 0] = -1                    # atomicMin of the CTA entry: start from the largest uint64
+
+    def begin(self, src):
+        self.attn.copy_(self.attn0)
+        if src is not None and hasattr(src, "trace_reset"):
+            src.trace_reset()
+        self.E.stamp(self.g[0:1])
+
+    def end(self):
+        self.E.stamp(self.g[1:2])
+
+
+def timeline_cell(model, cfg, src, fwd, pre, post, tracer, n_req):
+    """Capture a traced copy of the cell's graph and run n_req isolated requests (after 3 warm-up ones). Returns
+    one dict per request; times in ns from the request's issue (host clock)."""
+    from hstu_poc.ext import ext as _ext
+    E = _ext()
+    dev = torch.device("cuda")
+    T = _Tracer(E, cfg, dev)
+    tracer[0] = T
+    model.attn_trace = T.attn
+    v = getattr(src, "v", None)                  # CPU verbs engine
+    if src is not None and hasattr(src, "trace_on"):
+        src.trace_on(E)
+    if v is not None:
+        v.set_trace(True)
+    if src is not None:
+        src.eager = True                         # eager warm-up below
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for i in range(2):
+            pre(i)
+            fwd()
+            post(i)
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+    if v is not None:
+        v.wait_idle()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        fwd()
+    if src is not None:
+        src.eager = False
+        if hasattr(src, "capture_post"):         # re-capture with the trace buffer
+            src.pgraph = None
+            src.capture_post()
+    torch.cuda.synchronize()
+    cal = np.array(E.calibrate_clock(200), dtype=np.int64).reshape(-1, 2)
+    d = cal[:, 1] - cal[:, 0]
+    off = int(d.min())
+    out = []
+    for i in range(n_req + 3):
+        torch.cuda.synchronize()
+        if v is not None:
+            v.wait_idle()
+        t0 = time.monotonic_ns()
+        pre(i + 1000)
+        t1 = time.monotonic_ns()
+        g.replay()
+        t2 = time.monotonic_ns()
+        post(i + 1000)
+        ev = torch.cuda.Event()
+        ev.record()
+        while not ev.query():
+            pass
+        t3 = time.monotonic_ns()
+        if v is not None:
+            v.wait_idle()
+        torch.cuda.synchronize()
+        if i < 3:
+            continue
+
+        def gt(x):                               # GPU globaltimer -> ns since the request's issue
+            return int(x) - off - t0 if x not in (0, -1) else None
+        gs = T.g.tolist()
+        r = dict(host=[0, t1 - t0, t2 - t0, t3 - t0], g0=gt(gs[0]), g1=gt(gs[1]),
+                 attn=[[gt(a[0]), gt(a[1]), gt(a[2]), int(a[3])] for a in T.attn.tolist()])
+        if src is not None and getattr(src, "tr_pub", None) is not None:
+            hdr = src.tr_pub[:130].tolist()
+            n = int(hdr[0])
+            evs = src.tr_pub[130:130 + 3 * n].view(-1, 3).tolist() if n else []
+            r["pub_start"] = gt(hdr[1])
+            r["pub_db"] = [gt(x) for x in hdr[2:2 + 8 * cfg.layers]]
+            r["pub_ev"] = [[int(l_), int(v_), gt(t_)] for l_, v_, t_ in evs]
+            r["wait"] = [gt(x) for x in src.tr_wait.tolist()]
+        if v is not None:
+            tr = v.trace_read()
+            n = int(tr[6])
+            rel = lambda x: int(x) - t0 if x else None  # noqa: E731  (host clock already)
+            r["cpu"] = dict(post0=rel(tr[0]), post1=rel(tr[1]), pick=rel(tr[2]), cqe0=rel(tr[3]), end=rel(tr[4]),
+                            post2=rel(tr[5]),
+                            ev=[[int(tr[7 + 3 * k]), int(tr[8 + 3 * k]), rel(tr[9 + 3 * k])] for k in range(n)])
+        out.append(r)
+    tracer[0] = None
+    model.attn_trace = None
+    if src is not None:
+        src.trace = False
+    if v is not None:
+        v.set_trace(False)
+    del g
+    return out, dict(offset_ns=off, cal_spread_ns=int(np.percentile(d, 50) - off), cal_n=int(len(d)))
+
+
 def run_cell(model, cfg, mode, hist, cand, args, extra_sources):
     dev = torch.device("cuda")
     B = len(hist)
     src = None
+    tracer = [None]                              # set by timeline_cell while it captures its traced graph
     if mode == "recompute":
         b = Batch([0] * B, cand, new=hist, device=dev)
         T = b.total_k
@@ -62,8 +178,14 @@ def run_cell(model, cfg, mode, hist, cand, args, extra_sources):
         flops = cfg.layers * (linear_flops(T, cfg) + attn_flops(b, cfg, recompute=True))
 
         def fwd():
+            T = tracer[0]
+            if T is not None:
+                T.begin(None)
             x = model.embed(items, acts, b.pos_full)
-            return model.forward_full(x, b)
+            y = model.forward_full(x, b)
+            if T is not None:
+                T.end()
+            return y
     else:
         b = Batch(hist, cand, device=dev)
         src = make_source(mode, cfg, extra_sources)
@@ -72,19 +194,26 @@ def run_cell(model, cfg, mode, hist, cand, args, extra_sources):
         flops = cfg.layers * (linear_flops(b.total_q, cfg) + attn_flops(b, cfg, recompute=False))
 
         def fwd():
+            T = tracer[0]
+            if T is not None:
+                T.begin(src)
             src.start()
             x = model.embed(items, None, b.pos_q)
             y = model.forward_cached(x, b, src.kv, before_attn=src.before_attn, attn_fn=getattr(src, "attn_fn", None))
             src.end()
+            if T is not None:
+                T.end()
             return y
 
     pre = getattr(src, "pre_replay", None) or (lambda i: None)
+    post = getattr(src, "post_replay", None) or (lambda i: None)     # split posting: the rest after the launch
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         for i in range(2):
             pre(i)
             fwd()
+            post(i)
     torch.cuda.current_stream().wait_stream(s)
     torch.cuda.synchronize()
     if getattr(args, "eager", False):     # P4: no CUDA graph, launch every kernel per request
@@ -96,12 +225,17 @@ def run_cell(model, cfg, mode, hist, cand, args, extra_sources):
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             fwd()
+        if src is not None:
+            src.eager = False                    # graph replays from now on (split posting allowed)
+            if hasattr(src, "capture_post"):
+                src.capture_post()               # raw GDAKI v3: the post kernel's own graph
     torch.cuda.synchronize()
     # estimate, then measure
     t0 = time.perf_counter()
     for i in range(3):
         pre(i)
         g.replay()
+        post(i)
         torch.cuda.synchronize()
     t_est = (time.perf_counter() - t0) / 3
     n = int(min(args.max_iters, max(args.min_iters, args.budget_s / max(t_est, 1e-6))))
@@ -124,6 +258,7 @@ def run_cell(model, cfg, mode, hist, cand, args, extra_sources):
         e0.record()
         pre(i + 3)
         g.replay()
+        post(i + 3)
         e1.record()
         if host is not None:
             while not e1.query():
@@ -149,6 +284,14 @@ def run_cell(model, cfg, mode, hist, cand, args, extra_sources):
     if bad is not None:
         res["check_bad_words"] = bad
     res["eta"] = res["tflops"] / PEAK_TFLOPS
+    if getattr(args, "timeline", 0):
+        del g
+        g = None
+        tl, cal = timeline_cell(model, cfg, src, fwd, pre, post, tracer, args.timeline)
+        res["timeline"] = tl
+        res["calibration"] = cal
+        if src is not None and getattr(src, "tile_rows", 0):
+            res.update(tile_rows=int(src.tile_rows), tile_steps=int(src.tile_steps))
     del g
     if src is not None:
         src.release()
@@ -172,6 +315,8 @@ def add_args(ap):
     ap.add_argument("--eager", action="store_true", help="no CUDA graph (P4 baseline)")
     ap.add_argument("--clock", default="gpu", choices=["gpu", "host"], help="host: also time each request end to end "
                     "on the host (request issued -> output event seen complete); needs --isolated")
+    ap.add_argument("--timeline", type=int, default=0, help="after the measurement, trace N more isolated requests "
+                    "with a traced copy of the graph (written to <out>.timeline.rank<r>.jsonl)")
 
 
 def main():
@@ -217,6 +362,12 @@ def run_grid(a, rank, world, extra, gpus=None):
                 except torch.cuda.OutOfMemoryError as e:
                     rec.update(skipped=f"OOM: {str(e)[:80]}")
                 torch.cuda.empty_cache()
+            tl = rec.pop("timeline", None)
+            if tl is not None:
+                with open(f"{a.out}.timeline.rank{rank}.jsonl", "a") as ft:
+                    base = {k: v for k, v in rec.items() if not isinstance(v, (list, dict)) or k == "calibration"}
+                    for k, r in enumerate(tl):
+                        ft.write(json.dumps(dict(base, req=k, **r)) + "\n")
             out.write(json.dumps(rec) + "\n")
             out.flush()
             if "skipped" in rec:

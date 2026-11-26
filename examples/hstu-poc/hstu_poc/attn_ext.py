@@ -45,13 +45,15 @@ def attn_ext(verbose=False):
     return torch.ops.hpoc_attn
 
 
-def hstu_fwd(q, k, v, cu_q, cu_k, max_q, max_k, scaling, num_targets, alpha, kv_ready=0, kv_seq=0, mode=0, pdl=False):
-    """FBGEMM's hstu_varlen_fwd_90 (causal + targets), with the P4 wait settings applied to this launch only."""
+def hstu_fwd(q, k, v, cu_q, cu_k, max_q, max_k, scaling, num_targets, alpha, kv_ready=0, kv_seq=0, mode=0, pdl=False,
+             trace=0):
+    """FBGEMM's hstu_varlen_fwd_90 (causal + targets), with the P4 wait settings applied to this launch only.
+    trace: optional device address of 4 uint64 (timeline: CTA entry min, exit max, last spinning data wait, count)."""
     ops = attn_ext()
-    ops.set_kv_wait(kv_ready, kv_seq, mode, pdl)
+    ops.set_kv_wait(kv_ready, kv_seq, mode, pdl, trace)
     try:
         out, _ = ops.hstu_varlen_fwd_90(q, k, v, cu_q, cu_k, None, None, max_q, max_k, scaling, None, num_targets, 1,
                                         -1, 0, alpha, None, None, -1, 0)
     finally:
-        ops.set_kv_wait(0, 0, 0, False)
+        ops.set_kv_wait(0, 0, 0, False, 0)
     return out

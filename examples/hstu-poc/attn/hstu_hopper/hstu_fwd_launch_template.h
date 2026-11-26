@@ -97,7 +97,7 @@ void run_hstu_fwd(Hstu_fwd_params& params, cudaStream_t stream) {
           params.descale_q_head_stride, params.descale_k_head_stride, params.descale_v_head_stride, params.descale_vt_head_stride, params.descale_vt_row_stride,
           static_cast<int const*>(params.func_ptr), params.func_ids_stride, params.window_size_left, params.window_size_right,
           params.target_group_size, params.scaling_seqlen, params.alpha, params.cu_seqlens_vt_descale, params.cu_seqlens_q_block_descale, params.cu_seqlens_kv_block_descale, params.q_block_descale_head_stride, params.kv_block_descale_head_stride,
-          params.kv_ready, params.kv_seq, params.kv_wait_mode
+          params.kv_ready, params.kv_seq, params.kv_wait_mode, params.kv_trace
       });
   typename CollectiveEpilogue::Params epilogue_params =
       CollectiveEpilogue::to_underlying_arguments({

@@ -27,13 +27,20 @@ class RawGdaki {
   void post_gets(const Seg* segs, const int* layer_ptr, int n_layers, uint64_t* tickets, uint64_t* t_post,
                  cudaStream_t s, const int* var = nullptr, int64_t var_stride = 0);
   void wait_layer(const uint64_t* tickets, int layer, uint64_t* t_done, cudaStream_t s);
-  void poll(const uint64_t* tickets, int n_layers, const uint32_t* seq, uint32_t* ready, cudaStream_t s);   // P4 fused
+  void poll(const uint64_t* tickets, int n_layers, const uint32_t* seq, uint32_t* ready, cudaStream_t s,
+            unsigned long long* trace = nullptr);   // P4 fused; trace: timeline (kvutil.h)
   // per-tile waits: chunked gets posted from each segment's end; tickets [n_layers * max_steps * nqp]; the poller
   // publishes tsteps[l] = steps landed (0x7fffffff when the layer is complete)
   // (the post kernel also polls the completions and publishes tsteps, see raw_post_tiled_kernel)
   void post_gets_tiled(const Seg* segs, const int* layer_ptr, int n_layers, uint64_t* tickets, int max_steps,
                        int64_t tile_bytes, int* tsteps, cudaStream_t s, const int* var = nullptr,
-                       int64_t var_stride = 0);
+                       int64_t var_stride = 0, unsigned long long* trace = nullptr, int version = 1,
+                       uint64_t* prog = nullptr, uint64_t seq = 0, const uint32_t* seq_ptr = nullptr);
+  // prog (v2 only): publish prog[l] = seq << 32 | steps (uint64, device memory) instead of tsteps[l], for a post kernel
+  // launched outside the request's graph (per-tile v3: no reset of the progress words by the graph); seq_ptr: read the
+  // sequence number from device memory instead (a post kernel captured in its own graph)
+  // version 2: exclusive QP ownership (no locks/atomics in DOCA's posting calls), a separate publisher warp that
+  // publishes each layer as soon as it is posted (raw_post_tiled2_kernel)
   void destroy();
 
  private:

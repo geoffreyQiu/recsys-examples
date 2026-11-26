@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
+#include <vector>
+
 namespace hpoc {
 
 // 8-byte word `word` of (user, layer) for a given seed. Each 16-bit lane is a finite BF16 in +-[2^-7, 2^-6).
@@ -36,7 +38,7 @@ void wait_flag_gpu(const volatile uint32_t* flag, uint32_t value, uint64_t* stam
 // (*seq)++, and the per-layer wait spins until flags[layer] >= *seq (the CPU stores seq into flags[layer]).
 void seq_inc_gpu(uint32_t* seq, cudaStream_t s);
 void relay_flags_gpu(const volatile uint32_t* host_flags, int n_layers, const uint32_t* seq, uint32_t* ready,
-                     cudaStream_t s);   // P4 fused, CPU verbs
+                     cudaStream_t s, unsigned long long* trace = nullptr);   // P4 fused, CPU verbs
 // flags[layer] = *seq, after a system-scope fence (host-mapped flags read by a CPU thread)
 void set_flag_seq_gpu(volatile uint32_t* flags, int layer, const uint32_t* seq, cudaStream_t s);
 void wait_flags_seq_gpu(const volatile uint32_t* flags, int layer, const uint32_t* seq, uint64_t* stamp,
@@ -44,7 +46,19 @@ void wait_flags_seq_gpu(const volatile uint32_t* flags, int layer, const uint32_
 // per-tile waits, CPU verbs: relay the worker's per-layer progress ((seq << 32) | steps, host-mapped) into device
 // words tsteps[l] = steps landed (0x7fffffff once the layer is complete), for the attention's per-tile spin
 void relay_tiles_gpu(const volatile unsigned long long* prog, const volatile uint32_t* host_flags, int n_layers,
-                     const uint32_t* seq, int32_t* tsteps, cudaStream_t s);
+                     const uint32_t* seq, int32_t* tsteps, cudaStream_t s, unsigned long long* trace = nullptr,
+                     int version = 1);   // version 2: one read per poll (progress word marks a complete layer)
+
+// Timeline traces of the progress publishers (optional, nullptr = off; globaltimer ns). Layout of a trace buffer:
+// [0] number of events, [1] publisher kernel start, [2 + 8 l + q] layer l's doorbell on queue pair q (raw GDAKI),
+// then events of 3 words from TRACE_EV: (layer, value published, time); at most TRACE_CAP events.
+constexpr int TRACE_DB = 2;
+constexpr int TRACE_EV = 2 + 16 * 8;
+constexpr int TRACE_CAP = 8192;
+__host__ __device__ inline int64_t trace_words() { return TRACE_EV + 3 * (int64_t)TRACE_CAP; }
+// Clock calibration: a GPU thread records (host CLOCK_MONOTONIC ns written by the CPU into mapped memory, its own
+// globaltimer when it saw the value). Returns n pairs; min(gpu - host) estimates the clock offset (+ one-way latency).
+std::vector<int64_t> calibrate_clock(int n);
 
 // P6: an SM hog (every block's thread 0 spins for ns while the block stays resident) and green contexts.
 void hog_gpu(int64_t ns, int blocks, int threads, cudaStream_t s);

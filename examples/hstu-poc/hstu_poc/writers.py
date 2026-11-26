@@ -9,6 +9,7 @@ writes when the GPU flags a layer as ready)."""
 import numpy as np
 import torch
 
+from .kvsource import side_stream
 from .model import Batch
 
 
@@ -21,7 +22,7 @@ class WriterBase:
         self.dev = torch.device(device)
         self.rng = np.random.default_rng(seed)
         self.scratch = window.numel() - 4096          # fence landing zone: last 4 KiB of the window
-        self.side = torch.cuda.Stream(device=self.dev)
+        self.side = side_stream(self.dev)
         self.evs = [torch.cuda.Event() for _ in range(cfg.layers)]
 
     def setup(self, b: Batch, blk):

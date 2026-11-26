@@ -4,6 +4,8 @@
 #include <omp.h>
 
 #include <stdexcept>
+#include <time.h>
+#include <vector>
 #include <string>
 
 namespace hpoc {
@@ -99,21 +101,37 @@ __global__ void wait_flags_seq_kernel(const volatile uint32_t* flags, int layer,
 void seq_inc_gpu(uint32_t* seq, cudaStream_t s) { seq_inc_kernel<<<1, 1, 0, s>>>(seq); }
 // P4 fused, CPU verbs: relay the CPU's host-mapped per-layer flags into device ready words (one thread polls PCIe,
 // the attention CTAs spin on L2)
-__global__ void relay_flags_kernel(const volatile uint32_t* host_flags, int n_layers, const uint32_t* seq, uint32_t* ready) {
+__device__ __forceinline__ void trace_event(unsigned long long* tr, int& n, int l, long long v) {
+  if (tr && n < TRACE_CAP) {
+    unsigned long long* e = tr + TRACE_EV + 3 * n;
+    e[0] = (unsigned long long)l;
+    e[1] = (unsigned long long)v;
+    e[2] = gtimer();
+    ++n;
+  }
+}
+__global__ void relay_flags_kernel(const volatile uint32_t* host_flags, int n_layers, const uint32_t* seq, uint32_t* ready,
+                                   unsigned long long* tr) {
+  if (tr) tr[1] = gtimer();
+  int n = 0;
   const uint32_t s = *seq;
   for (int l = 0; l < n_layers; ++l) {
     while (host_flags[l] < s) {
     }
     __threadfence_system();
     asm volatile("st.release.gpu.global.u32 [%0], %1;" ::"l"(ready + l), "r"(s) : "memory");
+    trace_event(tr, n, l, 0x7fffffff);
   }
+  if (tr) tr[0] = n;
 }
 void relay_flags_gpu(const volatile uint32_t* host_flags, int n_layers, const uint32_t* seq, uint32_t* ready,
-                     cudaStream_t s) {
-  relay_flags_kernel<<<1, 1, 0, s>>>(host_flags, n_layers, seq, ready);
+                     cudaStream_t s, unsigned long long* trace) {
+  relay_flags_kernel<<<1, 1, 0, s>>>(host_flags, n_layers, seq, ready, trace);
 }
 __global__ void relay_tiles_kernel(const volatile unsigned long long* prog, const volatile uint32_t* host_flags,
-                                   int n_layers, const uint32_t* seq, int32_t* tsteps) {
+                                   int n_layers, const uint32_t* seq, int32_t* tsteps, unsigned long long* tr) {
+  if (tr) tr[1] = gtimer();
+  int n = 0;
   const uint32_t s = *seq;
   for (int l = 0; l < n_layers; ++l) {
     int last = 0;
@@ -124,18 +142,95 @@ __global__ void relay_tiles_kernel(const volatile unsigned long long* prog, cons
         last = (int)(p & 0xffffffffull);
         __threadfence_system();
         asm volatile("st.release.gpu.global.s32 [%0], %1;" ::"l"(tsteps + l), "r"(last) : "memory");
+        trace_event(tr, n, l, last);
       }
       if (full) {
         __threadfence_system();
         asm volatile("st.release.gpu.global.s32 [%0], %1;" ::"l"(tsteps + l), "r"(0x7fffffff) : "memory");
+        trace_event(tr, n, l, 0x7fffffff);
         break;
       }
     }
   }
+  if (tr) tr[0] = n;
+}
+// v2: one PCIe read per poll: the worker marks a complete layer in its progress word (steps = 0x7fffffff)
+__global__ void relay_tiles2_kernel(const volatile unsigned long long* prog, int n_layers, const uint32_t* seq,
+                                    int32_t* tsteps, unsigned long long* tr) {
+  if (tr) tr[1] = gtimer();
+  int n = 0;
+  const uint32_t s = *seq;
+  for (int l = 0; l < n_layers; ++l) {
+    int last = 0;
+    while (last != 0x7fffffff) {
+      const unsigned long long p = prog[l];
+      const int v = (int)(p & 0xffffffffull);
+      if ((uint32_t)(p >> 32) == s && v > last) {
+        last = v;
+        __threadfence_system();
+        asm volatile("st.release.gpu.global.s32 [%0], %1;" ::"l"(tsteps + l), "r"(last) : "memory");
+        trace_event(tr, n, l, last);
+      }
+    }
+  }
+  if (tr) tr[0] = n;
 }
 void relay_tiles_gpu(const volatile unsigned long long* prog, const volatile uint32_t* host_flags, int n_layers,
-                     const uint32_t* seq, int32_t* tsteps, cudaStream_t s) {
-  relay_tiles_kernel<<<1, 1, 0, s>>>(prog, host_flags, n_layers, seq, tsteps);
+                     const uint32_t* seq, int32_t* tsteps, cudaStream_t s, unsigned long long* trace, int version) {
+  if (version == 2)
+    relay_tiles2_kernel<<<1, 1, 0, s>>>(prog, n_layers, seq, tsteps, trace);
+  else
+    relay_tiles_kernel<<<1, 1, 0, s>>>(prog, host_flags, n_layers, seq, tsteps, trace);
+}
+
+// clock calibration (see kvutil.h): stop after n values or at the sentinel -1
+__global__ void calib_kernel(const volatile long long* hw, long long* out, int n) {
+  long long last = hw[0];
+  for (int i = 0; i < n;) {
+    const long long v = hw[0];
+    if (v == last) continue;
+    if (v == -1) break;
+    out[2 * i] = v;
+    out[2 * i + 1] = (long long)gtimer();
+    last = v;
+    ++i;
+  }
+}
+static int64_t mono_ns() {
+  timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec;
+}
+std::vector<int64_t> calibrate_clock(int n) {
+  long long* hw = nullptr;
+  long long* hw_dev = nullptr;
+  long long* out = nullptr;
+  cudaHostAlloc((void**)&hw, sizeof(long long), cudaHostAllocMapped);
+  cudaHostGetDevicePointer((void**)&hw_dev, hw, 0);
+  cudaMalloc((void**)&out, 2 * sizeof(long long) * n);
+  cudaMemset(out, 0, 2 * sizeof(long long) * n);
+  *(volatile long long*)hw = 0;
+  cudaStream_t s;
+  cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+  calib_kernel<<<1, 1, 0, s>>>(hw_dev, out, n);
+  const int64_t t_start = mono_ns();
+  while (mono_ns() - t_start < 200000) {   // let the kernel start
+  }
+  for (int i = 0; i < n + 16; ++i) {
+    const int64_t t0 = mono_ns();
+    while (mono_ns() - t0 < 5000) {         // ~5 us apart: the GPU sees every value
+    }
+    const int64_t t = mono_ns();
+    __atomic_store_n((volatile long long*)hw, (long long)t, __ATOMIC_SEQ_CST);
+  }
+  __atomic_store_n((volatile long long*)hw, -1ll, __ATOMIC_SEQ_CST);
+  cudaStreamSynchronize(s);
+  std::vector<int64_t> r(2 * n);
+  cudaMemcpy(r.data(), out, 2 * sizeof(long long) * n, cudaMemcpyDeviceToHost);
+  cudaStreamDestroy(s);
+  cudaFree(out);
+  cudaFreeHost(hw);
+  return r;
 }
 __global__ void set_flag_seq_kernel(volatile uint32_t* flags, int layer, const uint32_t* seq) {
   __threadfence_system();

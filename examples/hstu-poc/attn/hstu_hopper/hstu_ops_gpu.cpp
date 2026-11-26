@@ -619,10 +619,11 @@ void run_hstu_fwd_hopper(Hstu_fwd_params& params, cudaStream_t stream) {
 // POC (P4): wait settings for the next forward launch (host-side, so CUDA-graph capture bakes them into each
 // layer's kernel node). Set before an attention call, reset after it.
 static struct {
-  int64_t ready = 0, seq = 0, mode = 0;
+  int64_t ready = 0, seq = 0, mode = 0, trace = 0;
   bool pdl = false;
 } g_kv_wait;
-void hpoc_set_kv_wait(int64_t ready, int64_t seq, int64_t mode, bool pdl) {
+void hpoc_set_kv_wait(int64_t ready, int64_t seq, int64_t mode, bool pdl, int64_t trace) {
+  g_kv_wait.trace = trace;
   g_kv_wait.ready = ready;
   g_kv_wait.seq = seq;
   g_kv_wait.mode = mode;
@@ -879,6 +880,7 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_90(
   params.kv_seq = reinterpret_cast<const uint32_t*>(g_kv_wait.seq);
   params.kv_wait_mode = (int)g_kv_wait.mode;
   params.pdl = g_kv_wait.pdl;
+  params.kv_trace = reinterpret_cast<unsigned long long*>(g_kv_wait.trace);
 
   auto tile_count_semaphore = torch::zeros({1}, opts.dtype(torch::kInt32));
   params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
@@ -1422,7 +1424,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> hstu_varlen_bwd_90(
 } // namespace fbgemm_gpu::hstu
 
 TORCH_LIBRARY_FRAGMENT(hpoc_attn, m) {
-  m.def("set_kv_wait(int ready, int seq, int mode, bool pdl) -> ()", &fbgemm_gpu::hstu::hpoc_set_kv_wait);
+  m.def("set_kv_wait(int ready, int seq, int mode, bool pdl, int trace=0) -> ()", &fbgemm_gpu::hstu::hpoc_set_kv_wait);
   m.set_python_module("hstu.hstu_ops_gpu");
   m.def(
       "hstu_varlen_fwd_90("

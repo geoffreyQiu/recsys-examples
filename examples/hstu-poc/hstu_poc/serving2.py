@@ -22,7 +22,7 @@ from collections import deque
 import numpy as np
 import torch
 
-from .kvsource import VerbsKVSource
+from .kvsource import VerbsKVSource, side_stream
 from .model import Batch
 from .serving import thread_cpu
 
@@ -142,7 +142,7 @@ class FetchServer(_Common):
         self.p4 = p4
         if p4 == "fused":
             self.ready = torch.zeros(cfg.layers, dtype=torch.int32, device=dev)
-            self.side = torch.cuda.Stream()
+            self.side = side_stream()                          # never the capturing stream (kvsource.side_stream)
             if kind == "verbs":
                 self.kseq = self.seq_dev                       # the batch's newest request's sequence number
                 self._poll = lambda: E.relay_flags(self.flags, cfg.layers, self.seq_dev, self.ready)  # noqa: E731

@@ -4,8 +4,11 @@
 set -eu
 cd "$(dirname "$0")/.."
 F=docs/figs
-# explanatory diagrams (schematic): wait variants over time, who posts and reports progress
+# explanatory diagrams (schematic): wait variants over time, who posts and reports progress; the model
 python tools/fetch_diagrams.py $F
+python tools/model_diagram.py $F
+# speed of light (docs/sol.md): request timelines, latency / SoL, time split against SoL
+python tools/sol_figs.py $F
 # plain-run latency (P2t, host clock): per transport its fastest implementation, recompute, local hit
 python tools/p2t_to_p2c.py results/p2t work/p2t_flat
 python tools/report_figs.py work/p2t_flat --cost $F/cost-per-user.png

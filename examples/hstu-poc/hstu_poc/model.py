@@ -133,6 +133,9 @@ class HSTU(torch.nn.Module):
         self.mlp_w1, self.mlp_b1 = rnd(h, m1, scale=1 / math.sqrt(h)), rnd(m1, scale=0.02)
         self.mlp_w2, self.mlp_b2 = rnd(m1, m2, scale=1 / math.sqrt(m1)), rnd(m2, scale=0.02)
         self.alpha = 1.0 / math.sqrt(cfg.head_dim)
+        # timeline (optional): [layers, 4] int64 device tensor; when set, every attention runs the copied kernel
+        # (attn/hstu_hopper, same code as FBGEMM's) and records its CTA entry/exit and data waits (attn_ext.hstu_fwd)
+        self.attn_trace = None
 
     # ------------------------------------------------------------------ pieces
     def bucket(self, pos):
@@ -163,7 +166,11 @@ class HSTU(torch.nn.Module):
         out.add_(p["b_proj"])
         return out
 
-    def attention(self, q, k, v, cu_q, cu_k, max_q, max_k, num_targets):
+    def attention(self, q, k, v, cu_q, cu_k, max_q, max_k, num_targets, layer=None):
+        if self.attn_trace is not None and layer is not None:
+            from .attn_ext import hstu_fwd
+            return hstu_fwd(q, k, v, cu_q, cu_k, max_q, max_k, self.cfg.max_len, num_targets, self.alpha,
+                            trace=self.attn_trace.data_ptr() + 32 * layer)
         return hstu_attn_varlen_func(q, k, v, cu_q, cu_k, None, None, max_q, max_k, self.cfg.max_len, None,
                                      num_targets, 1, (-1, 0), self.alpha)
 
@@ -182,7 +189,7 @@ class HSTU(torch.nn.Module):
                 K, V = kv_out(i)
                 K.copy_(k)
                 V.copy_(v)
-            a = self.attention(q, k, v, b.cu_full, b.cu_full, b.max_k, b.max_k, b.num_targets)
+            a = self.attention(q, k, v, b.cu_full, b.cu_full, b.max_k, b.max_k, b.num_targets, layer=i)
             x = self.finish(i, a, u, x)
         return self.head(x[b.cand_in_full])
 
@@ -207,7 +214,7 @@ class HSTU(torch.nn.Module):
             else:
                 if before_attn is not None:
                     before_attn(i)
-                a = self.attention(q, K, V, b.cu_q, b.cu_k, b.max_q, b.max_k, b.num_targets)
+                a = self.attention(q, K, V, b.cu_q, b.cu_k, b.max_q, b.max_k, b.num_targets, layer=i)
             x = self.finish(i, a, u, x)
         return self.head(x[b.cand_in_q])
 

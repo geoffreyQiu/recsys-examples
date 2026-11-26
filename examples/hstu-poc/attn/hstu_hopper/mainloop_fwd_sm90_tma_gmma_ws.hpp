@@ -29,6 +29,19 @@ namespace flash {
 
 using namespace cute;
 
+// POC timeline: globaltimer, and the record of a data wait that had to spin (see Hstu_fwd_params::kv_trace)
+__device__ __forceinline__ unsigned long long hpoc_gtimer() {
+  unsigned long long t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
+__device__ __forceinline__ void hpoc_trace_wait(unsigned long long* tr) {
+  if (tr) {
+    atomicMax(tr + 2, hpoc_gtimer());
+    atomicAdd(tr + 3, 1ull);
+  }
+}
+
 // 4 warps
 struct SmemTransposeFp8_64x64 {
   using Element = cutlass::float_e4m3_t;
@@ -233,6 +246,7 @@ struct CollectiveMainloopFwd {
     uint32_t const* kv_ready;
     uint32_t const* kv_seq;
     int kv_wait_mode;
+    unsigned long long* kv_trace;
   };
 
   // Device side kernel params
@@ -272,6 +286,7 @@ struct CollectiveMainloopFwd {
     uint32_t const* kv_ready;
     uint32_t const* kv_seq;
     int kv_wait_mode;
+    unsigned long long* kv_trace;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
@@ -343,7 +358,8 @@ struct CollectiveMainloopFwd {
         args.kv_block_descale_head_stride,
         args.kv_ready,
         args.kv_seq,
-        args.kv_wait_mode};
+        args.kv_wait_mode,
+        args.kv_trace};
   }
 
   /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best
@@ -463,10 +479,13 @@ struct CollectiveMainloopFwd {
       if (cute::elect_one_sync()) {
         uint32_t want = *mainloop_params.kv_seq;
         uint32_t got;
+        int spins = 0;
         do {
           asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(got) : "l"(mainloop_params.kv_ready) : "memory");
+          ++spins;
         } while (got < want);
         asm volatile("fence.proxy.async.global;" ::: "memory");
+        if (spins > 1) hpoc_trace_wait(mainloop_params.kv_trace);
       }
       __syncwarp();
     } else if (mainloop_params.kv_wait_mode == 2) {
@@ -476,19 +495,73 @@ struct CollectiveMainloopFwd {
     // this tile's history rows have landed. The history is transferred from its end backwards (the loop below
     // consumes key blocks last-to-first): *kv_ready = number of chunks landed for this layer (every user),
     // 0x7fffffff once the layer is complete. Blocks past the history (the candidates' own rows) need no wait.
-    const int kv_tile_mode = mainloop_params.kv_wait_mode & 0xff;
+    const int kv_tile_mode = mainloop_params.kv_wait_mode & 0x7f;
     const int kv_tile_rows = mainloop_params.kv_wait_mode >> 8;
     const int kv_hist_len = Is_target ? seqlen_traits_k.actual_seq_len_h : seqlen_traits_k.actual_seq_len;
+    // kv_got: the progress this thread last observed (with acquire + proxy fence); a tile it already covers needs
+    // neither a new load nor a fence (env HPOC-side switch: kv_wait_mode bit 7 = always reload, the old behaviour)
+    int kv_got = 0;
+    const bool kv_reload = (mainloop_params.kv_wait_mode & 0x80) != 0;
+    // mode 4 (CPU verbs, direct): *kv_ready is the worker's 64-bit progress word (seq << 32 | steps) in host-mapped
+    // memory, read over PCIe with system-scope acquire; no relay kernel, no per-request reset
+    // mode 5 (raw GDAKI, post kernel outside the graph): the same 64-bit seq-tagged word in device memory (gpu scope)
+    const uint32_t kv_want = (kv_tile_mode == 4 || kv_tile_mode == 5) ? *mainloop_params.kv_seq : 0u;
     auto tile_wait = [&](int nb) {
+      if (kv_tile_mode == 5) {
+        const int start = nb * static_cast<int>(get<1>(TileShape_MNK{}));
+        if (start < kv_hist_len) {
+          const int need = (kv_hist_len - start + kv_tile_rows - 1) / kv_tile_rows;
+          if (kv_reload || kv_got < need) {
+            unsigned long long p;
+            int got;
+            int spins = 0;
+            do {
+              asm volatile("ld.acquire.gpu.global.u64 %0, [%1];" : "=l"(p)
+                           : "l"(reinterpret_cast<const unsigned long long*>(mainloop_params.kv_ready)) : "memory");
+              got = (uint32_t)(p >> 32) == kv_want ? (int)(p & 0xffffffffull) : 0;
+              ++spins;
+            } while (got < need);
+            asm volatile("fence.proxy.async.global;" ::: "memory");
+            kv_got = got;
+            if (spins > 1) hpoc_trace_wait(mainloop_params.kv_trace);
+          }
+        }
+      }
+      if (kv_tile_mode == 4) {
+        const int start = nb * static_cast<int>(get<1>(TileShape_MNK{}));
+        if (start < kv_hist_len) {
+          const int need = (kv_hist_len - start + kv_tile_rows - 1) / kv_tile_rows;
+          if (kv_reload || kv_got < need) {
+            unsigned long long p;
+            int got;
+            int spins = 0;
+            do {
+              asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(p)
+                           : "l"(reinterpret_cast<const unsigned long long*>(mainloop_params.kv_ready)) : "memory");
+              got = (uint32_t)(p >> 32) == kv_want ? (int)(p & 0xffffffffull) : 0;
+              ++spins;
+            } while (got < need);
+            asm volatile("fence.proxy.async.global;" ::: "memory");
+            kv_got = got;
+            if (spins > 1) hpoc_trace_wait(mainloop_params.kv_trace);
+          }
+        }
+      }
       if (kv_tile_mode == 3) {
         const int start = nb * static_cast<int>(get<1>(TileShape_MNK{}));
         if (start < kv_hist_len) {
           const int need = (kv_hist_len - start + kv_tile_rows - 1) / kv_tile_rows;
-          int got;
-          do {
-            asm volatile("ld.acquire.gpu.global.s32 %0, [%1];" : "=r"(got) : "l"(mainloop_params.kv_ready) : "memory");
-          } while (got < need);
-          asm volatile("fence.proxy.async.global;" ::: "memory");
+          if (kv_reload || kv_got < need) {
+            int got;
+            int spins = 0;
+            do {
+              asm volatile("ld.acquire.gpu.global.s32 %0, [%1];" : "=r"(got) : "l"(mainloop_params.kv_ready) : "memory");
+              ++spins;
+            } while (got < need);
+            asm volatile("fence.proxy.async.global;" ::: "memory");
+            kv_got = got;
+            if (spins > 1) hpoc_trace_wait(mainloop_params.kv_trace);
+          }
         }
       }
     };

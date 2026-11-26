@@ -204,14 +204,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("set_spin", &VerbsKV::set_spin)
       .def("progress_ptr", &VerbsKV::progress_device_ptr)
       .def("post_reads_tiled",
-           [](VerbsKV& v, torch::Tensor segs, torch::Tensor layer_ptr, uint32_t seq, int64_t tile_bytes) {
+           [](VerbsKV& v, torch::Tensor segs, torch::Tensor layer_ptr, uint32_t seq, int64_t tile_bytes,
+              int first_layers) {
              TORCH_CHECK(!segs.is_cuda() && segs.scalar_type() == torch::kInt64 && segs.is_contiguous(), "segs cpu int64");
              TORCH_CHECK(!layer_ptr.is_cuda() && layer_ptr.scalar_type() == torch::kInt32, "layer_ptr cpu int32");
              TORCH_CHECK(tile_bytes > 0, "tile_bytes > 0");
              v.post_reads_tiled(segs.data_ptr<int64_t>(), layer_ptr.data_ptr<int>(), (int)layer_ptr.numel() - 1, seq,
-                                tile_bytes);
-           })
+                                tile_bytes, first_layers);
+           },
+           py::arg("segs"), py::arg("layer_ptr"), py::arg("seq"), py::arg("tile_bytes"), py::arg("first_layers") = 0)
+      .def("post_rest", &VerbsKV::post_rest)
       .def("set_inline_post", &VerbsKV::set_inline_post)
+      .def("set_trace", &VerbsKV::set_trace)
+      .def("trace_read", &VerbsKV::trace_read)
       .def("destroy", &VerbsKV::destroy);
   py::class_<RawGdaki>(m, "RawGdaki")
       .def(py::init<const std::string&, int64_t, int, int>(), py::arg("dev"), py::arg("bytes"), py::arg("nqp") = 4,
@@ -243,12 +248,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            },
            py::arg("tickets"), py::arg("layer"), py::arg("t_done") = py::none())
       .def("poll",
-           [](RawGdaki& r, torch::Tensor tickets, int n_layers, torch::Tensor seq, torch::Tensor ready) {
-             r.poll((const uint64_t*)tickets.data_ptr(), n_layers, (const uint32_t*)seq.data_ptr(), (uint32_t*)ready.data_ptr(), cur());
-           })
+           [](RawGdaki& r, torch::Tensor tickets, int n_layers, torch::Tensor seq, torch::Tensor ready,
+              std::optional<torch::Tensor> trace) {
+             r.poll((const uint64_t*)tickets.data_ptr(), n_layers, (const uint32_t*)seq.data_ptr(), (uint32_t*)ready.data_ptr(), cur(),
+                    ptr_or_null<unsigned long long>(trace));
+           },
+           py::arg("tickets"), py::arg("n_layers"), py::arg("seq"), py::arg("ready"), py::arg("trace") = py::none())
       .def("post_gets_tiled",
            [](RawGdaki& r, torch::Tensor segs, torch::Tensor layer_ptr, torch::Tensor tickets, int max_steps,
-              int64_t tile_bytes, torch::Tensor tsteps, std::optional<torch::Tensor> var, int64_t var_stride) {
+              int64_t tile_bytes, torch::Tensor tsteps, std::optional<torch::Tensor> var, int64_t var_stride,
+              std::optional<torch::Tensor> trace, int version, std::optional<torch::Tensor> prog, int64_t seq,
+              std::optional<torch::Tensor> seq_dev) {
              need_cuda(segs, "segs");
              need_cuda(layer_ptr, "layer_ptr");
              need_cuda(tickets, "tickets");
@@ -257,19 +267,38 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              TORCH_CHECK(tickets.numel() >= (int64_t)r.nqp() * nl * max_steps, "tickets too small");
              TORCH_CHECK(max_steps >= 1 && tile_bytes > 0, "bad tiled arguments");
              r.post_gets_tiled((const Seg*)segs.data_ptr(), layer_ptr.data_ptr<int>(), (int)nl, (uint64_t*)tickets.data_ptr(),
-                               max_steps, tile_bytes, (int*)tsteps.data_ptr(), cur(), host_index_ptr(var), var_stride);
+                               max_steps, tile_bytes, (int*)tsteps.data_ptr(), cur(), host_index_ptr(var), var_stride,
+                               ptr_or_null<unsigned long long>(trace), version, ptr_or_null<uint64_t>(prog), (uint64_t)seq,
+                               ptr_or_null<uint32_t>(seq_dev));
            },
            py::arg("segs"), py::arg("layer_ptr"), py::arg("tickets"), py::arg("max_steps"), py::arg("tile_bytes"),
-           py::arg("tsteps"), py::arg("var") = py::none(), py::arg("var_stride") = 0)
+           py::arg("tsteps"), py::arg("var") = py::none(), py::arg("var_stride") = 0, py::arg("trace") = py::none(),
+           py::arg("version") = 1, py::arg("prog") = py::none(), py::arg("seq") = 0, py::arg("seq_dev") = py::none())
       .def("destroy", &RawGdaki::destroy);
   m.def("seq_inc", [](torch::Tensor seq) { seq_inc_gpu((uint32_t*)seq.data_ptr(), cur()); });
-  m.def("relay_tiles", [](int64_t prog, int64_t host_flags, int n_layers, torch::Tensor seq, torch::Tensor tsteps) {
+  m.def("trace_words", []() { return trace_words(); });
+  // launch an instantiated CUDA graph (torch.cuda.CUDAGraph.raw_cuda_graph_exec()) on a stream, without Python's stream
+  // context (raw GDAKI v3: the post graph right before the request graph)
+  m.def("graph_launch", [](int64_t exec, int64_t stream) {
+    cudaError_t e = cudaGraphLaunch((cudaGraphExec_t)exec, (cudaStream_t)stream);
+    TORCH_CHECK(e == cudaSuccess, "cudaGraphLaunch: ", cudaGetErrorString(e));
+  });
+  m.def("calibrate_clock", [](int n) {
+    py::gil_scoped_release nogil;
+    return calibrate_clock(n);
+  });
+  m.def("relay_tiles", [](int64_t prog, int64_t host_flags, int n_layers, torch::Tensor seq, torch::Tensor tsteps,
+                          std::optional<torch::Tensor> trace, int version) {
     relay_tiles_gpu((const volatile unsigned long long*)prog, (const volatile uint32_t*)host_flags, n_layers,
-                    (const uint32_t*)seq.data_ptr(), (int32_t*)tsteps.data_ptr(), cur());
-  });
-  m.def("relay_flags", [](int64_t host_flags, int n_layers, torch::Tensor seq, torch::Tensor ready) {
-    relay_flags_gpu((const volatile uint32_t*)host_flags, n_layers, (const uint32_t*)seq.data_ptr(), (uint32_t*)ready.data_ptr(), cur());
-  });
+                    (const uint32_t*)seq.data_ptr(), (int32_t*)tsteps.data_ptr(), cur(), ptr_or_null<unsigned long long>(trace),
+                    version);
+  }, py::arg("prog"), py::arg("host_flags"), py::arg("n_layers"), py::arg("seq"), py::arg("tsteps"),
+     py::arg("trace") = py::none(), py::arg("version") = 1);
+  m.def("relay_flags", [](int64_t host_flags, int n_layers, torch::Tensor seq, torch::Tensor ready,
+                          std::optional<torch::Tensor> trace) {
+    relay_flags_gpu((const volatile uint32_t*)host_flags, n_layers, (const uint32_t*)seq.data_ptr(), (uint32_t*)ready.data_ptr(), cur(),
+                    ptr_or_null<unsigned long long>(trace));
+  }, py::arg("host_flags"), py::arg("n_layers"), py::arg("seq"), py::arg("ready"), py::arg("trace") = py::none());
   m.def("set_flag_seq", [](int64_t flags_addr, int layer, torch::Tensor seq) {
     set_flag_seq_gpu((volatile uint32_t*)flags_addr, layer, (const uint32_t*)seq.data_ptr(), cur());
   });

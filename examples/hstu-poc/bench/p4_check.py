@@ -38,6 +38,7 @@ def main():
     ap.add_argument("--slow-ms", type=float, default=2.0)
     ap.add_argument("--pool-gb", type=float, default=16)
     ap.add_argument("--seed", type=int, default=99)
+    ap.add_argument("--variants", default="5a,copy,pdl,fused,pdl_early,tile,nowait")
     ap.add_argument("--tuned", action="store_true", help="latency options on (GDAKI: zero-copy descriptor, side-branch "
                     "post; GIN: adaptive contexts; CPU verbs: spinning worker, inline posting)")
     a = ap.parse_args()
@@ -79,13 +80,13 @@ def main():
         items = torch.randint(0, cfg.n_items, (b.total_q,), device="cuda", generator=torch.Generator("cuda").manual_seed(5))
         out = {}
         with torch.inference_mode():
-            for variant in ["5a", "copy", "pdl", "fused", "pdl_early", "tile", "nowait"]:
+            for variant in a.variants.split(","):
                 slow = 0 if variant == "5a" else int(a.slow_ms * 1e6)
                 src = make(cfg).p4_init("copy" if variant == "nowait" else variant, slow_ns=slow)
                 if variant == "nowait":
                     src.attn_fn = NoWait(src)
                 src.setup(b)
-                verbs = isinstance(src, VerbsKVSource)
+                verbs = isinstance(src, VerbsKVSource) or (getattr(src, "pre_launch", 0) and src.p4 == "tile")
                 res = {}
 
                 def fwd():
@@ -99,11 +100,16 @@ def main():
                 with torch.cuda.stream(s):      # warm-up (also builds the copied kernel on first use)
                     src.pre_replay(0)
                     fwd()
+                    if hasattr(src, "post_replay"):
+                        src.post_replay(0)
                 torch.cuda.current_stream().wait_stream(s)
                 torch.cuda.synchronize()
                 g = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(g):
                     fwd()
+                src.eager = False                   # graph replays: split posting allowed
+                if hasattr(src, "capture_post"):
+                    src.capture_post()
                 for trial in range(3):
                     torch.cuda.synchronize()
                     src.buf.zero_()                 # history rows must come from this request's transfer
@@ -114,10 +120,15 @@ def main():
                         g.replay()
                         time.sleep(a.slow_ms / 1e3)
                         src.post_now()
+                        if getattr(src, "split_post", 0) and src.p4 == "tile":
+                            time.sleep(a.slow_ms / 1e3)     # split posting: the second part later still
+                            src.post_replay(0)
                         src.post_after_launch = False
                     else:
                         src.pre_replay(0)
                         g.replay()
+                        if hasattr(src, "post_replay"):
+                            src.post_replay(0)
                     torch.cuda.synchronize()
                     out.setdefault(variant, []).append(res["y"].float().clone())
                 del g

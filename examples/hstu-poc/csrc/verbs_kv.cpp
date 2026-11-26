@@ -89,6 +89,20 @@ struct VerbsImpl {
   std::atomic<int64_t> pending{0};
   std::atomic<bool> spin{false}, stop_a{false};
   bool inline_post = false;
+  // timeline trace (optional): CLOCK_MONOTONIC ns of the last request's posting (start, end), the worker taking the
+  // job, the first completion, the end of the job, and events (layer, value published, time)
+  std::atomic<bool> trace{false};
+  std::vector<int64_t> tev;
+  int64_t t_post0 = 0, t_post1 = 0, t_pick = 0, t_cqe0 = 0, t_end = 0, t_post2 = 0;
+  // split posting: the layers of a tiled request still to be posted by post_rest() (request thread, after the graph
+  // launch) while the worker already polls the completions of the first part
+  struct Pending {
+    bool active = false;
+    std::vector<int64_t> segs;
+    std::vector<int> lp;
+    int64_t tb = 0;
+    int l0 = 0, n_layers = 0, rr = 0;
+  } pend;
 };
 
 static int nic_numa(const std::string& dev) {
@@ -108,32 +122,63 @@ static void* numa_host_alloc(size_t bytes, int node) {
   return p;
 }
 
+static int64_t mono_ns() {
+  timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec;
+}
+static void trace_begin(VerbsImpl* p) {
+  p->tev.clear();
+  p->t_post2 = 0;
+  p->t_cqe0 = p->t_end = 0;   // t_pick: set when the worker takes the job (before or after posting)
+  p->t_post0 = mono_ns();
+}
+static inline void trace_ev(VerbsImpl* p, int l, int64_t v) {
+  p->tev.push_back(l);
+  p->tev.push_back(v);
+  p->tev.push_back(mono_ns());
+}
+
 static int64_t thread_ns() {
   timespec ts;
   clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
   return (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec;
 }
 
-static void post_tiled(VerbsImpl* p, Job& j) {
-  const int nqp = (int)p->qps.size();
+// plan of a tiled request: steps and chunks per step of every layer (the worker needs them before it polls)
+static void plan_tiled(Job& j) {
   const int64_t tb = j.tile_bytes;
   j.step_cnt.assign(j.n_layers, {});
   j.n_steps.assign(j.n_layers, 0);
   j.expect.assign(j.n_layers, 0);
-  std::vector<std::vector<ibv_sge>> sges(nqp);
-  std::vector<std::vector<ibv_send_wr>> wrs(nqp);
-  int rr = 0;
   for (int l = 0; l < j.n_layers; ++l) {
-    const int s0 = j.lp[l], s1 = j.lp[l + 1];
     int64_t maxb = 0;
-    size_t total = 0;
-    for (int i = s0; i < s1; ++i) {
-      maxb = std::max(maxb, j.segs[4 * (size_t)i + 2]);
-      total += (size_t)((j.segs[4 * (size_t)i + 2] + tb - 1) / tb);
-    }
+    for (int i = j.lp[l]; i < j.lp[l + 1]; ++i) maxb = std::max(maxb, j.segs[4 * (size_t)i + 2]);
     const int ns = (int)((maxb + tb - 1) / tb);
     j.n_steps[l] = ns;
     j.step_cnt[l].assign(ns, 0);
+    for (int k = 0; k < ns; ++k)
+      for (int i = j.lp[l]; i < j.lp[l + 1]; ++i)
+        if (j.segs[4 * (size_t)i + 2] > k * tb) j.step_cnt[l][k]++;
+  }
+}
+
+// post layers [l0, l1) of a tiled request, chunk reads in step order, round-robin over the QPs (rr carries on across
+// calls), one chained ibv_post_send per layer and QP
+static void post_tiled_layers(VerbsImpl* p, const std::vector<int64_t>& segs, const std::vector<int>& lp, int64_t tb,
+                              int l0, int l1, int& rr) {
+  const int nqp = (int)p->qps.size();
+  std::vector<std::vector<ibv_sge>> sges(nqp);
+  std::vector<std::vector<ibv_send_wr>> wrs(nqp);
+  for (int l = l0; l < l1; ++l) {
+    const int s0 = lp[l], s1 = lp[l + 1];
+    int64_t maxb = 0;
+    size_t total = 0;
+    for (int i = s0; i < s1; ++i) {
+      maxb = std::max(maxb, segs[4 * (size_t)i + 2]);
+      total += (size_t)((segs[4 * (size_t)i + 2] + tb - 1) / tb);
+    }
+    const int ns = (int)((maxb + tb - 1) / tb);
     for (int q = 0; q < nqp; ++q) {
       sges[q].clear();
       wrs[q].clear();
@@ -142,7 +187,7 @@ static void post_tiled(VerbsImpl* p, Job& j) {
     }
     for (int k = 0; k < ns; ++k) {
       for (int i = s0; i < s1; ++i) {
-        const int64_t* s = &j.segs[4 * (size_t)i];
+        const int64_t* s = &segs[4 * (size_t)i];
         const int64_t bytes = s[2];
         if (bytes <= k * tb) continue;
         const int64_t len = std::min(tb, bytes - k * tb);
@@ -162,7 +207,6 @@ static void post_tiled(VerbsImpl* p, Job& j) {
         w.wr.rdma.remote_addr = p->raddr + (uint64_t)(s[0] + off);
         w.wr.rdma.rkey = p->rkey;
         wrs[q].push_back(w);
-        j.step_cnt[l][k]++;
       }
     }
     for (int q = 0; q < nqp; ++q) {
@@ -176,7 +220,15 @@ static void post_tiled(VerbsImpl* p, Job& j) {
       if (r) throw std::runtime_error("ibv_post_send (tiled) failed: " + std::string(strerror(r)));
     }
   }
+}
+
+static void post_tiled(VerbsImpl* p, Job& j) {
+  if (p->trace) trace_begin(p);
+  plan_tiled(j);
+  int rr = 0;
+  post_tiled_layers(p, j.segs, j.lp, j.tile_bytes, 0, j.n_layers, rr);
   j.posted = true;
+  if (p->trace) p->t_post1 = mono_ns();
 }
 
 static void poll_tiled(VerbsImpl* p, Job& j) {
@@ -191,7 +243,9 @@ static void poll_tiled(VerbsImpl* p, Job& j) {
       while (d < j.n_steps[l] && got[l][d] >= j.step_cnt[l][d]) ++d;
       if (d != done[l]) {
         done[l] = d;
-        __atomic_store_n(&p->prog_host[l], ((uint64_t)j.seq << 32) | (uint64_t)d, __ATOMIC_RELEASE);
+        const uint64_t v = d >= j.n_steps[l] ? 0x7fffffffull : (uint64_t)d;   // complete: one read tells the relay
+        __atomic_store_n(&p->prog_host[l], ((uint64_t)j.seq << 32) | v, __ATOMIC_RELEASE);
+        if (p->trace) trace_ev(p, l, d);
       }
     }
     while (next < j.n_layers && done[next] >= j.n_steps[next]) {
@@ -201,16 +255,19 @@ static void poll_tiled(VerbsImpl* p, Job& j) {
     if (next >= j.n_layers) break;
     int n = ibv_poll_cq(p->cq, 64, wc);
     if (n < 0) throw std::runtime_error("ibv_poll_cq failed");
+    if (n > 0 && p->trace && p->t_cqe0 == 0) p->t_cqe0 = mono_ns();
     for (int k = 0; k < n; ++k) {
       if (wc[k].status != IBV_WC_SUCCESS)
         throw std::runtime_error(std::string("work completion error: ") + ibv_wc_status_str(wc[k].status));
       got[wc[k].wr_id >> 32][wc[k].wr_id & 0xffffffffull]++;
     }
   }
+  if (p->trace) p->t_end = mono_ns();
 }
 
 static void post_job(VerbsImpl* p, Job& j) {
   if (j.tile_bytes > 0) return post_tiled(p, j);
+  if (p->trace && !j.write) trace_begin(p);
   const int nqp = (int)p->qps.size();
   std::vector<int>& expect = j.expect;
   expect.assign(j.n_layers, 0);
@@ -252,6 +309,7 @@ static void post_job(VerbsImpl* p, Job& j) {
     }
   }
   j.posted = true;
+  if (p->trace && !j.write) p->t_post1 = mono_ns();
 }
 
 static void run_job(VerbsImpl* p, Job& j) {
@@ -268,17 +326,20 @@ static void run_job(VerbsImpl* p, Job& j) {
                                    CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TO_OWNER);
       }
       if (!j.write) __atomic_store_n(&p->flags_host[next], j.seq, __ATOMIC_RELEASE);
+      if (p->trace && !j.write) trace_ev(p, next, 0x7fffffff);
       ++next;
     }
     if (next >= j.n_layers) break;
     int n = ibv_poll_cq(p->cq, 64, wc);
     if (n < 0) throw std::runtime_error("ibv_poll_cq failed");
+    if (n > 0 && p->trace && !j.write && p->t_cqe0 == 0) p->t_cqe0 = mono_ns();
     for (int k = 0; k < n; ++k) {
       if (wc[k].status != IBV_WC_SUCCESS)
         throw std::runtime_error(std::string("work completion error: ") + ibv_wc_status_str(wc[k].status));
       got[wc[k].wr_id >> 8]++;
     }
   }
+  if (p->trace && !j.write) p->t_end = mono_ns();
 }
 
 // W path: post layer l's RDMA WRITEs once the GPU says its K/V rows exist, then an 8-byte RDMA READ per QP as a
@@ -379,6 +440,7 @@ static void worker_main(VerbsImpl* p) {
       p->jobs.pop_front();
       p->pending--;
     }
+    if (p->trace && !j.write && !j.gated) p->t_pick = mono_ns();
     int64_t t0 = thread_ns();
     try {
       if (j.gated) run_write_job(p, j);
@@ -541,6 +603,13 @@ void VerbsKV::set_spin(bool on) {
   p_->cv.notify_all();
 }
 void VerbsKV::set_inline_post(bool on) { p_->inline_post = on; }
+void VerbsKV::set_trace(bool on) { p_->trace = on; }
+std::vector<int64_t> VerbsKV::trace_read() const {
+  std::vector<int64_t> r = {p_->t_post0, p_->t_post1, p_->t_pick, p_->t_cqe0, p_->t_end, p_->t_post2,
+                           (int64_t)(p_->tev.size() / 3)};
+  r.insert(r.end(), p_->tev.begin(), p_->tev.end());
+  return r;
+}
 
 void VerbsKV::post_reads(const int64_t* segs, const int* layer_ptr, int n_layers, uint32_t seq) {
   if (n_layers > p_->max_layers) throw std::runtime_error("verbs: too many layers");
@@ -556,16 +625,45 @@ void VerbsKV::post_reads(const int64_t* segs, const int* layer_ptr, int n_layers
 }
 
 void VerbsKV::post_reads_tiled(const int64_t* segs, const int* layer_ptr, int n_layers, uint32_t seq,
-                               int64_t tile_bytes) {
+                               int64_t tile_bytes, int first_layers) {
   if (n_layers > p_->max_layers) throw std::runtime_error("verbs: too many layers");
+  if (p_->pend.active) throw std::runtime_error("verbs: post_rest() of the previous split request missing");
   Job j;
   j.n_layers = n_layers;
   j.lp.assign(layer_ptr, layer_ptr + n_layers + 1);
   j.segs.assign(segs, segs + 4 * (size_t)layer_ptr[n_layers]);
   j.seq = seq;
   j.tile_bytes = tile_bytes;
-  if (p_->inline_post && p_->done.load() == p_->submitted) post_job(p_, j);
+  if (p_->inline_post && p_->done.load() == p_->submitted) {
+    if (first_layers > 0 && first_layers < n_layers) {
+      // split: post the first layers now, the rest in post_rest() after the caller launched the graph
+      if (p_->trace) trace_begin(p_);
+      plan_tiled(j);
+      int rr = 0;
+      post_tiled_layers(p_, j.segs, j.lp, tile_bytes, 0, first_layers, rr);
+      j.posted = true;
+      VerbsImpl::Pending& q = p_->pend;
+      q.segs = std::move(j.segs);
+      q.lp = j.lp;
+      q.tb = tile_bytes;
+      q.l0 = first_layers;
+      q.n_layers = n_layers;
+      q.rr = rr;
+      q.active = true;
+      if (p_->trace) p_->t_post1 = mono_ns();
+    } else {
+      post_job(p_, j);
+    }
+  }
   submit(p_, std::move(j));
+}
+
+void VerbsKV::post_rest() {
+  VerbsImpl::Pending& q = p_->pend;
+  if (!q.active) return;
+  post_tiled_layers(p_, q.segs, q.lp, q.tb, q.l0, q.n_layers, q.rr);
+  q.active = false;
+  if (p_->trace) p_->t_post2 = mono_ns();
 }
 
 void VerbsKV::post_writes(const int64_t* segs, const int* layer_ptr, int n_layers, uint32_t seq, int64_t fence_remote,
